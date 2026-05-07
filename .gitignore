@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Local generated simulation products and caches.
+outputs/
+results/
+cache/
+*.npy
+*.npz
+*.pkl
+*.fits
+*.h5
+*.hdf5
+
+# Environment-local files.
+.env
+.venv/
+venv/
