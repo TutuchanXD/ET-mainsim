@@ -17,7 +17,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 from astropy import units as u
 
 
@@ -179,6 +178,17 @@ def ensure_local_imports() -> None:
             sys.path.insert(0, path_str)
 
 
+def require_torch():
+    try:
+        import torch
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "main_rd_g18_parallel rendering requires torch. Install torch before "
+            "running the simulation entrypoints."
+        ) from exc
+    return torch
+
+
 def _json_default(value: Any) -> Any:
     if hasattr(value, "to_string"):
         return value.to_string()
@@ -204,49 +214,108 @@ def sim_config_dict(
     frame_rows: int,
     frame_cols: int,
     *,
-    sky_surface_brightness_mag_arcsec2: float = SKY_SURFACE_BRIGHTNESS,
-    n_subpixels: int = N_SUBPIXELS,
-    scattered_light_e_s_pix: float = 0.0,
+    spec: MainRdRunSpec | None = None,
+    sky_surface_brightness_mag_arcsec2: float | None = None,
+    n_subpixels: int | None = None,
+    scattered_light_e_s_pix: float | None = None,
 ) -> dict[str, Any]:
     ensure_local_imports()
     from photsim7.background import sky_surface_brightness_to_background_flux
 
-    sky_surface_brightness_mag_arcsec2 = float(sky_surface_brightness_mag_arcsec2)
+    if spec is None:
+        pixel_scale = PIXEL_SCALE
+        pixel_width = PIXEL_WIDTH
+        exposure = EXPOSURE
+        observing_duration = OBSERVING_DURATION
+        sky_surface_brightness_mag_arcsec2 = (
+            SKY_SURFACE_BRIGHTNESS
+            if sky_surface_brightness_mag_arcsec2 is None
+            else float(sky_surface_brightness_mag_arcsec2)
+        )
+        n_subpixels = N_SUBPIXELS if n_subpixels is None else int(n_subpixels)
+        scattered_light_e_s_pix = (
+            0.0 if scattered_light_e_s_pix is None else float(scattered_light_e_s_pix)
+        )
+        dark_current = DARK_CURRENT
+        readout_noise = READOUT_NOISE
+        full_well_electrons = FULL_WELL_ELECTRONS
+        gain_electrons_per_adu = GAIN_ELECTRONS_PER_ADU
+        adc_bit_depth = ADC_BIT_DEPTH
+        bias_level_adu = BIAS_LEVEL_ADU
+        column_noise_sigma_adu = COLUMN_NOISE_SIGMA_ADU
+        cosmic_ray_library_path = COSMIC_RAY_LIBRARY_PATH
+        cosmic_ray_pixel_size = COSMIC_RAY_PIXEL_SIZE
+        cosmic_ray_event_rate = COSMIC_RAY_EVENT_RATE
+        psf_bundle_name = PSF_BUNDLE_NAME
+        use_jitter_integrated_psf = True
+        n_jitter_integrated_psf_models = JITTER_INTEGRATED_PSF_MODELS
+        n_jitter_frames_per_model = JITTER_FRAMES_PER_MODEL
+    else:
+        pixel_scale = float(spec.pixel_scale_arcsec_per_pix) * u.arcsec / u.pix
+        pixel_width = float(spec.pixel_width_um) * u.um
+        exposure = float(spec.exposure_s) * u.s
+        observing_duration = float(spec.observing_duration_s) * u.s
+        sky_surface_brightness_mag_arcsec2 = (
+            float(spec.sky_surface_brightness_mag_arcsec2)
+            if sky_surface_brightness_mag_arcsec2 is None
+            else float(sky_surface_brightness_mag_arcsec2)
+        )
+        n_subpixels = int(spec.n_subpixels if n_subpixels is None else n_subpixels)
+        scattered_light_e_s_pix = (
+            float(spec.scattered_light_e_s_pix)
+            if scattered_light_e_s_pix is None
+            else float(scattered_light_e_s_pix)
+        )
+        dark_current = float(spec.dark_current_e_s_pix) * u.electron / u.s / u.pix
+        readout_noise = float(spec.readout_noise_e_pix) * u.electron / u.pix
+        full_well_electrons = float(spec.full_well_electrons)
+        gain_electrons_per_adu = float(spec.gain_electrons_per_adu)
+        adc_bit_depth = int(spec.adc_bit_depth)
+        bias_level_adu = float(spec.bias_level_adu)
+        column_noise_sigma_adu = float(spec.column_noise_sigma_adu)
+        cosmic_ray_library_path = spec.cosmic_ray_library_path
+        cosmic_ray_pixel_size = float(spec.cosmic_ray_pixel_size_um) * u.um
+        cosmic_ray_event_rate = float(spec.cosmic_ray_event_rate_cm2_s) / (u.cm**2 * u.s)
+        psf_bundle_name = spec.psf_bundle_name
+        use_jitter_integrated_psf = bool(spec.use_jitter_integrated_psf)
+        n_jitter_integrated_psf_models = int(spec.n_jitter_integrated_psf_models)
+        n_jitter_frames_per_model = int(spec.n_jitter_frames_per_model)
+
     background_flux = sky_surface_brightness_to_background_flux(
         sky_surface_brightness_mag_arcsec2,
-        PIXEL_SCALE,
+        pixel_scale,
         magnitude_system="ET",
     )
     return {
         "Detector Width": int(frame_cols) * u.pix,
         "Detector Height": int(frame_rows) * u.pix,
         "Subpixels Per Pixel Dim": int(n_subpixels),
-        "Pixel Scale": PIXEL_SCALE,
-        "Pixel Width": PIXEL_WIDTH,
-        "Exposure Duration": EXPOSURE,
-        "Observing Duration": OBSERVING_DURATION,
+        "Pixel Scale": pixel_scale,
+        "Pixel Width": pixel_width,
+        "Exposure Duration": exposure,
+        "Observing Duration": observing_duration,
         "Simulation Cadence Mult": 1,
         "Background Flux": background_flux,
         "Sky Background Mode": "surface_brightness",
         "Sky Background Surface Brightness": sky_surface_brightness_mag_arcsec2,
         "Sky Background Magnitude System": "ET",
         "Subtract Nonstellar Mean": False,
-        "Dark Current": DARK_CURRENT,
+        "Dark Current": dark_current,
         "Scattered Light": float(scattered_light_e_s_pix) * u.electron / u.s / u.pix,
-        "Readout Noise": READOUT_NOISE,
+        "Readout Noise": readout_noise,
         "Enable ADC Digitization": True,
-        "Full Well Electrons": FULL_WELL_ELECTRONS * u.electron,
-        "Gain Electrons Per ADU": GAIN_ELECTRONS_PER_ADU * u.electron / u.adu,
-        "ADC Bit Depth": ADC_BIT_DEPTH,
+        "Full Well Electrons": full_well_electrons * u.electron,
+        "Gain Electrons Per ADU": gain_electrons_per_adu * u.electron / u.adu,
+        "ADC Bit Depth": adc_bit_depth,
         "ADC Min Value": 0.0,
         "ADC Round Values": True,
-        "Bias Level ADU": BIAS_LEVEL_ADU * u.adu,
-        "Column Noise Sigma ADU": COLUMN_NOISE_SIGMA_ADU * u.adu,
+        "Bias Level ADU": bias_level_adu * u.adu,
+        "Column Noise Sigma ADU": column_noise_sigma_adu * u.adu,
         "Save Bias Metadata": True,
         "Enable Cosmic Rays": True,
-        "Cosmic Ray Event Library Path": COSMIC_RAY_LIBRARY_PATH,
-        "Cosmic Ray Event Library Pixel Size": COSMIC_RAY_PIXEL_SIZE,
-        "Cosmic Ray Event Rate": COSMIC_RAY_EVENT_RATE,
+        "Cosmic Ray Event Library Path": cosmic_ray_library_path,
+        "Cosmic Ray Event Library Pixel Size": cosmic_ray_pixel_size,
+        "Cosmic Ray Event Rate": cosmic_ray_event_rate,
         "Cosmic Ray Seed": 0,
         "Inter-PRV (RMS)": 1.0 * u.percent,
         "Inter-PRV (Nominal)": 100.0 * u.percent,
@@ -258,11 +327,11 @@ def sim_config_dict(
         "Thermal Defocus Model": "none",
         "Thermal Defocus Amplitude": 0.0 * u.percent,
         "Thermal Defocus Offset": 100.0 * u.percent,
-        "PSF Bundle Name": PSF_BUNDLE_NAME,
+        "PSF Bundle Name": psf_bundle_name,
         "PSF Field ID": "nearest",
-        "Use Jitter-Integrated PSF": True,
-        "N Jitter-Integrated PSF Models": JITTER_INTEGRATED_PSF_MODELS,
-        "N Jitter Frames Per Model": JITTER_FRAMES_PER_MODEL,
+        "Use Jitter-Integrated PSF": use_jitter_integrated_psf,
+        "N Jitter-Integrated PSF Models": n_jitter_integrated_psf_models,
+        "N Jitter Frames Per Model": n_jitter_frames_per_model,
         "Telescope Count": 1,
         "Optical Efficiency Ratio": 101.0 * u.percent,
     }
@@ -700,6 +769,7 @@ def build_star_catalog(
     frame_rows: int,
     frame_cols: int,
     psf_field_ids: np.ndarray,
+    frame_exposure_s: float = EXPOSURE.to(u.s).value,
 ):
     ensure_local_imports()
     from photsim7.field import Stars
@@ -708,7 +778,7 @@ def build_star_catalog(
     stars = Stars()
     stars.build_catalog(
         catalog_star_data,
-        frame_exposure=EXPOSURE,
+        frame_exposure=float(frame_exposure_s) * u.s,
         optical_eff_ratio=1.0,
         aperture_area_ratio=1.0,
         mag_type="ET",
@@ -730,6 +800,8 @@ def build_psf_manager(
     device: str,
     star_data: dict[str, Any],
     n_subpixels: int,
+    psf_bundle_name: str = PSF_BUNDLE_NAME,
+    pixel_scale_arcsec_per_pix: float = PIXEL_SCALE.to(u.arcsec / u.pix).value,
     integrate_jitter: bool,
     xy_jitter_pix: np.ndarray | None,
     n_jitter_integrated_psf_models: int,
@@ -739,8 +811,8 @@ def build_psf_manager(
     from photsim7.psf.model import PSFModelManager
 
     actor_config = {
-        "bundle_name": PSF_BUNDLE_NAME,
-        "pixel_scale": PIXEL_SCALE,
+        "bundle_name": psf_bundle_name,
+        "pixel_scale": float(pixel_scale_arcsec_per_pix) * u.arcsec / u.pix,
         "n_rows": int(frame_rows),
         "n_cols": int(frame_cols),
         "n_subpixels": int(n_subpixels),
@@ -811,10 +883,8 @@ def build_detector_response_sampler(
 
 def make_renderer(
     *,
-    frame_rows: int,
-    frame_cols: int,
-    sky_surface_brightness_mag_arcsec2: float,
-    n_subpixels: int,
+    sim_config: dict[str, Any],
+    frame_exposure_s: float,
     device: str,
     stars,
     psf_model_manager,
@@ -824,15 +894,10 @@ def make_renderer(
     from photsim7.full_frame_renderer import SingleCadenceFullFrameRenderer
 
     return SingleCadenceFullFrameRenderer(
-        sim_config=sim_config_dict(
-            frame_rows,
-            frame_cols,
-            sky_surface_brightness_mag_arcsec2=sky_surface_brightness_mag_arcsec2,
-            n_subpixels=n_subpixels,
-        ),
+        sim_config=sim_config,
         stars=stars,
         psf_model_manager=psf_model_manager,
-        frame_exposure=EXPOSURE,
+        frame_exposure=float(frame_exposure_s) * u.s,
         detector_response_sampler=detector_response_sampler,
         compute_device=device,
         float_precision=32,
@@ -1218,7 +1283,7 @@ def scattered_light_for_frame(spec: MainRdRunSpec, frame_index: int):
         and float(spec.scattered_light_step_e_pix_frame) != 0.0
     ):
         scattered_rate += (
-            float(spec.scattered_light_step_e_pix_frame) / EXPOSURE.to(u.s).value
+            float(spec.scattered_light_step_e_pix_frame) / float(spec.exposure_s)
         )
     return scattered_rate * u.electron / u.s / u.pix
 
@@ -1304,6 +1369,7 @@ def jitter_integrated_psf_offsets(
 
 
 def sample_column_noise_adu(*, frame_cols: int, sigma_adu: float, dtype, device):
+    torch = require_torch()
     sigma_adu = float(sigma_adu)
     if sigma_adu < 0.0:
         raise ValueError(f"column_noise_sigma_adu must be non-negative, got {sigma_adu}")
@@ -1318,6 +1384,16 @@ def sample_column_noise_adu(*, frame_cols: int, sigma_adu: float, dtype, device)
     )
 
 
+def load_cosmic_ray_event_library(spec: MainRdRunSpec):
+    ensure_local_imports()
+    from photsim7.cosmic_rays import CosmicRayEventLibrary
+
+    return CosmicRayEventLibrary.load(
+        spec.cosmic_ray_library_path,
+        expected_pixel_size_um=float(spec.cosmic_ray_pixel_size_um),
+    )
+
+
 def apply_detector_chain(
     *,
     image_electrons,
@@ -1325,11 +1401,12 @@ def apply_detector_chain(
     frame_rows: int,
     frame_cols: int,
     seed: int,
-    column_noise_sigma_adu: float,
+    spec: MainRdRunSpec,
+    cosmic_ray_library=None,
 ):
+    torch = require_torch()
     ensure_local_imports()
     from photsim7.cosmic_rays import (
-        CosmicRayEventLibrary,
         CosmicRayInjector,
         apply_adc_digitization,
         clip_full_well_electrons,
@@ -1344,9 +1421,9 @@ def apply_detector_chain(
 
     clipped_e = clip_full_well_electrons(
         image_electrons,
-        full_well_electrons=FULL_WELL_ELECTRONS,
+        full_well_electrons=float(spec.full_well_electrons),
     )
-    readout_sigma = READOUT_NOISE.to(u.electron / u.pix).value
+    readout_sigma = float(spec.readout_noise_e_pix)
     if readout_sigma > 0.0:
         clipped_e = clipped_e + torch.normal(
             mean=0.0,
@@ -1358,19 +1435,20 @@ def apply_detector_chain(
 
     image_adu = electrons_to_adu(
         clipped_e,
-        gain_electrons_per_adu=GAIN_ELECTRONS_PER_ADU,
+        gain_electrons_per_adu=float(spec.gain_electrons_per_adu),
     )
 
-    library = CosmicRayEventLibrary.load(
-        COSMIC_RAY_LIBRARY_PATH,
-        expected_pixel_size_um=COSMIC_RAY_PIXEL_SIZE.to(u.um).value,
+    library = (
+        load_cosmic_ray_event_library(spec)
+        if cosmic_ray_library is None
+        else cosmic_ray_library
     )
     mean_events = mean_events_from_rate(
-        rate_events_per_cm2_s=COSMIC_RAY_EVENT_RATE,
+        rate_events_per_cm2_s=float(spec.cosmic_ray_event_rate_cm2_s) / (u.cm**2 * u.s),
         n_rows=int(frame_rows),
         n_cols=int(frame_cols),
-        pixel_size_um=COSMIC_RAY_PIXEL_SIZE,
-        exposure_s=EXPOSURE,
+        pixel_size_um=float(spec.cosmic_ray_pixel_size_um) * u.um,
+        exposure_s=float(spec.exposure_s) * u.s,
     )
     image_adu_stack, cosmic_payload = CosmicRayInjector(library).inject(
         image_adu.unsqueeze(0),
@@ -1383,15 +1461,15 @@ def apply_detector_chain(
 
     col_noise = sample_column_noise_adu(
         frame_cols=int(frame_cols),
-        sigma_adu=float(column_noise_sigma_adu),
+        sigma_adu=float(spec.column_noise_sigma_adu),
         dtype=image_adu.dtype,
         device=image_adu.device,
     )
-    image_adu = image_adu + BIAS_LEVEL_ADU + col_noise[None, :]
+    image_adu = image_adu + float(spec.bias_level_adu) + col_noise[None, :]
     image_dn = apply_adc_digitization(
         image_adu,
         enabled=True,
-        bit_depth=ADC_BIT_DEPTH,
+        bit_depth=int(spec.adc_bit_depth),
         min_value=0.0,
         round_values=True,
     )
@@ -1427,6 +1505,7 @@ def plot_preview(image_dn: np.ndarray, preview_path: Path, *, title: str) -> Non
 
 def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
     ensure_local_imports()
+    torch = require_torch()
     frame_indices = selected_frame_indices(args.frame_indices, args.frames)
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
@@ -1481,6 +1560,8 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
         device=args.device,
         star_data=star_data,
         n_subpixels=int(spec.n_subpixels),
+        psf_bundle_name=spec.psf_bundle_name,
+        pixel_scale_arcsec_per_pix=float(spec.pixel_scale_arcsec_per_pix),
         integrate_jitter=bool(args.jitter_integrated_psf),
         xy_jitter_pix=xy_jitter_pix,
         n_jitter_integrated_psf_models=int(args.jitter_psf_models),
@@ -1491,6 +1572,7 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
         frame_rows=spec.frame_rows,
         frame_cols=spec.frame_cols,
         psf_field_ids=psf_field_ids,
+        frame_exposure_s=float(spec.exposure_s),
     )
     detector_response_sampler = None
     if not args.no_detector_response:
@@ -1501,16 +1583,18 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
             device=args.device,
             seed=int(args.seed),
         )
+    run_sim_config = sim_config_dict(spec.frame_rows, spec.frame_cols, spec=spec)
     renderer = make_renderer(
-        frame_rows=spec.frame_rows,
-        frame_cols=spec.frame_cols,
-        sky_surface_brightness_mag_arcsec2=float(spec.sky_surface_brightness_mag_arcsec2),
-        n_subpixels=int(spec.n_subpixels),
+        sim_config=run_sim_config,
+        frame_exposure_s=float(spec.exposure_s),
         device=args.device,
         stars=stars,
         psf_model_manager=psf_manager,
         detector_response_sampler=detector_response_sampler,
     )
+    background_flux_per_pixel = run_sim_config["Background Flux"]
+    dark_current_per_pixel = run_sim_config["Dark Current"]
+    cosmic_ray_library = load_cosmic_ray_event_library(spec)
 
     base_x = np.asarray(stars["Detector Xpix Shifted"], dtype=np.float64)
     base_y = np.asarray(stars["Detector Ypix Shifted"], dtype=np.float64)
@@ -1571,17 +1655,9 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
             enable_scattered_light=bool(scattered_light_per_pixel.value != 0.0),
             enable_dark_current=True,
             enable_readout_noise=False,
-            background_flux_per_pixel=sim_config_dict(
-                spec.frame_rows,
-                spec.frame_cols,
-                sky_surface_brightness_mag_arcsec2=float(
-                    spec.sky_surface_brightness_mag_arcsec2
-                ),
-                n_subpixels=int(spec.n_subpixels),
-                scattered_light_e_s_pix=float(spec.scattered_light_e_s_pix),
-            )["Background Flux"],
+            background_flux_per_pixel=background_flux_per_pixel,
             scattered_light_per_pixel=scattered_light_per_pixel,
-            dark_current_per_pixel=DARK_CURRENT,
+            dark_current_per_pixel=dark_current_per_pixel,
             readout_noise=0.0 * u.electron / u.pix,
             subtract_nonstellar_mean=False,
             star_x_positions_pix=base_x + float(offset_x),
@@ -1602,7 +1678,8 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
             frame_rows=spec.frame_rows,
             frame_cols=spec.frame_cols,
             seed=int(args.seed),
-            column_noise_sigma_adu=float(spec.column_noise_sigma_adu),
+            spec=spec,
+            cosmic_ray_library=cosmic_ray_library,
         )
         if args.device.startswith("cuda"):
             torch.cuda.synchronize()
@@ -1657,7 +1734,7 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
             "psf_scale": float(psf_scale),
             "scattered_light_e_s_pix": float(scattered_light_per_pixel.value),
             "scattered_light_e_pix_frame": float(
-                scattered_light_per_pixel.value * EXPOSURE.to(u.s).value
+                scattered_light_per_pixel.value * float(spec.exposure_s)
             ),
             "effect_components": {
                 "psd_drift_pix": effect_arrays["psd_drift_pix"][frame_index],
@@ -1675,7 +1752,9 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
             "image_p99": float(np.percentile(image_np, 99)),
             "image_p999": float(np.percentile(image_np, 99.9)),
             "image_max": int(np.max(image_np)),
-            "saturated_pixels": int(np.count_nonzero(image_np >= (2**ADC_BIT_DEPTH - 1))),
+            "saturated_pixels": int(
+                np.count_nonzero(image_np >= (2 ** int(spec.adc_bit_depth) - 1))
+            ),
             "peak_cuda_allocated_mb": peak_allocated_mb,
             "peak_cuda_reserved_mb": peak_reserved_mb,
             "frame_path": str(frame_path),
@@ -1848,8 +1927,12 @@ def launch_or_run(args: argparse.Namespace, spec: MainRdRunSpec, script_path: Pa
     output_root = Path(args.output_root).expanduser()
     output_root.mkdir(parents=True, exist_ok=True)
     frame_indices = selected_frame_indices(args.frame_indices, args.frames)
-    cache_path = prepare_star_cache(args, spec)
     if args.dry_run:
+        cache_path = (
+            Path(args.star_cache).expanduser()
+            if args.star_cache is not None
+            else star_cache_path(output_root, spec, args.mag_limit)
+        )
         print(f"[Dry run] star_cache={cache_path}")
         print(
             f"[Dry run] frames={args.frames} gpus={args.gpus} "
@@ -1857,6 +1940,7 @@ def launch_or_run(args: argparse.Namespace, spec: MainRdRunSpec, script_path: Pa
         )
         return
 
+    cache_path = prepare_star_cache(args, spec)
     if args.worker_rank is not None:
         args.star_cache = cache_path if args.star_cache is None else args.star_cache
         run_worker(args, spec)
