@@ -27,6 +27,7 @@ the removed local `Photosim6ft` directory.
 | `scripts/et_sim_100_det_v4_thermal.py` | Wrapper for the `v4_thermal` profile. |
 | `scripts/et_sim_100_det_v5_prv_subpixel.py` | Wrapper for the `v5_prv_subpixel` profile. |
 | `config/et_100_det_inputs_1h.xlsx` | Baseline ET main-detector runtime spreadsheet recovered with the scripts. |
+| `main_rd_g18_parallel/` | Current parallel Photsim7-based `main_rd` full-effect simulation scripts, including detector-coordinate 500x500/700x700 sky23.2 scattered-light branches. |
 
 ## Runtime Inputs
 

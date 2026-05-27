@@ -633,6 +633,9 @@ _meta.update(
         "pixel_scale_arcsec_per_pix": float(pixel_scale.value),
         "detector_width_pix": int(detector_width_pix),
         "detector_height_pix": int(detector_height_pix),
+        "subtract_nonstellar_mean": bool(
+            config_manager.parameters["Subtract Nonstellar Mean"]
+        ),
         "gaia_gmag_lim": float(GAIA_GMAG_LIM),
         "apply_static_field_offset": bool(APPLY_STATIC_FIELD_OFFSET),
         "requested_field_offset_x_pix": (
