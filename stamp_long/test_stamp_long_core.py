@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import pickle
 import sys
 from pathlib import Path
@@ -116,6 +117,119 @@ def test_random_et_mag_sampling_is_star_stable_and_in_range():
     assert frame1.star_flux_e_s == pytest.approx(frame0.star_flux_e_s)
     assert other_star.et_mag != pytest.approx(frame0.et_mag)
     assert frame0.star_flux_e_s == pytest.approx(core.et_mag_to_photon_rate_e_s(frame0.et_mag))
+
+
+def test_parse_jitter_bank_variants_accepts_requested_grid():
+    variants = core.parse_jitter_bank_variants("100x200,100x300,200x400,300x600")
+
+    assert variants == [
+        core.JitterBankVariant(100, 200),
+        core.JitterBankVariant(100, 300),
+        core.JitterBankVariant(200, 400),
+        core.JitterBankVariant(300, 600),
+    ]
+    assert [variant.variant_id for variant in variants] == [
+        "J100F200",
+        "J100F300",
+        "J200F400",
+        "J300F600",
+    ]
+
+
+def test_derive_jitter_bank_variant_uses_master_prefix_and_even_frame_sampling():
+    master = np.arange(3 * 2 * 6, dtype=np.float32).reshape(3, 2, 6)
+
+    derived, metadata = core.derive_jitter_bank_variant(
+        master,
+        core.JitterBankVariant(2, 4),
+    )
+
+    assert derived.shape == (2, 2, 4)
+    assert metadata["source_shape"] == [3, 2, 6]
+    assert metadata["variant_shape"] == [2, 2, 4]
+    assert metadata["model_indices"] == [0, 1]
+    assert metadata["frame_indices"] == [0, 1, 3, 4]
+    assert np.array_equal(derived, master[:2, :, [0, 1, 3, 4]])
+
+
+def test_jitter_comparison_model_indices_include_edges_and_middle():
+    assert core.jitter_comparison_model_indices(100, max_samples=3) == [0, 50, 99]
+    assert core.jitter_comparison_model_indices(2, max_samples=3) == [0, 1]
+
+
+def test_stamp_difference_metrics_report_flux_centroid_and_relative_l2():
+    reference = np.zeros((3, 3), dtype=np.float32)
+    reference[1, 1] = 10.0
+    candidate = reference.copy()
+    candidate[1, 2] = 1.0
+
+    metrics = core.stamp_difference_metrics(candidate, reference)
+
+    assert metrics["max_abs_diff"] == pytest.approx(1.0)
+    assert metrics["rms_diff"] == pytest.approx(1.0 / 3.0)
+    assert metrics["relative_l2"] == pytest.approx(0.1)
+    assert metrics["reference_flux"] == pytest.approx(10.0)
+    assert metrics["candidate_flux"] == pytest.approx(11.0)
+    assert metrics["flux_delta_fraction"] == pytest.approx(0.1)
+    assert metrics["centroid_shift_pix"] > 0.0
+
+
+def test_jitter_sensitivity_cases_default_to_representative_short_and_long_cases():
+    cases = core.jitter_sensitivity_cases(None)
+
+    assert [(case.case_id, case.exposure_s, case.stamp_size) for case in cases] == [
+        ("J030S11", 30.0, 11),
+        ("J300S15", 300.0, 15),
+    ]
+
+
+def test_run_jitter_sensitivity_dry_run_reports_cases_and_variants(tmp_path):
+    summary = core.run_jitter_sensitivity(
+        output_root=tmp_path,
+        variants=core.parse_jitter_bank_variants("100x200,300x600"),
+        cases=core.jitter_sensitivity_cases("J030S11"),
+        global_seed=20260617,
+        device_mode="cuda",
+        dry_run=True,
+    )
+
+    assert summary["dry_run"] is True
+    assert summary["output_root"] == str(tmp_path)
+    assert [case["case_id"] for case in summary["cases"]] == ["J030S11"]
+    assert [variant["variant_id"] for variant in summary["variants"]] == [
+        "J100F200",
+        "J300F600",
+    ]
+    assert summary["master_variant"]["variant_id"] == "J300F600"
+    assert summary["global_seed"] == 20260617
+    assert summary["device_mode"] == "cuda"
+
+
+def test_run_jitter_sensitivity_cli_dry_run_prints_json(tmp_path, capsys):
+    exit_code = core.run_jitter_sensitivity_cli(
+        [
+            "--dry-run",
+            "--output-root",
+            str(tmp_path),
+            "--cases",
+            "J030S11",
+            "--variants",
+            "100x200,300x600",
+            "--device",
+            "cuda",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 0
+    assert payload["dry_run"] is True
+    assert payload["output_root"] == str(tmp_path)
+    assert [case["case_id"] for case in payload["cases"]] == ["J030S11"]
+    assert [variant["variant_id"] for variant in payload["variants"]] == [
+        "J100F200",
+        "J300F600",
+    ]
 
 
 def test_resolve_data_path_uses_et_data_dir_for_relative_assets(tmp_path):

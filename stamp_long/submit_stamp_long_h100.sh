@@ -4,7 +4,7 @@
 #   sbatch /cluster/home/cxgao/ET/ET-mainsim/stamp_long/submit_stamp_long_h100.sh
 #
 # Runtime overrides:
-#   STAGE=smoke|compute|io|physics
+#   STAGE=smoke|compute|io|physics|jitter_sensitivity
 #   WORKERS_PER_GPU=10
 #   MATRIX_PRESET=stamp_scale_v2
 #   SCALE_GROUP=short_high_star|long_low_star
@@ -17,6 +17,10 @@
 #   ET_MAG_MAX=14.5
 #   COSMIC_RAY_LIBRARY=/cluster/home/cxgao/ET/Photsim7-data/path/to/events.npz
 #   PSF_BUNDLE_NAME=psf/et/241006/D280mm-focus
+#   JITTER_VARIANTS=100x200,100x300,200x400,300x600
+#   JITTER_CASES=J030S11,J300S15
+#   JITTER_MODEL_SAMPLES=3
+#   SAVE_JITTER_ARRAYS=1
 
 #SBATCH --job-name=stamp_long_h100
 #SBATCH --partition=gpu
@@ -34,7 +38,17 @@ WORKERS_PER_GPU="${WORKERS_PER_GPU:-10}"
 GPUS="${GPUS:-0,1,2}"
 SEED="${SEED:-20260617}"
 DEVICE="${DEVICE:-cuda}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/cluster/home/cxgao/sshfs-share/ET-mainsim/stamp_long}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-}"
+if [[ -z "${OUTPUT_ROOT}" ]]; then
+  case "${STAGE}" in
+    jitter|jitter_sensitivity)
+      OUTPUT_ROOT="/cluster/home/cxgao/sshfs-share/ET-mainsim/stamp_long_jitter_sensitivity"
+      ;;
+    *)
+      OUTPUT_ROOT="/cluster/home/cxgao/sshfs-share/ET-mainsim/stamp_long"
+      ;;
+  esac
+fi
 CASE_IDS="${CASE_IDS:-}"
 MATRIX_PRESET="${MATRIX_PRESET:-}"
 SCALE_GROUP="${SCALE_GROUP:-}"
@@ -65,6 +79,10 @@ PSD_MOTION_PATH="${PSD_MOTION_PATH:-pds/ET_psd3-2.pkl}"
 DVA_MODEL_PATH="${DVA_MODEL_PATH:-DVA/et/ET_DVA_effect_models_slim_v231117.pkl}"
 JITTER_PSF_MODELS="${JITTER_PSF_MODELS:-300}"
 JITTER_FRAMES_PER_MODEL="${JITTER_FRAMES_PER_MODEL:-600}"
+JITTER_VARIANTS="${JITTER_VARIANTS:-100x200,100x300,200x400,300x600}"
+JITTER_CASES="${JITTER_CASES:-}"
+JITTER_MODEL_SAMPLES="${JITTER_MODEL_SAMPLES:-3}"
+SAVE_JITTER_ARRAYS="${SAVE_JITTER_ARRAYS:-1}"
 DYNAMIC_EFFECTS="${DYNAMIC_EFFECTS:-1}"
 PSD_MOTION="${PSD_MOTION:-1}"
 DVA_DRIFT="${DVA_DRIFT:-1}"
@@ -77,12 +95,18 @@ echo "job_id=${SLURM_JOB_ID:-unknown}"
 echo "host=$(hostname)"
 date
 echo "stage=${STAGE}"
+echo "output_root=${OUTPUT_ROOT}"
 echo "matrix_preset=${MATRIX_PRESET:-unset}"
 echo "scale_group=${SCALE_GROUP:-unset}"
 echo "workers_per_gpu=${WORKERS_PER_GPU}"
 echo "star_flux_mode=${STAR_FLUX_MODE}"
 echo "et_mag_range=${ET_MAG_MIN},${ET_MAG_MAX}"
 echo "jitter_psf=${JITTER_PSF_MODELS}x${JITTER_FRAMES_PER_MODEL}"
+if [[ "${STAGE}" == "jitter" || "${STAGE}" == "jitter_sensitivity" ]]; then
+  echo "jitter_variants=${JITTER_VARIANTS}"
+  echo "jitter_cases=${JITTER_CASES:-default}"
+  echo "jitter_model_samples=${JITTER_MODEL_SAMPLES}"
+fi
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu --format=csv,noheader,nounits || true
 
@@ -133,8 +157,11 @@ case "${STAGE}" in
   physics)
     RUNNER="stamp_long/run_stamp_long_physics_benchmark.py"
     ;;
+  jitter|jitter_sensitivity)
+    RUNNER="stamp_long/run_stamp_long_jitter_sensitivity.py"
+    ;;
   *)
-    echo "Unknown STAGE=${STAGE}; expected smoke, compute, io, or physics" >&2
+    echo "Unknown STAGE=${STAGE}; expected smoke, compute, io, physics, or jitter_sensitivity" >&2
     exit 2
     ;;
 esac
@@ -194,6 +221,18 @@ if [[ -n "${WRITE_MODE}" ]]; then
 fi
 if [[ "${DRY_RUN}" == "1" ]]; then
   cmd+=(--dry-run)
+fi
+if [[ "${STAGE}" == "jitter" || "${STAGE}" == "jitter_sensitivity" ]]; then
+  cmd+=(--variants "${JITTER_VARIANTS}")
+  cmd+=(--model-samples "${JITTER_MODEL_SAMPLES}")
+  if [[ -n "${JITTER_CASES}" ]]; then
+    cmd+=(--cases "${JITTER_CASES}")
+  fi
+  if [[ "${SAVE_JITTER_ARRAYS}" == "1" ]]; then
+    cmd+=(--save-arrays)
+  else
+    cmd+=(--no-save-arrays)
+  fi
 fi
 if [[ "${PHOTSIM7_PSF}" == "1" ]]; then
   cmd+=(--photsim7-psf)

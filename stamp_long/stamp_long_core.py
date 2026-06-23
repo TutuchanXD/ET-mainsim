@@ -14,7 +14,7 @@ import sys
 import time
 import types
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -28,6 +28,12 @@ DEFAULT_OUTPUT_ROOT = Path(
     os.environ.get(
         "RESULTS_ROOT",
         "/home/cxgao/Results/ET-mainsim/stamp_long",
+    )
+)
+DEFAULT_JITTER_SENSITIVITY_OUTPUT_ROOT = Path(
+    os.environ.get(
+        "JITTER_SENSITIVITY_OUTPUT_ROOT",
+        str(DEFAULT_OUTPUT_ROOT.parent / "stamp_long_jitter_sensitivity"),
     )
 )
 DEFAULT_BASE_EXPOSURE_S = 10.0
@@ -230,6 +236,24 @@ class RenderOptions:
 
 
 @dataclass(frozen=True)
+class JitterBankVariant:
+    n_models: int
+    n_frames_per_model: int
+
+    @property
+    def variant_id(self) -> str:
+        return f"J{int(self.n_models):03d}F{int(self.n_frames_per_model):03d}"
+
+
+@dataclass(frozen=True)
+class JitterSensitivityCase:
+    case_id: str
+    exposure_s: float
+    stamp_size: int
+    description: str
+
+
+@dataclass(frozen=True)
 class StampRecord:
     case_id: str
     exposure_time_s: float
@@ -356,6 +380,199 @@ def _normalize_star_flux_mode(star_flux_mode: str) -> str:
             f"Unsupported star_flux_mode {star_flux_mode!r}; expected fixed or random_et_mag"
         )
     return normalized
+
+
+def parse_jitter_bank_variants(raw: str | None) -> list[JitterBankVariant]:
+    if raw is None or str(raw).strip() == "":
+        return [
+            JitterBankVariant(100, 200),
+            JitterBankVariant(100, 300),
+            JitterBankVariant(200, 400),
+            JitterBankVariant(300, 600),
+        ]
+    variants: list[JitterBankVariant] = []
+    for token in str(raw).split(","):
+        item = token.strip().lower().replace("*", "x")
+        if not item:
+            continue
+        if "x" not in item:
+            raise ValueError(
+                f"Invalid jitter bank variant {token!r}; expected '<models>x<frames>'"
+            )
+        n_models_raw, n_frames_raw = item.split("x", 1)
+        variant = JitterBankVariant(int(n_models_raw), int(n_frames_raw))
+        if variant.n_models <= 0 or variant.n_frames_per_model <= 0:
+            raise ValueError(f"Jitter bank variant values must be positive: {token!r}")
+        variants.append(variant)
+    if not variants:
+        raise ValueError("At least one jitter bank variant is required")
+    return variants
+
+
+def jitter_frame_indices(source_frames: int, target_frames: int) -> list[int]:
+    source_frames = int(source_frames)
+    target_frames = int(target_frames)
+    if source_frames <= 0 or target_frames <= 0:
+        raise ValueError("source_frames and target_frames must be positive")
+    if target_frames > source_frames:
+        raise ValueError(
+            f"target_frames must be <= source_frames, got {target_frames} > {source_frames}"
+        )
+    indices = np.floor(
+        np.arange(target_frames, dtype=np.float64)
+        * float(source_frames)
+        / float(target_frames)
+    ).astype(np.int64)
+    return [int(index) for index in indices]
+
+
+def derive_jitter_bank_variant(
+    master_xy_jitter_pix: np.ndarray,
+    variant: JitterBankVariant,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    master = np.asarray(master_xy_jitter_pix, dtype=np.float32)
+    if master.ndim != 3 or master.shape[1] != 2:
+        raise ValueError(
+            "master_xy_jitter_pix must have shape (n_models, 2, n_frames_per_model), "
+            f"got {master.shape}"
+        )
+    if int(variant.n_models) > int(master.shape[0]):
+        raise ValueError(
+            f"variant n_models must be <= master n_models, got {variant.n_models} > {master.shape[0]}"
+        )
+    if int(variant.n_frames_per_model) > int(master.shape[2]):
+        raise ValueError(
+            "variant n_frames_per_model must be <= master n_frames_per_model, "
+            f"got {variant.n_frames_per_model} > {master.shape[2]}"
+        )
+    model_indices = list(range(int(variant.n_models)))
+    frame_indices = jitter_frame_indices(
+        int(master.shape[2]),
+        int(variant.n_frames_per_model),
+    )
+    derived = master[: int(variant.n_models), :, frame_indices].copy()
+    metadata = {
+        "variant_id": variant.variant_id,
+        "source_shape": [int(value) for value in master.shape],
+        "variant_shape": [int(value) for value in derived.shape],
+        "model_indices": model_indices,
+        "frame_indices": frame_indices,
+        "model_coverage_fraction": float(variant.n_models) / float(master.shape[0]),
+        "frame_coverage_fraction": float(variant.n_frames_per_model) / float(master.shape[2]),
+    }
+    return derived, metadata
+
+
+def jitter_comparison_model_indices(n_models: int, *, max_samples: int = 3) -> list[int]:
+    n_models = int(n_models)
+    max_samples = int(max_samples)
+    if n_models <= 0:
+        raise ValueError(f"n_models must be positive, got {n_models}")
+    if max_samples <= 0:
+        raise ValueError(f"max_samples must be positive, got {max_samples}")
+    if n_models <= max_samples:
+        return list(range(n_models))
+    raw = np.linspace(0, n_models - 1, max_samples)
+    indices = sorted({int(round(value)) for value in raw})
+    if indices[0] != 0:
+        indices.insert(0, 0)
+    if indices[-1] != n_models - 1:
+        indices.append(n_models - 1)
+    return indices[:max_samples]
+
+
+def jitter_sensitivity_cases(raw: str | None) -> list[JitterSensitivityCase]:
+    cases = [
+        JitterSensitivityCase("J030S11", 30.0, 11, "30 s 11x11 short-exposure representative"),
+        JitterSensitivityCase("J300S15", 300.0, 15, "300 s 15x15 long-exposure representative"),
+    ]
+    if raw is None or str(raw).strip() == "":
+        return cases
+    wanted = {token.strip() for token in str(raw).split(",") if token.strip()}
+    filtered = [case for case in cases if case.case_id in wanted]
+    missing = sorted(wanted - {case.case_id for case in filtered})
+    if missing:
+        raise ValueError(f"Unknown jitter sensitivity case ids: {missing}")
+    return filtered
+
+
+def _master_jitter_variant(variants: Sequence[JitterBankVariant]) -> JitterBankVariant:
+    if not variants:
+        raise ValueError("At least one jitter bank variant is required")
+    return max(
+        variants,
+        key=lambda variant: (int(variant.n_models), int(variant.n_frames_per_model)),
+    )
+
+
+def _image_moments(image: np.ndarray) -> dict[str, float]:
+    weights = np.asarray(image, dtype=np.float64)
+    total = float(np.sum(weights))
+    if not np.isfinite(total) or np.isclose(total, 0.0):
+        return {
+            "flux": total,
+            "centroid_x": math.nan,
+            "centroid_y": math.nan,
+            "second_moment_radius_pix": math.nan,
+        }
+    yy, xx = np.indices(weights.shape, dtype=np.float64)
+    centroid_x = float(np.sum(weights * xx) / total)
+    centroid_y = float(np.sum(weights * yy) / total)
+    radius2 = (xx - centroid_x) ** 2 + (yy - centroid_y) ** 2
+    second_moment = float(np.sum(weights * radius2) / total)
+    return {
+        "flux": total,
+        "centroid_x": centroid_x,
+        "centroid_y": centroid_y,
+        "second_moment_radius_pix": math.sqrt(max(second_moment, 0.0)),
+    }
+
+
+def stamp_difference_metrics(
+    candidate: np.ndarray,
+    reference: np.ndarray,
+) -> dict[str, float]:
+    candidate_arr = np.asarray(candidate, dtype=np.float64)
+    reference_arr = np.asarray(reference, dtype=np.float64)
+    if candidate_arr.shape != reference_arr.shape:
+        raise ValueError(
+            f"candidate and reference shapes must match, got {candidate_arr.shape} and {reference_arr.shape}"
+        )
+    diff = candidate_arr - reference_arr
+    diff_l2 = float(np.linalg.norm(diff.ravel()))
+    reference_l2 = float(np.linalg.norm(reference_arr.ravel()))
+    candidate_moments = _image_moments(candidate_arr)
+    reference_moments = _image_moments(reference_arr)
+    centroid_shift = math.hypot(
+        candidate_moments["centroid_x"] - reference_moments["centroid_x"],
+        candidate_moments["centroid_y"] - reference_moments["centroid_y"],
+    )
+    reference_flux = reference_moments["flux"]
+    candidate_flux = candidate_moments["flux"]
+    flux_delta = candidate_flux - reference_flux
+    return {
+        "max_abs_diff": float(np.max(np.abs(diff))),
+        "mean_abs_diff": float(np.mean(np.abs(diff))),
+        "rms_diff": float(math.sqrt(np.mean(diff * diff))),
+        "relative_l2": diff_l2 / reference_l2 if reference_l2 > 0.0 else math.nan,
+        "reference_flux": float(reference_flux),
+        "candidate_flux": float(candidate_flux),
+        "flux_delta": float(flux_delta),
+        "flux_delta_fraction": (
+            flux_delta / reference_flux if not np.isclose(reference_flux, 0.0) else math.nan
+        ),
+        "reference_centroid_x": reference_moments["centroid_x"],
+        "reference_centroid_y": reference_moments["centroid_y"],
+        "candidate_centroid_x": candidate_moments["centroid_x"],
+        "candidate_centroid_y": candidate_moments["centroid_y"],
+        "centroid_shift_pix": float(centroid_shift),
+        "reference_second_moment_radius_pix": reference_moments["second_moment_radius_pix"],
+        "candidate_second_moment_radius_pix": candidate_moments["second_moment_radius_pix"],
+        "second_moment_radius_delta_pix": (
+            candidate_moments["second_moment_radius_pix"]
+            - reference_moments["second_moment_radius_pix"]
+        ),
+    }
 
 
 def split_ranges(total_items: int, n_parts: int) -> list[IndexRange]:
@@ -1077,6 +1294,65 @@ def _photsim7_psf_metadata(
     }
 
 
+def _build_photsim7_stamp_renderer_from_xy_jitter(
+    *,
+    stamp_size: int,
+    exposure_s: float,
+    psf_bundle_name: str,
+    psf_field_id: int,
+    psf_subpixels: int,
+    device: str,
+    integrate_jitter: bool,
+    jitter_integrated_psf_models: int,
+    jitter_frames_per_model: int,
+    xy_jitter_pix: np.ndarray | None,
+    jitter_metadata: dict[str, Any] | None,
+):
+    ensure_photsim7_imports()
+    from astropy import units as u
+    from photsim7.psf.model import PSFModelManager
+    from photsim7.stamp_renderer import SingleCadenceStampRenderer
+
+    actor_config = {
+        "bundle_name": str(psf_bundle_name),
+        "pixel_scale": PIXEL_SCALE_ARCSEC_PER_PIX * u.arcsec / u.pix,
+        "n_rows": int(stamp_size),
+        "n_cols": int(stamp_size),
+        "n_subpixels": int(psf_subpixels),
+        "integrate_jitter": bool(integrate_jitter),
+        "n_jitter_integrated_psf_models": (
+            int(jitter_integrated_psf_models) if bool(integrate_jitter) else 1
+        ),
+        "n_jitter_frames": int(jitter_frames_per_model) if bool(integrate_jitter) else 1,
+        "compute_device": str(device),
+        "float_precision": 32,
+    }
+    psf_manager = PSFModelManager(
+        config=actor_config,
+        warp_frame_batch_size=10,
+        xy_jitter_pix=xy_jitter_pix,
+        intialize=True,
+        build_jit_int_models=True,
+        field_ids=np.asarray([int(psf_field_id)], dtype=np.int64),
+        pad_to_detector_shape=False,
+    )
+    sim_config = {
+        "Subpixels Per Pixel Dim": int(psf_subpixels),
+        "Subtract Nonstellar Mean": False,
+    }
+    renderer = SingleCadenceStampRenderer(
+        sim_config=sim_config,
+        psf_model_manager=psf_manager,
+        stamp_size_pix=int(stamp_size),
+        frame_exposure=float(exposure_s) * u.s,
+        detector_response_sampler=None,
+        compute_device=str(device),
+        float_precision=32,
+    )
+    renderer.jitter_metadata = {} if jitter_metadata is None else dict(jitter_metadata)
+    return renderer
+
+
 @lru_cache(maxsize=16)
 def _build_photsim7_stamp_renderer_cached(
     stamp_size: int,
@@ -1308,6 +1584,37 @@ def _render_photsim7_stamp(config: StampRenderConfig) -> tuple[np.ndarray, dict[
             jitter_model_index=jitter_model_index,
         ),
     )
+
+
+def _render_expected_photsim7_stamp_with_renderer(
+    *,
+    renderer: Any,
+    config: StampRenderConfig,
+    device: str,
+    jitter_model_index: int,
+) -> np.ndarray:
+    from astropy import units as u
+
+    dynamic = _dynamic_effects_for_frame(config)
+    dx_pix, dy_pix = (0.0, 0.0)
+    psf_scale = 1.0
+    if dynamic["enabled"]:
+        dx_pix, dy_pix = dynamic["total_offset_pix"]
+        psf_scale = float(dynamic["psf_scale"])
+    detector_response_sampler = _build_stamp_local_response_sampler(config, device)
+    image = renderer.render_expected_stellar_stamp(
+        photon_count=float(config.star_flux_e_s) * float(config.exposure_s) * u.electron,
+        field_id=int(config.psf_field_id),
+        target_x_offset_pix=float(dx_pix),
+        target_y_offset_pix=float(dy_pix),
+        psf_scale=float(psf_scale),
+        jitter_model_index=int(jitter_model_index),
+        detector_response_sampler=detector_response_sampler,
+        response_y_start_pix=int(config.response_padding_pix),
+        response_x_start_pix=int(config.response_padding_pix),
+        return_numpy=True,
+    )
+    return np.asarray(image, dtype=np.float32)
 
 
 def _render_torch_stamp(config: StampRenderConfig) -> np.ndarray:
@@ -2003,6 +2310,369 @@ def run_stage(
     return results
 
 
+def _write_csv_rows(path: Path | str, rows: Sequence[dict[str, Any]]) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return path
+    fieldnames: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def _jitter_experiment_device(device_mode: str) -> str:
+    requested = "cuda:0" if str(device_mode) == "cuda" else str(device_mode)
+    resolved = _resolve_requested_device(requested)
+    if resolved.startswith("cuda"):
+        try:
+            import torch
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("CUDA device requested but torch is not installed") from exc
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"CUDA device requested ({resolved}) but torch.cuda.is_available() is False"
+            )
+    return resolved
+
+
+def _jitter_case_to_benchmark(case: JitterSensitivityCase) -> BenchmarkCase:
+    return BenchmarkCase(
+        str(case.case_id),
+        "jitter_sensitivity",
+        1,
+        float(case.exposure_s),
+        1,
+        int(case.stamp_size),
+        "none",
+        1,
+        str(case.description),
+    )
+
+
+def _build_renderer_for_jitter_variant(
+    *,
+    case: JitterSensitivityCase,
+    variant: JitterBankVariant,
+    xy_jitter_pix: np.ndarray,
+    jitter_metadata: dict[str, Any],
+    render_options: RenderOptions,
+    device: str,
+):
+    return _build_photsim7_stamp_renderer_from_xy_jitter(
+        stamp_size=int(case.stamp_size),
+        exposure_s=float(case.exposure_s),
+        psf_bundle_name=str(render_options.psf_bundle_name),
+        psf_field_id=int(render_options.psf_field_id),
+        psf_subpixels=int(render_options.psf_subpixels),
+        device=str(device),
+        integrate_jitter=True,
+        jitter_integrated_psf_models=int(variant.n_models),
+        jitter_frames_per_model=int(variant.n_frames_per_model),
+        xy_jitter_pix=xy_jitter_pix,
+        jitter_metadata=jitter_metadata,
+    )
+
+
+def run_jitter_sensitivity_case(
+    case: JitterSensitivityCase,
+    *,
+    output_root: Path | str,
+    variants: Sequence[JitterBankVariant],
+    global_seed: int,
+    device_mode: str,
+    render_options: RenderOptions | None = None,
+    star_id: int = 0,
+    frame_id: int = 0,
+    model_samples: int = 3,
+    save_arrays: bool = True,
+) -> dict[str, Any]:
+    output_root = Path(output_root).expanduser()
+    case_dir = output_root / str(case.case_id)
+    case_dir.mkdir(parents=True, exist_ok=True)
+    arrays_dir = case_dir / "arrays"
+    render_options = RenderOptions() if render_options is None else render_options
+    variants = list(variants)
+    master_variant = _master_jitter_variant(variants)
+    device = _jitter_experiment_device(device_mode)
+
+    benchmark_case = _jitter_case_to_benchmark(case)
+    seed = derive_seed(
+        int(global_seed),
+        exposure_s=float(case.exposure_s),
+        frame_id=int(frame_id),
+        star_id=int(star_id),
+        effect_type="stamp",
+    )
+    base_config = _build_render_config(
+        benchmark_case,
+        seed=seed,
+        global_seed=int(global_seed),
+        star_id=int(star_id),
+        frame_id=int(frame_id),
+        device=device,
+        render_options=render_options,
+    )
+    reference_config = replace(
+        base_config,
+        jitter_integrated_psf_models=int(master_variant.n_models),
+        jitter_frames_per_model=int(master_variant.n_frames_per_model),
+        device=device,
+    )
+    psd_path = _optional_resolved_path(base_config.psd_motion_path)
+    if psd_path is None:
+        raise ValueError("Jitter sensitivity experiment requires a PSD motion path")
+    jitter_seed = derive_seed(
+        int(global_seed),
+        exposure_s=float(case.exposure_s),
+        frame_id=0,
+        star_id=0,
+        effect_type="jitter_integrated_psf",
+    )
+
+    main_rd_core = _main_rd_core_module()
+    master_start = time.perf_counter()
+    master_xy_jitter_pix, master_jitter_metadata = main_rd_core.jitter_integrated_psf_offsets(
+        seed=int(jitter_seed),
+        enable_psd_motion=True,
+        enable_jitter_integrated_psf=True,
+        psd_motion_path=psd_path,
+        n_models=int(master_variant.n_models),
+        n_frames_per_model=int(master_variant.n_frames_per_model),
+        exposure_s=float(case.exposure_s),
+    )
+    master_generation_time_s = float(time.perf_counter() - master_start)
+
+    write_json(
+        case_dir / "case_config.json",
+        {
+            "case": asdict(case),
+            "variants": [asdict(variant) | {"variant_id": variant.variant_id} for variant in variants],
+            "master_variant": asdict(master_variant) | {"variant_id": master_variant.variant_id},
+            "global_seed": int(global_seed),
+            "stamp_seed": int(seed),
+            "jitter_seed": int(jitter_seed),
+            "device": str(device),
+            "render_options": asdict(render_options),
+            "resource_paths": _resource_metadata(render_options),
+            "comparison": "deterministic expected stellar stamp; stochastic photon/read/background noise disabled",
+        },
+    )
+    write_json(case_dir / "environment.json", environment_metadata())
+
+    metrics_rows: list[dict[str, Any]] = []
+    variant_rows: list[dict[str, Any]] = []
+    reference_cache: dict[int, np.ndarray] = {}
+    reference_renderer = None
+    reference_build_time_s = math.nan
+
+    for variant in variants:
+        derived_xy, derive_metadata = derive_jitter_bank_variant(
+            master_xy_jitter_pix,
+            variant,
+        )
+        variant_config = replace(
+            base_config,
+            jitter_integrated_psf_models=int(variant.n_models),
+            jitter_frames_per_model=int(variant.n_frames_per_model),
+            device=device,
+        )
+        variant_jitter_metadata = dict(master_jitter_metadata)
+        variant_jitter_metadata.update(
+            {
+                "derived_from_master_variant": master_variant.variant_id,
+                "derive_metadata": derive_metadata,
+            }
+        )
+        build_start = time.perf_counter()
+        renderer = _build_renderer_for_jitter_variant(
+            case=case,
+            variant=variant,
+            xy_jitter_pix=derived_xy,
+            jitter_metadata=variant_jitter_metadata,
+            render_options=render_options,
+            device=device,
+        )
+        build_time_s = float(time.perf_counter() - build_start)
+        if variant == master_variant:
+            reference_renderer = renderer
+            reference_build_time_s = build_time_s
+
+        model_indices = jitter_comparison_model_indices(
+            int(variant.n_models),
+            max_samples=int(model_samples),
+        )
+        render_time_s = 0.0
+        variant_metric_rows: list[dict[str, Any]] = []
+        for model_index in model_indices:
+            if model_index not in reference_cache:
+                if reference_renderer is None:
+                    ref_xy, ref_metadata = derive_jitter_bank_variant(
+                        master_xy_jitter_pix,
+                        master_variant,
+                    )
+                    ref_metadata["derived_from_master_variant"] = master_variant.variant_id
+                    ref_build_start = time.perf_counter()
+                    reference_renderer = _build_renderer_for_jitter_variant(
+                        case=case,
+                        variant=master_variant,
+                        xy_jitter_pix=ref_xy,
+                        jitter_metadata=dict(master_jitter_metadata) | {"derive_metadata": ref_metadata},
+                        render_options=render_options,
+                        device=device,
+                    )
+                    reference_build_time_s = float(time.perf_counter() - ref_build_start)
+                reference_cache[model_index] = _render_expected_photsim7_stamp_with_renderer(
+                    renderer=reference_renderer,
+                    config=reference_config,
+                    device=device,
+                    jitter_model_index=int(model_index),
+                )
+            reference_stamp = reference_cache[model_index]
+            render_start = time.perf_counter()
+            candidate_stamp = _render_expected_photsim7_stamp_with_renderer(
+                renderer=renderer,
+                config=variant_config,
+                device=device,
+                jitter_model_index=int(model_index),
+            )
+            render_time_s += float(time.perf_counter() - render_start)
+            row = {
+                "case_id": str(case.case_id),
+                "variant_id": variant.variant_id,
+                "n_models": int(variant.n_models),
+                "n_frames_per_model": int(variant.n_frames_per_model),
+                "model_index": int(model_index),
+                "master_variant_id": master_variant.variant_id,
+                "master_generation_time_s": float(master_generation_time_s),
+                "build_time_s": float(build_time_s),
+                "reference_build_time_s": float(reference_build_time_s),
+                "render_time_s": float(render_time_s),
+            }
+            row.update(stamp_difference_metrics(candidate_stamp, reference_stamp))
+            metrics_rows.append(row)
+            variant_metric_rows.append(row)
+            if save_arrays and model_index == model_indices[0]:
+                arrays_dir.mkdir(parents=True, exist_ok=True)
+                np.save(
+                    arrays_dir / f"reference_{master_variant.variant_id}_model{model_index:03d}.npy",
+                    reference_stamp.astype(np.float32, copy=False),
+                )
+                np.save(
+                    arrays_dir / f"{variant.variant_id}_model{model_index:03d}.npy",
+                    candidate_stamp.astype(np.float32, copy=False),
+                )
+                np.save(
+                    arrays_dir / f"diff_{variant.variant_id}_model{model_index:03d}.npy",
+                    (candidate_stamp - reference_stamp).astype(np.float32, copy=False),
+                )
+
+        def _mean(name: str) -> float:
+            return float(np.mean([float(row[name]) for row in variant_metric_rows]))
+
+        variant_rows.append(
+            {
+                "case_id": str(case.case_id),
+                "variant_id": variant.variant_id,
+                "n_models": int(variant.n_models),
+                "n_frames_per_model": int(variant.n_frames_per_model),
+                "model_indices": json.dumps(model_indices),
+                "master_generation_time_s": float(master_generation_time_s),
+                "build_time_s": float(build_time_s),
+                "render_time_s": float(render_time_s),
+                "mean_relative_l2": _mean("relative_l2"),
+                "mean_rms_diff": _mean("rms_diff"),
+                "mean_flux_delta_fraction": _mean("flux_delta_fraction"),
+                "mean_centroid_shift_pix": _mean("centroid_shift_pix"),
+                "mean_second_moment_radius_delta_pix": _mean("second_moment_radius_delta_pix"),
+            }
+        )
+
+    _write_csv_rows(case_dir / "metrics.csv", metrics_rows)
+    _write_csv_rows(case_dir / "variants.csv", variant_rows)
+    summary = {
+        "case": asdict(case),
+        "output_root": str(output_root),
+        "case_dir": str(case_dir),
+        "device": str(device),
+        "global_seed": int(global_seed),
+        "stamp_seed": int(seed),
+        "jitter_seed": int(jitter_seed),
+        "master_variant": asdict(master_variant) | {"variant_id": master_variant.variant_id},
+        "master_generation_time_s": float(master_generation_time_s),
+        "variants": variant_rows,
+        "metrics_csv": str(case_dir / "metrics.csv"),
+        "variants_csv": str(case_dir / "variants.csv"),
+        "arrays_dir": str(arrays_dir) if save_arrays else None,
+    }
+    write_json(case_dir / "summary.json", summary)
+    return summary
+
+
+def run_jitter_sensitivity(
+    *,
+    output_root: Path | str,
+    variants: Sequence[JitterBankVariant] | None = None,
+    cases: Sequence[JitterSensitivityCase] | None = None,
+    global_seed: int,
+    device_mode: str,
+    render_options: RenderOptions | None = None,
+    dry_run: bool = False,
+    model_samples: int = 3,
+    save_arrays: bool = True,
+) -> dict[str, Any]:
+    output_root = Path(output_root).expanduser()
+    variants = parse_jitter_bank_variants(None) if variants is None else list(variants)
+    cases = jitter_sensitivity_cases(None) if cases is None else list(cases)
+    master_variant = _master_jitter_variant(variants)
+    if dry_run:
+        return {
+            "dry_run": True,
+            "output_root": str(output_root),
+            "cases": [asdict(case) for case in cases],
+            "variants": [asdict(variant) | {"variant_id": variant.variant_id} for variant in variants],
+            "master_variant": asdict(master_variant) | {"variant_id": master_variant.variant_id},
+            "global_seed": int(global_seed),
+            "device_mode": str(device_mode),
+            "model_samples": int(model_samples),
+            "comparison": "deterministic expected stellar stamp; variants derived from one master jitter bank",
+        }
+
+    case_summaries = [
+        run_jitter_sensitivity_case(
+            case,
+            output_root=output_root,
+            variants=variants,
+            global_seed=int(global_seed),
+            device_mode=str(device_mode),
+            render_options=render_options,
+            model_samples=int(model_samples),
+            save_arrays=bool(save_arrays),
+        )
+        for case in cases
+    ]
+    summary = {
+        "dry_run": False,
+        "output_root": str(output_root),
+        "cases": [item["case"] for item in case_summaries],
+        "case_summaries": case_summaries,
+        "variants": [asdict(variant) | {"variant_id": variant.variant_id} for variant in variants],
+        "master_variant": asdict(master_variant) | {"variant_id": master_variant.variant_id},
+        "global_seed": int(global_seed),
+        "device_mode": str(device_mode),
+        "model_samples": int(model_samples),
+    }
+    write_json(output_root / "summary.json", summary)
+    return summary
+
+
 def _parse_csv_floats(raw: str | None) -> list[float] | None:
     if raw is None or str(raw).strip() == "":
         return None
@@ -2099,10 +2769,8 @@ def build_arg_parser(stage: str) -> argparse.ArgumentParser:
     return parser
 
 
-def run_cli(stage: str, argv: Sequence[str] | None = None) -> int:
-    parser = build_arg_parser(stage)
-    args = parser.parse_args(argv)
-    render_options = RenderOptions(
+def _render_options_from_args(args: argparse.Namespace) -> RenderOptions:
+    return RenderOptions(
         star_flux_e_s=float(args.star_flux_e_s),
         star_flux_mode=_normalize_star_flux_mode(args.star_flux_mode),
         et_mag_min=float(args.et_mag_min),
@@ -2140,6 +2808,68 @@ def run_cli(stage: str, argv: Sequence[str] | None = None) -> int:
         enable_momentum_dump=bool(args.enable_momentum_dump),
         enable_psf_breathing=bool(args.enable_psf_breathing),
     )
+
+
+def build_jitter_sensitivity_arg_parser() -> argparse.ArgumentParser:
+    parser = build_arg_parser("jitter_sensitivity")
+    parser.description = "Run stamp_long jitter-integrated PSF bank sensitivity experiment"
+    parser.set_defaults(output_root=DEFAULT_JITTER_SENSITIVITY_OUTPUT_ROOT)
+    parser.add_argument(
+        "--variants",
+        type=str,
+        default=os.environ.get("JITTER_VARIANTS", "100x200,100x300,200x400,300x600"),
+        help="Comma-separated jitter bank variants such as 100x200,100x300,200x400,300x600.",
+    )
+    parser.add_argument(
+        "--cases",
+        type=str,
+        default=os.environ.get("JITTER_CASES"),
+        help="Comma-separated jitter sensitivity case ids. Defaults to J030S11,J300S15.",
+    )
+    parser.add_argument(
+        "--model-samples",
+        type=int,
+        default=int(os.environ.get("JITTER_MODEL_SAMPLES", "3")),
+        help="Number of jitter model indices to compare per variant.",
+    )
+    parser.add_argument(
+        "--save-arrays",
+        dest="save_arrays",
+        action="store_true",
+        default=os.environ.get("SAVE_JITTER_ARRAYS", "1") != "0",
+        help="Save representative reference/candidate/difference .npy arrays.",
+    )
+    parser.add_argument(
+        "--no-save-arrays",
+        dest="save_arrays",
+        action="store_false",
+        help="Do not save representative .npy arrays.",
+    )
+    return parser
+
+
+def run_jitter_sensitivity_cli(argv: Sequence[str] | None = None) -> int:
+    parser = build_jitter_sensitivity_arg_parser()
+    args = parser.parse_args(argv)
+    summary = run_jitter_sensitivity(
+        output_root=args.output_root,
+        variants=parse_jitter_bank_variants(args.variants),
+        cases=jitter_sensitivity_cases(args.cases),
+        global_seed=int(args.seed),
+        device_mode=str(args.device),
+        render_options=_render_options_from_args(args),
+        dry_run=bool(args.dry_run),
+        model_samples=int(args.model_samples),
+        save_arrays=bool(args.save_arrays),
+    )
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
+def run_cli(stage: str, argv: Sequence[str] | None = None) -> int:
+    parser = build_arg_parser(stage)
+    args = parser.parse_args(argv)
+    render_options = _render_options_from_args(args)
     run_stage(
         stage,
         output_root=args.output_root,
