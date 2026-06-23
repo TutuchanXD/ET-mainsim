@@ -848,3 +848,69 @@ def test_run_case_writes_worker_manifest_shards(tmp_path):
             rows.extend(csv.DictReader(handle))
     assert len(rows) == 4
     assert {row["status"] for row in rows} == {"completed"}
+
+
+def test_run_case_uses_spawn_process_pool_for_cuda_workers(tmp_path, monkeypatch):
+    case = core.BenchmarkCase(
+        "T03",
+        "test",
+        n_stars=2,
+        exposure_s=30.0,
+        n_frames=1,
+        stamp_size=3,
+        write_mode="none",
+        gpus=1,
+        description="cuda process pool context test",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeFuture:
+        def __init__(self, result):
+            self._result = result
+
+        def result(self):
+            return self._result
+
+    class FakeProcessPoolExecutor:
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def submit(self, _fn, task):
+            return FakeFuture(
+                core.WorkerResult(
+                    worker_rank=int(task.worker_rank),
+                    n_stamps=0,
+                    n_written=0,
+                    n_skipped=0,
+                    n_failed=0,
+                    output_bytes=0,
+                    elapsed_s=0.0,
+                    manifest_path=str(tmp_path / f"manifest{int(task.worker_rank)}.csv"),
+                    n_records=0,
+                )
+            )
+
+    monkeypatch.setattr(core, "ProcessPoolExecutor", FakeProcessPoolExecutor)
+    monkeypatch.setattr(core, "as_completed", lambda futures: futures)
+    monkeypatch.setattr(core, "_case_physics_metadata", lambda *args, **kwargs: {})
+    monkeypatch.setattr(core, "environment_metadata", lambda: {})
+
+    core.run_case(
+        case,
+        output_root=tmp_path,
+        workers_per_gpu=2,
+        gpus="0",
+        global_seed=20260617,
+        device_mode="cuda",
+        render_options=core.RenderOptions(use_photsim7_psf=False),
+    )
+
+    mp_context = captured["kwargs"]["mp_context"]
+    assert mp_context.get_start_method() == "spawn"

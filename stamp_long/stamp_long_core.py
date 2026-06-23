@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import multiprocessing as mp
 import os
 import pickle
 import platform
@@ -2082,6 +2083,16 @@ def _parse_gpu_ids(gpus: str) -> list[str]:
     return [token.strip() for token in str(gpus).split(",") if token.strip()]
 
 
+def _process_pool_executor_kwargs(
+    *,
+    device_mode: str,
+    gpu_ids: Sequence[str],
+) -> dict[str, Any]:
+    if gpu_ids and str(device_mode).strip().lower() != "cpu":
+        return {"mp_context": mp.get_context("spawn")}
+    return {}
+
+
 def run_case(
     case: BenchmarkCase,
     *,
@@ -2170,7 +2181,11 @@ def run_case(
     if len(tasks) == 1:
         results = [_run_worker_task(tasks[0])]
     else:
-        with ProcessPoolExecutor(max_workers=len(tasks)) as executor:
+        executor_kwargs = _process_pool_executor_kwargs(
+            device_mode=str(device_mode),
+            gpu_ids=gpu_ids,
+        )
+        with ProcessPoolExecutor(max_workers=len(tasks), **executor_kwargs) as executor:
             futures = [executor.submit(_run_worker_task, task) for task in tasks]
             results = [future.result() for future in as_completed(futures)]
     for result in sorted(results, key=lambda item: item.worker_rank):
