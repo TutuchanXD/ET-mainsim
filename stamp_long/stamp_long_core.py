@@ -1990,6 +1990,8 @@ def _stamp_shard_path(task: WorkerTask) -> Path:
 def _stamp_shard_provenance(task: WorkerTask) -> dict[str, Any]:
     return {
         "producer": "ET-mainsim.stamp_long",
+        "et_mainsim_git_commit": _git_commit(Path(__file__).resolve().parents[1]),
+        "photsim7_git_commit": _git_commit(DEFAULT_PHOTSIM7_ROOT),
         "case": asdict(task.case),
         "worker_rank": int(task.worker_rank),
         "world_size": int(task.world_size),

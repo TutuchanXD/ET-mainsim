@@ -1156,6 +1156,55 @@ def test_hdf5_case_rerun_validates_and_skips_complete_shard(tmp_path, monkeypatc
     assert second["n_shards"] == 1
 
 
+def test_hdf5_case_rejects_complete_shard_from_different_code_revision(
+    tmp_path,
+    monkeypatch,
+):
+    case = core.BenchmarkCase(
+        "H06",
+        "test",
+        n_stars=1,
+        exposure_s=30.0,
+        n_frames=1,
+        stamp_size=3,
+        write_mode="all",
+        gpus=0,
+        description="revision provenance",
+    )
+    render_options = core.RenderOptions(
+        star_flux_mode="fixed",
+        use_photsim7_psf=False,
+        enable_dynamic_effects=False,
+    )
+    monkeypatch.setattr(
+        core,
+        "render_synthetic_stamp",
+        lambda config: (np.zeros((3, 3), dtype=np.float32), {}),
+    )
+    monkeypatch.setattr(core, "_git_commit", lambda path: "revision-a")
+    core.run_case(
+        case,
+        output_root=tmp_path,
+        workers_per_gpu=1,
+        gpus="",
+        global_seed=1,
+        output_format="hdf5",
+        render_options=render_options,
+    )
+
+    monkeypatch.setattr(core, "_git_commit", lambda path: "revision-b")
+    with pytest.raises(ValueError, match="provenance"):
+        core.run_case(
+            case,
+            output_root=tmp_path,
+            workers_per_gpu=1,
+            gpus="",
+            global_seed=1,
+            output_format="hdf5",
+            render_options=render_options,
+        )
+
+
 def test_run_case_uses_spawn_process_pool_for_cuda_workers(tmp_path, monkeypatch):
     case = core.BenchmarkCase(
         "T03",
