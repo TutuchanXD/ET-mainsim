@@ -65,7 +65,6 @@ DEFAULT_STAR_FLUX_E_S = 100.0
 DEFAULT_STAR_FLUX_MODE = "random_et_mag"
 DEFAULT_ET_MAG_MIN = 12.5
 DEFAULT_ET_MAG_MAX = 14.5
-ET_PHOTON_RATE_ZEROPOINT_E_S = 0.91526 * 615.75 * 1_961_225
 DEFAULT_BACKGROUND_E_S_PIX = 26.0
 DEFAULT_SCATTERED_LIGHT_E_S_PIX = 5.0
 DEFAULT_DARK_E_S_PIX = 1.0
@@ -339,9 +338,13 @@ def derive_seed(
 
 
 def et_mag_to_photon_rate_e_s(et_mag: float | np.ndarray) -> float | np.ndarray:
-    rates = ET_PHOTON_RATE_ZEROPOINT_E_S * np.power(
-        10.0,
-        -0.4 * np.asarray(et_mag, dtype=np.float64),
+    ensure_photsim7_imports()
+    from astropy import units as u
+    from photsim7.photometry import et_mag_to_detected_electron_rate
+
+    rates = np.asarray(
+        et_mag_to_detected_electron_rate(et_mag).to_value(u.electron / u.s),
+        dtype=np.float64,
     )
     if np.isscalar(et_mag):
         return float(rates)

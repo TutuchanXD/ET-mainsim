@@ -61,13 +61,18 @@ def test_default_render_options_match_reviewed_parameter_set():
     assert options.et_mag_max == pytest.approx(14.5)
 
 
-def test_et_mag_to_photon_rate_uses_main_rd_zero_point():
-    expected_zero_point = 0.91526 * 615.75 * 1_961_225
+def test_et_mag_to_photon_rate_matches_canonical_photsim7_calibration():
+    from astropy import units as u
+    from photsim7.photometry import et_mag_to_detected_electron_rate
 
-    rate = core.et_mag_to_photon_rate_e_s(20.0)
+    magnitudes = np.array([12.5, 14.0, 20.0], dtype=np.float64)
+    expected = et_mag_to_detected_electron_rate(magnitudes).to_value(u.electron / u.s)
 
-    assert core.ET_PHOTON_RATE_ZEROPOINT_E_S == pytest.approx(expected_zero_point)
-    assert rate == pytest.approx(expected_zero_point * 10 ** (-0.4 * 20.0))
+    actual = core.et_mag_to_photon_rate_e_s(magnitudes)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=0.0)
+    assert core.et_mag_to_photon_rate_e_s(12.5) == pytest.approx(expected[0])
+    assert not hasattr(core, "ET_PHOTON_RATE_ZEROPOINT_E_S")
 
 
 def test_random_et_mag_sampling_is_star_stable_and_in_range():
