@@ -11,6 +11,7 @@
 #   CASE_IDS=S1D11E300,S1D15E030
 #   MAX_CASES=1
 #   WRITE_MODE=sample|all|none
+#   OUTPUT_FORMAT=npy|hdf5
 #   DEVICE=cuda|auto|cpu
 #   STAR_FLUX_MODE=random_et_mag|fixed
 #   ET_MAG_MIN=12.5
@@ -56,6 +57,17 @@ EXPOSURES="${EXPOSURES:-}"
 STAMP_SIZES="${STAMP_SIZES:-}"
 MAX_CASES="${MAX_CASES:-}"
 WRITE_MODE="${WRITE_MODE:-}"
+OUTPUT_FORMAT="${OUTPUT_FORMAT:-}"
+if [[ -z "${OUTPUT_FORMAT}" ]]; then
+  case "${STAGE}" in
+    physics|io)
+      OUTPUT_FORMAT="hdf5"
+      ;;
+    *)
+      OUTPUT_FORMAT="npy"
+      ;;
+  esac
+fi
 SAMPLE_LIMIT="${SAMPLE_LIMIT:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 STAR_FLUX_E_S="${STAR_FLUX_E_S:-100.0}"
@@ -99,6 +111,7 @@ echo "output_root=${OUTPUT_ROOT}"
 echo "matrix_preset=${MATRIX_PRESET:-unset}"
 echo "scale_group=${SCALE_GROUP:-unset}"
 echo "workers_per_gpu=${WORKERS_PER_GPU}"
+echo "output_format=${OUTPUT_FORMAT}"
 echo "star_flux_mode=${STAR_FLUX_MODE}"
 echo "et_mag_range=${ET_MAG_MIN},${ET_MAG_MAX}"
 echo "jitter_psf=${JITTER_PSF_MODELS}x${JITTER_FRAMES_PER_MODEL}"
@@ -113,13 +126,14 @@ nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilizati
 source /cluster/apps/anaconda3/2024.02/etc/profile.d/conda.sh
 conda activate etbase-clu
 
-export ET_ROOT=/cluster/home/cxgao/ET
-export PHOTSIM7_ROOT=/cluster/home/cxgao/ET/Photsim7
-export ET_DATA_DIR=/cluster/home/cxgao/ET/Photsim7-data
-export PHOTSIM7_DATA_DIR=/cluster/home/cxgao/ET/Photsim7-data
+export ET_ROOT="${ET_ROOT:-/cluster/home/cxgao/ET}"
+export ET_MAINSIM_ROOT="${ET_MAINSIM_ROOT:-${ET_ROOT}/ET-mainsim}"
+export PHOTSIM7_ROOT="${PHOTSIM7_ROOT:-${ET_ROOT}/Photsim7}"
+export ET_DATA_DIR="${ET_DATA_DIR:-${ET_ROOT}/Photsim7-data}"
+export PHOTSIM7_DATA_DIR="${PHOTSIM7_DATA_DIR:-${ET_DATA_DIR}}"
 export RESULTS_ROOT="${OUTPUT_ROOT}"
 
-cd /cluster/home/cxgao/ET/ET-mainsim
+cd "${ET_MAINSIM_ROOT}"
 
 echo "python=$(command -v python)"
 python - <<'PY'
@@ -128,7 +142,7 @@ import subprocess
 import sys
 
 print("python_version=" + sys.version.replace("\n", " "))
-for path in ["/cluster/home/cxgao/ET/ET-mainsim", "/cluster/home/cxgao/ET/Photsim7"]:
+for path in [os.environ["ET_MAINSIM_ROOT"], os.environ["PHOTSIM7_ROOT"]]:
     try:
         commit = subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True).strip()
     except Exception as exc:
@@ -174,6 +188,7 @@ cmd=(
   --gpus "${GPUS}"
   --seed "${SEED}"
   --device "${DEVICE}"
+  --output-format "${OUTPUT_FORMAT}"
   --sample-limit "${SAMPLE_LIMIT}"
   --star-flux-e-s "${STAR_FLUX_E_S}"
   --star-flux-mode "${STAR_FLUX_MODE}"

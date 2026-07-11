@@ -61,13 +61,18 @@ def test_default_render_options_match_reviewed_parameter_set():
     assert options.et_mag_max == pytest.approx(14.5)
 
 
-def test_et_mag_to_photon_rate_uses_main_rd_zero_point():
-    expected_zero_point = 0.91526 * 615.75 * 1_961_225
+def test_et_mag_to_photon_rate_matches_canonical_photsim7_calibration():
+    from astropy import units as u
+    from photsim7.photometry import et_mag_to_detected_electron_rate
 
-    rate = core.et_mag_to_photon_rate_e_s(20.0)
+    magnitudes = np.array([12.5, 14.0, 20.0], dtype=np.float64)
+    expected = et_mag_to_detected_electron_rate(magnitudes).to_value(u.electron / u.s)
 
-    assert core.ET_PHOTON_RATE_ZEROPOINT_E_S == pytest.approx(expected_zero_point)
-    assert rate == pytest.approx(expected_zero_point * 10 ** (-0.4 * 20.0))
+    actual = core.et_mag_to_photon_rate_e_s(magnitudes)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=0.0)
+    assert core.et_mag_to_photon_rate_e_s(12.5) == pytest.approx(expected[0])
+    assert not hasattr(core, "ET_PHOTON_RATE_ZEROPOINT_E_S")
 
 
 def test_random_et_mag_sampling_is_star_stable_and_in_range():
@@ -650,6 +655,70 @@ def test_dry_run_reports_expected_files_for_stamp_scale_case(tmp_path):
     assert summary["expected_payload_bytes"] == 806400 * 15 * 15 * 4
 
 
+def test_output_format_cli_defaults_to_npy_and_accepts_hdf5(monkeypatch):
+    monkeypatch.delenv("OUTPUT_FORMAT", raising=False)
+
+    parser = core.build_arg_parser("smoke")
+
+    assert parser.parse_args([]).output_format == "npy"
+    assert parser.parse_args(["--output-format", "hdf5"]).output_format == "hdf5"
+
+
+def test_hdf5_requires_all_write_mode(tmp_path):
+    case = core.BenchmarkCase(
+        "H00",
+        "test",
+        n_stars=1,
+        exposure_s=30.0,
+        n_frames=1,
+        stamp_size=3,
+        write_mode="sample",
+        gpus=0,
+        description="invalid hdf5 mode",
+    )
+
+    with pytest.raises(ValueError, match="hdf5.*write_mode.*all"):
+        core.run_case(
+            case,
+            output_root=tmp_path,
+            workers_per_gpu=1,
+            gpus="",
+            global_seed=1,
+            output_format="hdf5",
+            dry_run=True,
+        )
+
+
+def test_hdf5_dry_run_reports_worker_shards_without_changing_logical_file_count(tmp_path):
+    case = core.BenchmarkCase(
+        "H01",
+        "test",
+        n_stars=5,
+        exposure_s=30.0,
+        n_frames=2,
+        stamp_size=3,
+        write_mode="all",
+        gpus=0,
+        description="hdf5 dry run",
+    )
+
+    summary = core.run_case(
+        case,
+        output_root=tmp_path,
+        workers_per_gpu=2,
+        gpus="",
+        global_seed=1,
+        output_format="hdf5",
+        dry_run=True,
+    )
+
+    assert summary["output_format"] == "hdf5"
+    assert summary["expected_files"] == 10
+    assert summary["expected_items"] == 10
+    assert summary["expected_shards"] == 2
+    assert summary["expected_output_files"] == 3
+
+
 def test_run_stage_filters_stamp_scale_group_in_dry_run(tmp_path):
     results = core.run_stage(
         "physics",
@@ -848,6 +917,292 @@ def test_run_case_writes_worker_manifest_shards(tmp_path):
             rows.extend(csv.DictReader(handle))
     assert len(rows) == 4
     assert {row["status"] for row in rows} == {"completed"}
+
+
+def test_run_case_hdf5_writes_one_shard_per_worker_and_relative_index(tmp_path):
+    from photsim7.artifacts import StampShardReader, read_shard_index
+
+    case = core.BenchmarkCase(
+        "H02",
+        "test",
+        n_stars=2,
+        exposure_s=30.0,
+        n_frames=2,
+        stamp_size=3,
+        write_mode="all",
+        gpus=0,
+        description="hdf5 worker shards",
+    )
+    render_options = core.RenderOptions(
+        star_flux_e_s=0.0,
+        star_flux_mode="fixed",
+        background_e_s_pix=0.0,
+        scattered_light_e_s_pix=0.0,
+        dark_e_s_pix=0.0,
+        read_noise_10s_e_pix=0.0,
+        cosmic_ray_event_rate=0.0,
+        use_photsim7_psf=False,
+        enable_dynamic_effects=False,
+    )
+
+    summary = core.run_case(
+        case,
+        output_root=tmp_path,
+        workers_per_gpu=2,
+        gpus="",
+        global_seed=20260617,
+        output_format="hdf5",
+        render_options=render_options,
+    )
+
+    case_dir = tmp_path / "H02"
+    index_path = case_dir / "shard_index.json"
+    assert summary["output_format"] == "hdf5"
+    assert summary["artifact_index_path"] == str(index_path)
+    assert summary["manifest_index_path"] is None
+    assert summary["n_stamps"] == 4
+    assert summary["n_written"] == 4
+    assert summary["n_shards"] == 2
+    assert summary["expected_shards"] == 2
+    assert not list(case_dir.rglob("*.csv"))
+    assert not (case_dir / "manifests").exists()
+
+    index = read_shard_index(index_path, verify_shards=True)
+    assert index.run_id == "H02"
+    assert [entry.path for entry in index.shards] == [
+        "shards/stamps.worker000.h5",
+        "shards/stamps.worker001.h5",
+    ]
+    assert [entry.star_ids for entry in index.shards] == [(0,), (1,)]
+    for entry in index.shards:
+        with StampShardReader(case_dir / entry.path) as reader:
+            assert reader.frame_ids == (0, 1)
+            for star_id in reader.star_ids:
+                for frame_id in reader.frame_ids:
+                    assert reader.read_stamp(star_id, frame_id).shape == (3, 3)
+                    assert reader.read_seed(star_id, frame_id) == core.derive_seed(
+                        20260617,
+                        exposure_s=30.0,
+                        frame_id=frame_id,
+                        star_id=star_id,
+                        effect_type="stamp",
+                    )
+
+
+def test_hdf5_worker_resumes_partial_without_rerendering_complete_items(
+    tmp_path,
+    monkeypatch,
+):
+    from photsim7.artifacts import ItemStatus, StampShardReader
+
+    case = core.BenchmarkCase(
+        "H03",
+        "test",
+        n_stars=1,
+        exposure_s=30.0,
+        n_frames=2,
+        stamp_size=3,
+        write_mode="all",
+        gpus=0,
+        description="hdf5 partial resume",
+    )
+    task = core.WorkerTask(
+        case=case,
+        output_root=str(tmp_path),
+        star_range=core.IndexRange(0, 1),
+        worker_rank=0,
+        world_size=1,
+        gpu_id=None,
+        global_seed=20260617,
+        write_mode="all",
+        output_format="hdf5",
+        device_mode="cpu",
+        sample_limit=1,
+        render_options=core.RenderOptions(
+            star_flux_mode="fixed",
+            use_photsim7_psf=False,
+            enable_dynamic_effects=False,
+        ),
+    )
+    calls = []
+
+    def interrupted_render(config):
+        calls.append(config.frame_id)
+        if config.frame_id == 1:
+            raise RuntimeError("simulated interruption")
+        return np.full((3, 3), config.frame_id, dtype=np.float32), {}
+
+    monkeypatch.setattr(core, "render_synthetic_stamp", interrupted_render)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        core._run_worker_task(task)
+
+    partial_path = tmp_path / "H03" / "shards" / "stamps.worker000.partial.h5"
+    with StampShardReader(partial_path, allow_incomplete=True) as reader:
+        assert reader.item_status(0, 0) is ItemStatus.COMPLETE
+        assert reader.item_status(0, 1) is ItemStatus.UNWRITTEN
+
+    resumed_calls = []
+
+    def resumed_render(config):
+        resumed_calls.append(config.frame_id)
+        return np.full((3, 3), config.frame_id, dtype=np.float32), {}
+
+    monkeypatch.setattr(core, "render_synthetic_stamp", resumed_render)
+    result = core._run_worker_task(task)
+
+    assert calls == [0, 1]
+    assert resumed_calls == [1]
+    assert result.output_format == "hdf5"
+    assert result.n_stamps == 2
+    assert result.n_written == 1
+    assert result.n_skipped == 1
+    assert result.n_shards == 1
+    assert result.manifest_path == ""
+    assert Path(result.artifact_path).name == "stamps.worker000.h5"
+    assert not partial_path.exists()
+
+
+def test_hdf5_worker_rejects_renderer_dtype_regression(tmp_path, monkeypatch):
+    from photsim7.artifacts import ShardSchemaError
+
+    case = core.BenchmarkCase(
+        "H04",
+        "test",
+        n_stars=1,
+        exposure_s=30.0,
+        n_frames=1,
+        stamp_size=3,
+        write_mode="all",
+        gpus=0,
+        description="strict hdf5 dtype",
+    )
+    task = core.WorkerTask(
+        case=case,
+        output_root=str(tmp_path),
+        star_range=core.IndexRange(0, 1),
+        worker_rank=0,
+        world_size=1,
+        gpu_id=None,
+        global_seed=1,
+        write_mode="all",
+        output_format="hdf5",
+        device_mode="cpu",
+        sample_limit=1,
+        render_options=core.RenderOptions(
+            star_flux_mode="fixed",
+            use_photsim7_psf=False,
+            enable_dynamic_effects=False,
+        ),
+    )
+    monkeypatch.setattr(
+        core,
+        "render_synthetic_stamp",
+        lambda config: (np.zeros((3, 3), dtype=np.float64), {}),
+    )
+
+    with pytest.raises(ShardSchemaError, match="image dtype"):
+        core._run_worker_task(task)
+
+
+def test_hdf5_case_rerun_validates_and_skips_complete_shard(tmp_path, monkeypatch):
+    case = core.BenchmarkCase(
+        "H05",
+        "test",
+        n_stars=1,
+        exposure_s=30.0,
+        n_frames=1,
+        stamp_size=3,
+        write_mode="all",
+        gpus=0,
+        description="complete hdf5 resume",
+    )
+    render_options = core.RenderOptions(
+        star_flux_mode="fixed",
+        use_photsim7_psf=False,
+        enable_dynamic_effects=False,
+    )
+    monkeypatch.setattr(
+        core,
+        "render_synthetic_stamp",
+        lambda config: (np.zeros((3, 3), dtype=np.float32), {}),
+    )
+    first = core.run_case(
+        case,
+        output_root=tmp_path,
+        workers_per_gpu=1,
+        gpus="",
+        global_seed=1,
+        output_format="hdf5",
+        render_options=render_options,
+    )
+
+    def should_not_render(config):
+        raise AssertionError("complete HDF5 shard should not be rendered again")
+
+    monkeypatch.setattr(core, "render_synthetic_stamp", should_not_render)
+    second = core.run_case(
+        case,
+        output_root=tmp_path,
+        workers_per_gpu=1,
+        gpus="",
+        global_seed=1,
+        output_format="hdf5",
+        render_options=render_options,
+    )
+
+    assert first["n_written"] == 1
+    assert second["n_written"] == 0
+    assert second["n_skipped"] == 1
+    assert second["n_shards"] == 1
+
+
+def test_hdf5_case_rejects_complete_shard_from_different_code_revision(
+    tmp_path,
+    monkeypatch,
+):
+    case = core.BenchmarkCase(
+        "H06",
+        "test",
+        n_stars=1,
+        exposure_s=30.0,
+        n_frames=1,
+        stamp_size=3,
+        write_mode="all",
+        gpus=0,
+        description="revision provenance",
+    )
+    render_options = core.RenderOptions(
+        star_flux_mode="fixed",
+        use_photsim7_psf=False,
+        enable_dynamic_effects=False,
+    )
+    monkeypatch.setattr(
+        core,
+        "render_synthetic_stamp",
+        lambda config: (np.zeros((3, 3), dtype=np.float32), {}),
+    )
+    monkeypatch.setattr(core, "_git_commit", lambda path: "revision-a")
+    core.run_case(
+        case,
+        output_root=tmp_path,
+        workers_per_gpu=1,
+        gpus="",
+        global_seed=1,
+        output_format="hdf5",
+        render_options=render_options,
+    )
+
+    monkeypatch.setattr(core, "_git_commit", lambda path: "revision-b")
+    with pytest.raises(ValueError, match="provenance"):
+        core.run_case(
+            case,
+            output_root=tmp_path,
+            workers_per_gpu=1,
+            gpus="",
+            global_seed=1,
+            output_format="hdf5",
+            render_options=render_options,
+        )
 
 
 def test_run_case_uses_spawn_process_pool_for_cuda_workers(tmp_path, monkeypatch):
