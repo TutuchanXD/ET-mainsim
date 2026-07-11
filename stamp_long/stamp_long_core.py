@@ -2316,7 +2316,7 @@ def run_case(
         int(active_worker_count) if normalized_output_format == "hdf5" else 0
     )
     expected_output_files = (
-        expected_shards + 1
+        (expected_shards + 1)
         if normalized_output_format == "hdf5"
         else expected_files
     )
