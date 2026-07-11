@@ -279,6 +279,7 @@ class WorkerTask:
     gpu_id: str | None
     global_seed: int
     write_mode: str
+    output_format: str
     device_mode: str
     sample_limit: int
     render_options: RenderOptions
@@ -295,6 +296,18 @@ class WorkerResult:
     elapsed_s: float
     manifest_path: str
     n_records: int
+    output_format: str = "npy"
+    artifact_path: str = ""
+    n_shards: int = 0
+
+
+def _normalize_output_format(output_format: str) -> str:
+    normalized = str(output_format).strip().lower()
+    if normalized not in {"npy", "hdf5"}:
+        raise ValueError(
+            f"Unsupported output_format {output_format!r}; expected npy or hdf5"
+        )
+    return normalized
 
 
 def exposure_parameters(
@@ -1965,15 +1978,178 @@ def _case_physics_metadata(
     }
 
 
+def _stamp_shard_path(task: WorkerTask) -> Path:
+    return (
+        Path(task.output_root).expanduser()
+        / task.case.case_id
+        / "shards"
+        / f"stamps.worker{int(task.worker_rank):03d}.h5"
+    )
+
+
+def _stamp_shard_provenance(task: WorkerTask) -> dict[str, Any]:
+    return {
+        "producer": "ET-mainsim.stamp_long",
+        "case": asdict(task.case),
+        "worker_rank": int(task.worker_rank),
+        "world_size": int(task.world_size),
+        "global_seed": int(task.global_seed),
+        "device_mode": str(task.device_mode),
+        "gpu_id": None if task.gpu_id is None else str(task.gpu_id),
+        "render_options": asdict(task.render_options),
+    }
+
+
+def _validate_complete_stamp_shard(task: WorkerTask, path: Path) -> int:
+    ensure_photsim7_imports()
+    from photsim7.artifacts import StampShardReader
+
+    expected_star_ids = tuple(range(task.star_range.start, task.star_range.stop))
+    expected_frame_ids = tuple(range(int(task.case.n_frames)))
+    expected_chunk = (
+        1,
+        min(256, len(expected_frame_ids)),
+        int(task.case.stamp_size),
+        int(task.case.stamp_size),
+    )
+    with StampShardReader(path) as reader:
+        spec = reader.spec
+        checks = {
+            "run_id": (spec.run_id, str(task.case.case_id)),
+            "case_id": (spec.case_id, str(task.case.case_id)),
+            "star_ids": (spec.star_ids, expected_star_ids),
+            "frame_ids": (spec.frame_ids, expected_frame_ids),
+            "image_shape": (
+                spec.image_shape,
+                (int(task.case.stamp_size), int(task.case.stamp_size)),
+            ),
+            "chunk_shape": (spec.chunk_shape, expected_chunk),
+            "dtype": (spec.dtype_name, "float32"),
+            "unit": (spec.unit, "electron"),
+            "domain": (spec.domain, "electrons"),
+            "provenance": (
+                dict(spec.provenance),
+                _stamp_shard_provenance(task),
+            ),
+        }
+        mismatches = [name for name, (actual, expected) in checks.items() if actual != expected]
+        if mismatches:
+            raise ValueError(
+                f"Existing final HDF5 shard {path} does not match the worker task: "
+                + ", ".join(mismatches)
+            )
+        return int(spec.item_count)
+
+
+def _run_worker_task_hdf5(
+    task: WorkerTask,
+    *,
+    start: float,
+    device: str,
+) -> WorkerResult:
+    if str(task.write_mode) != "all":
+        raise ValueError("hdf5 output requires write_mode='all'")
+    ensure_photsim7_imports()
+    from photsim7.artifacts import ItemStatus, StampShardWriter
+
+    shard_path = _stamp_shard_path(task)
+    if shard_path.exists():
+        item_count = _validate_complete_stamp_shard(task, shard_path)
+        return WorkerResult(
+            worker_rank=int(task.worker_rank),
+            n_stamps=item_count,
+            n_written=0,
+            n_skipped=item_count,
+            n_failed=0,
+            output_bytes=int(shard_path.stat().st_size),
+            elapsed_s=float(time.perf_counter() - start),
+            manifest_path="",
+            n_records=0,
+            output_format="hdf5",
+            artifact_path=str(shard_path),
+            n_shards=1,
+        )
+
+    writer = StampShardWriter(
+        shard_path,
+        run_id=str(task.case.case_id),
+        case_id=str(task.case.case_id),
+        star_ids=range(task.star_range.start, task.star_range.stop),
+        frame_ids=range(int(task.case.n_frames)),
+        stamp_shape=(int(task.case.stamp_size), int(task.case.stamp_size)),
+        dtype="float32",
+        unit="electron",
+        domain="electrons",
+        provenance=_stamp_shard_provenance(task),
+        resume=True,
+    )
+    n_stamps = 0
+    n_written = 0
+    n_skipped = 0
+    try:
+        for star_id in range(task.star_range.start, task.star_range.stop):
+            for frame_id in range(int(task.case.n_frames)):
+                n_stamps += 1
+                if writer.item_status(star_id, frame_id) is ItemStatus.COMPLETE:
+                    n_skipped += 1
+                    continue
+                seed = derive_seed(
+                    task.global_seed,
+                    exposure_s=task.case.exposure_s,
+                    frame_id=frame_id,
+                    star_id=star_id,
+                    effect_type="stamp",
+                )
+                config = _build_render_config(
+                    task.case,
+                    seed=seed,
+                    global_seed=task.global_seed,
+                    star_id=star_id,
+                    frame_id=frame_id,
+                    device=device,
+                    render_options=task.render_options,
+                )
+                stamp, _metadata = render_synthetic_stamp(config)
+                writer.write_stamp(
+                    star_id,
+                    frame_id,
+                    stamp,
+                    seed=seed,
+                )
+                n_written += 1
+        final_path = writer.finalize()
+    finally:
+        writer.close()
+
+    return WorkerResult(
+        worker_rank=int(task.worker_rank),
+        n_stamps=int(n_stamps),
+        n_written=int(n_written),
+        n_skipped=int(n_skipped),
+        n_failed=0,
+        output_bytes=int(final_path.stat().st_size),
+        elapsed_s=float(time.perf_counter() - start),
+        manifest_path="",
+        n_records=0,
+        output_format="hdf5",
+        artifact_path=str(final_path),
+        n_shards=1,
+    )
+
+
 def _run_worker_task(task: WorkerTask) -> WorkerResult:
     start = time.perf_counter()
+    output_format = _normalize_output_format(task.output_format)
+    device = _worker_device(task.device_mode, task.gpu_id)
+    if output_format == "hdf5":
+        return _run_worker_task_hdf5(task, start=start, device=device)
+
     records: list[StampRecord] = []
     n_stamps = 0
     n_written = 0
     n_skipped = 0
     n_failed = 0
     output_bytes = 0
-    device = _worker_device(task.device_mode, task.gpu_id)
     active_write_mode = task.write_mode
     n_sample_outputs = 0
     for star_id in range(task.star_range.start, task.star_range.stop):
@@ -2036,6 +2212,7 @@ def _run_worker_task(task: WorkerTask) -> WorkerResult:
         elapsed_s=float(time.perf_counter() - start),
         manifest_path=str(manifest_path),
         n_records=len(records),
+        output_format="npy",
     )
 
 
@@ -2104,6 +2281,7 @@ def run_case(
     gpus: str,
     global_seed: int,
     write_mode: str | None = None,
+    output_format: str = "npy",
     dry_run: bool = False,
     device_mode: str = "auto",
     sample_limit: int = 1,
@@ -2112,6 +2290,13 @@ def run_case(
     output_root = Path(output_root).expanduser()
     case_dir = output_root / case.case_id
     case_write_mode = case.write_mode if write_mode is None else str(write_mode)
+    if case_write_mode not in {"all", "none", "sample"}:
+        raise ValueError(f"Unsupported write_mode {case_write_mode!r}")
+    normalized_output_format = _normalize_output_format(output_format)
+    if normalized_output_format == "hdf5" and case_write_mode != "all":
+        raise ValueError(
+            f"hdf5 output requires write_mode='all', got {case_write_mode!r}"
+        )
     render_options = RenderOptions() if render_options is None else render_options
     resource_metadata = _resource_metadata(render_options)
     gpu_ids = _parse_gpu_ids(gpus)
@@ -2123,18 +2308,32 @@ def run_case(
         world_size = max(1, int(workers_per_gpu))
     ranges = split_ranges(case.n_stars, world_size)
     expected_files = int(case.n_stars) * int(case.n_frames)
+    expected_items = expected_files
+    active_worker_count = sum(item.stop > item.start for item in ranges)
+    expected_shards = (
+        int(active_worker_count) if normalized_output_format == "hdf5" else 0
+    )
+    expected_output_files = (
+        expected_shards + 1
+        if normalized_output_format == "hdf5"
+        else expected_files
+    )
     expected_payload_bytes = expected_files * int(case.stamp_size) * int(case.stamp_size) * 4
     if dry_run:
         return {
             "case": asdict(case),
             "output_root": str(output_root),
             "write_mode": case_write_mode,
+            "output_format": normalized_output_format,
             "gpu_ids": gpu_ids,
             "workers_per_gpu": int(workers_per_gpu),
             "world_size": int(world_size),
             "star_ranges": [asdict(item) for item in ranges],
             "estimated_stamps": int(case.n_stars) * int(case.n_frames),
             "expected_files": int(expected_files),
+            "expected_items": int(expected_items),
+            "expected_shards": int(expected_shards),
+            "expected_output_files": int(expected_output_files),
             "expected_payload_bytes": int(expected_payload_bytes),
             "render_options": asdict(render_options),
             "resource_paths": resource_metadata,
@@ -2151,6 +2350,7 @@ def run_case(
         {
             "case": asdict(case),
             "write_mode": case_write_mode,
+            "output_format": normalized_output_format,
             "gpu_ids": gpu_ids,
             "workers_per_gpu": int(workers_per_gpu),
             "global_seed": int(global_seed),
@@ -2171,6 +2371,7 @@ def run_case(
             gpu_id=(gpu_ids[rank % len(gpu_ids)] if gpu_ids else None),
             global_seed=int(global_seed),
             write_mode=case_write_mode,
+            output_format=normalized_output_format,
             device_mode=str(device_mode),
             sample_limit=int(sample_limit),
             render_options=render_options,
@@ -2191,46 +2392,101 @@ def run_case(
         with ProcessPoolExecutor(max_workers=len(tasks), **executor_kwargs) as executor:
             futures = [executor.submit(_run_worker_task, task) for task in tasks]
             results = [future.result() for future in as_completed(futures)]
-    for result in sorted(results, key=lambda item: item.worker_rank):
+    ordered_results = sorted(results, key=lambda item: item.worker_rank)
+    for result in ordered_results:
         worker_payloads.append(asdict(result))
 
     elapsed = time.perf_counter() - started
-    manifest_index_path = case_dir / "manifest_index.json"
     n_stamps = sum(result.n_stamps for result in results)
     n_written = sum(result.n_written for result in results)
     n_skipped = sum(result.n_skipped for result in results)
     n_failed = sum(result.n_failed for result in results)
+    n_shards = sum(result.n_shards for result in results)
     output_bytes = sum(result.output_bytes for result in results)
     throughput = float(n_stamps) / elapsed if elapsed > 0 else math.nan
-    files_per_s = float(n_written) / elapsed if elapsed > 0 else math.nan
-    manifest_index = {
-        "case_id": str(case.case_id),
-        "expected_files": int(expected_files),
-        "manifest_shards": [
+    files_per_s = (
+        float(n_shards if normalized_output_format == "hdf5" else n_written) / elapsed
+        if elapsed > 0
+        else math.nan
+    )
+    manifest_index_path: Path | None = None
+    artifact_index_path: Path | None = None
+    manifest_shards: list[dict[str, Any]] = []
+    artifact_shards: list[dict[str, Any]] = []
+    if normalized_output_format == "hdf5":
+        ensure_photsim7_imports()
+        from photsim7.artifacts import write_shard_index
+
+        artifact_index_path = case_dir / "shard_index.json"
+        write_shard_index(
+            artifact_index_path,
+            run_id=str(case.case_id),
+            shard_paths=[result.artifact_path for result in ordered_results],
+            metadata={
+                "producer": "ET-mainsim.stamp_long",
+                "case_id": str(case.case_id),
+                "output_format": "hdf5",
+                "expected_items": int(expected_items),
+                "worker_count": len(ordered_results),
+            },
+        )
+        artifact_shards = [
+            {
+                "worker_rank": int(result.worker_rank),
+                "path": str(Path(result.artifact_path).relative_to(case_dir)),
+                "items": int(result.n_stamps),
+                "bytes": int(result.output_bytes),
+            }
+            for result in ordered_results
+        ]
+    else:
+        manifest_index_path = case_dir / "manifest_index.json"
+        manifest_shards = [
             {
                 "worker_rank": int(result.worker_rank),
                 "path": str(result.manifest_path),
                 "records": int(result.n_records),
             }
-            for result in sorted(results, key=lambda item: item.worker_rank)
-        ],
-    }
-    write_json(manifest_index_path, manifest_index)
+            for result in ordered_results
+        ]
+        write_json(
+            manifest_index_path,
+            {
+                "case_id": str(case.case_id),
+                "expected_files": int(expected_files),
+                "manifest_shards": manifest_shards,
+            },
+        )
     summary = {
         "case": asdict(case),
+        "write_mode": case_write_mode,
+        "output_format": normalized_output_format,
         "elapsed_s": float(elapsed),
         "expected_files": int(expected_files),
+        "expected_items": int(expected_items),
+        "expected_shards": int(expected_shards),
+        "expected_output_files": int(expected_output_files),
         "expected_payload_bytes": int(expected_payload_bytes),
         "n_stamps": int(n_stamps),
         "n_written": int(n_written),
         "n_skipped": int(n_skipped),
         "n_failed": int(n_failed),
+        "n_shards": int(n_shards),
         "output_bytes": int(output_bytes),
         "output_star_stamp_per_s": float(throughput),
         "files_per_s": float(files_per_s),
+        "shards_per_s": (
+            float(n_shards) / elapsed if elapsed > 0 else math.nan
+        ),
         "pixel_per_s": float(throughput * case.stamp_size * case.stamp_size),
-        "manifest_index_path": str(manifest_index_path),
-        "manifest_shards": manifest_index["manifest_shards"],
+        "manifest_index_path": (
+            None if manifest_index_path is None else str(manifest_index_path)
+        ),
+        "artifact_index_path": (
+            None if artifact_index_path is None else str(artifact_index_path)
+        ),
+        "manifest_shards": manifest_shards,
+        "artifact_shards": artifact_shards,
         "workers": worker_payloads,
         "render_options": asdict(render_options),
         "resource_paths": resource_metadata,
@@ -2289,6 +2545,7 @@ def run_stage(
     gpus: str,
     global_seed: int,
     write_mode: str | None = None,
+    output_format: str = "npy",
     dry_run: bool = False,
     device_mode: str = "auto",
     sample_limit: int = 1,
@@ -2318,6 +2575,7 @@ def run_stage(
             gpus=gpus,
             global_seed=global_seed,
             write_mode=write_mode,
+            output_format=output_format,
             dry_run=dry_run,
             device_mode=device_mode,
             sample_limit=sample_limit,
@@ -2716,6 +2974,11 @@ def build_arg_parser(stage: str) -> argparse.ArgumentParser:
     parser.add_argument("--gpus", type=str, default="0,1,2")
     parser.add_argument("--seed", type=int, default=20260617)
     parser.add_argument("--write-mode", choices=["all", "none", "sample"], default=None)
+    parser.add_argument(
+        "--output-format",
+        choices=["npy", "hdf5"],
+        default=os.environ.get("OUTPUT_FORMAT", "npy"),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--sample-limit", type=int, default=1)
@@ -2895,6 +3158,7 @@ def run_cli(stage: str, argv: Sequence[str] | None = None) -> int:
         gpus=args.gpus,
         global_seed=args.seed,
         write_mode=args.write_mode,
+        output_format=args.output_format,
         dry_run=bool(args.dry_run),
         device_mode=args.device,
         sample_limit=int(args.sample_limit),
