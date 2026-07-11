@@ -33,8 +33,8 @@
 | stamp 内容 | 只包含目标星，不包含背景星和邻星 |
 | 输出单位 | electrons |
 | 输出 dtype | `float32` |
-| 输出格式 | 评估阶段为单个 stamp 一个 `.npy` 文件 |
-| 文件粒度 | 单个 star-frame stamp 一个文件 |
+| 输出格式 | `npy` 用于 smoke/debug；production 使用 sharded HDF5 |
+| 文件粒度 | NPY 为单个 star-frame；HDF5 为单个 worker/case shard |
 | 输出 cadence | 等于输出曝光时间 |
 | stamp 尺寸 | 11x11 和 15x15 都作为正式评估组合 |
 | duty cycle | 100% |
@@ -42,6 +42,7 @@
 | 目标星亮度 | 暂不接入外部星表；每颗星按 ET mag 12.5-14.5 均匀随机采样 |
 
 本轮仍采用直接长曝光近似：不显式生成 10 s 子曝光并离线叠加，而是直接按目标曝光时间生成最终 stamp。10 s 只作为参数缩放参考。
+ET mag 到 detector electron/s 的转换调用 Photsim7 canonical photometry service，不再维护 ET-mainsim 本地零点公式。
 
 ---
 
@@ -201,7 +202,16 @@ seed = f(global_seed, exposure_s, frame_id, star_id, effect_type)
 
 ## 6. I/O 和 manifest 设计要求
 
-当前实现若把每个 stamp 的 `StampRecord` 全部返回主进程，再一次性写单个 `manifest.csv`，在最大单 case `4,838,400` 条记录下会产生明显的 Python 对象内存和跨进程序列化压力。
+当前实现提供两个明确模式：
+
+| 模式 | 用途 | item index |
+| --- | --- | --- |
+| `--output-format npy` | smoke/debug/legacy comparison | 每个 worker 的 `manifest.workerNN.csv` |
+| `--output-format hdf5` | production | shard 内 `star_ids`、`frame_ids`、`seeds`、`status` datasets |
+
+HDF5 模式只允许 `write_mode=all`，一个 worker/case 只打开一个 writer。父进程只写 `photsim7.image_shard_index.v1` 相对路径索引，不再产生 per-stamp CSV。这样最大 case 的文件数从 O(stars x frames) 降为 O(workers)。
+
+NPY compatibility mode 继续使用 worker 分片 manifest：
 
 正式执行前应改为以下之一：
 
@@ -211,7 +221,7 @@ seed = f(global_seed, exposure_s, frame_id, star_id, effect_type)
 | day/frame 分片 manifest | 按 day 或 frame block 写多个 manifest，适合长时低星数组续跑 | 可选 |
 | 主进程 streaming writer | worker 通过 queue 发送记录，主进程边收边写 | 可选，复杂度更高 |
 
-推荐采用 worker 分片 manifest，并保留以下字段：
+NPY manifest 保留以下字段：
 
 | 字段 | 说明 |
 | --- | --- |
@@ -235,6 +245,9 @@ seed = f(global_seed, exposure_s, frame_id, star_id, effect_type)
 * 单个 `.npy` 采用临时文件写入后 atomic rename；
 * 已存在且 shape/dtype 正确的 stamp 可跳过，manifest 标记为 `skipped_existing`；
 * 每个 worker 写独立 manifest shard，主进程只写 `manifest_index.json`；
+* HDF5 live file 使用 `.partial.h5`，status 依次为 unwritten/writing/complete/failed；
+* HDF5 重跑跳过 complete item，重试 writing/failed/unwritten item，全部完成后 atomic rename 为 `.h5`；
+* 已完成 HDF5 shard 必须经过 run/case/ids/shape/dtype/unit/domain/provenance 校验后才能整 shard 跳过；
 * summary 中记录 `expected_files`、`n_written`、`n_skipped`、`n_failed`、`files_per_s`；
 * 失败重跑不能改变同一 star/frame/effect 的随机结果。
 
@@ -263,6 +276,21 @@ stamp_long/
     exp300/
 ```
 
+Production HDF5 layout:
+
+```text
+stamp_long/
+  <case_id>/
+    environment.json
+    case_config.json
+    summary.json
+    shard_index.json
+    shards/
+      stamps.worker000.h5
+      stamps.worker001.h5
+      ...
+```
+
 说明：
 
 * 每个 case 只包含一个曝光值，因此 `expXXX` 目录用于路径一致性和后续合并分析；
@@ -289,6 +317,7 @@ stamp_long/
 | `GPUS` | `0,1,2` |
 | `DEVICE` | `cuda` |
 | `WRITE_MODE` | `all` |
+| `OUTPUT_FORMAT` | physics/io 为 `hdf5`；smoke/compute 为 `npy` |
 | `STAR_FLUX_MODE` | `random_et_mag` |
 | `ET_MAG_MIN` / `ET_MAG_MAX` | `12.5` / `14.5` |
 | `JITTER_PSF_MODELS` / `JITTER_FRAMES_PER_MODEL` | `300` / `600` |
@@ -382,12 +411,12 @@ batch 4: L7D long_low_star cases
 | case 生成 | 增加 16 个正式 case，或增加 `--matrix-preset stamp_scale_v2` 自动生成 |
 | CLI | 增加 `--n-stars`、`--duration-days`、`--stamp-sizes`、`--exposures` 的矩阵生成能力 |
 | Slurm wrapper | 增加 `MATRIX_PRESET`、`SCALE_GROUP`、`DURATION_DAYS`、`N_STARS` 等环境覆盖 |
-| manifest | 改为 worker 分片或 streaming，避免全量记录回主进程 |
+| manifest | NPY 保留 worker 分片；HDF5 使用 shard 内 ids/status/seeds 和相对 JSON index |
 | resume | 支持已写文件校验和跳过 |
 | summary | 增加 `expected_files`、`n_written`、`n_skipped`、`n_failed`、`files_per_s`、`output_bytes` |
 | 测试 | 覆盖 180 s 参数、16-case 矩阵、dry-run 计数、manifest 分片和 resume |
 
-当前运行前准备已落地：16-case 矩阵、worker 分片 manifest、resume/atomic write、ET mag 12.5-14.5 随机采样、`300 x 600` Jitter-integrated PSF 默认值和 Slurm wrapper 参数透传。
+当前运行前准备已落地：16-case 矩阵、NPY worker manifest、HDF5 one-shard-per-worker、partial resume/atomic finalize、canonical ET mag 12.5-14.5 electron-rate conversion、`300 x 600` Jitter-integrated PSF 默认值和 Slurm wrapper 参数透传。
 
 目标命令形态示例：
 
@@ -395,6 +424,7 @@ batch 4: L7D long_low_star cases
 MATRIX_PRESET=stamp_scale_v2 \
 SCALE_GROUP=short_high_star \
 WRITE_MODE=all \
+OUTPUT_FORMAT=hdf5 \
 GPUS=0,1,2 \
 WORKERS_PER_GPU=10 \
 sbatch stamp_long/submit_stamp_long_h100.sh
@@ -402,6 +432,7 @@ sbatch stamp_long/submit_stamp_long_h100.sh
 MATRIX_PRESET=stamp_scale_v2 \
 SCALE_GROUP=long_low_star \
 WRITE_MODE=all \
+OUTPUT_FORMAT=hdf5 \
 GPUS=0,1,2 \
 WORKERS_PER_GPU=10 \
 sbatch stamp_long/submit_stamp_long_h100.sh
