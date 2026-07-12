@@ -1,10 +1,11 @@
 # main_rd Parallel Full-Effect Simulations
 
-This directory contains parallel ET `main_rd` simulation entry points backed by
-`main_rd_parallel_core.py`. The scripts share the same detector/electronics and
-motion-effect implementation; each entry point only overrides the source field,
-image shape, sky background, subpixel grid, frame count, or scattered-light
-schedule stated below.
+This directory contains parallel ET `main_rd` orchestration entry points backed
+by `main_rd_parallel_core.py`. Active workers convert `MainRdRunSpec` once to a
+Photsim7 `SimulationSpec`, build reusable `FullFrameServices`, and render each
+cadence through `run_single_cadence_full_frame(...)`. The scripts only select
+the source field, image shape, sky background, subpixel grid, frame count, and
+project-specific output schedule.
 
 Outputs default to:
 
@@ -29,6 +30,8 @@ Unless a script says otherwise, the shared settings are:
 | Exposure | `10 s` |
 | Pixel size | `10 um` |
 | Pixel scale | `4.83 arcsec/pix` |
+| Optical efficiency | `58%` |
+| ET quantum efficiency | `80%` |
 | Dark current | `1 e-/s/pix` |
 | Inter-pixel response RMS | `1%` |
 | Intra-pixel response RMS | `1%` |
@@ -39,7 +42,7 @@ Unless a script says otherwise, the shared settings are:
 | Bias | `3500 ADU` |
 | Readout noise | `6 e-/pix`, applied after full-well clipping and before gain |
 | Cosmic rays | enabled, `5 events cm^-2 s^-1`, 10 um event library |
-| PSD motion | enabled, `/home/cxgao/ET/photsim6_cache/ET_psd3-2.pkl` |
+| PSD motion | enabled, `ET_DATA_DIR/pds/ET_psd3-2.pkl` |
 | Jitter-integrated PSF | enabled |
 | DVA drift | enabled, field angle/theta `12 deg` |
 | Thermal drift | enabled |
@@ -47,8 +50,21 @@ Unless a script says otherwise, the shared settings are:
 | WEED PSF breathing | enabled |
 
 The PSD motion is split at the single-frame cadence. Motion slower than the
-`10 s` cadence is applied as frame-to-frame centroid drift; faster motion is
-integrated into PSF models.
+`10 s` cadence is projected from its native spacecraft-attitude frame into a
+renderer `(x, y)` offset for each source; faster motion is integrated into PSF
+models. DVA and thermal terms remain radial focal-plane components until the
+same per-cadence projection. The saved `effects_timeseries.npz` therefore holds
+compact native components, with its schema in
+`effects_timeseries.metadata.json`.
+
+ET photon rates use the accepted approximation
+`et_mag (AB) = gaia_g_mag (Vega)` and the ET report calibration with explicit
+`58%` optical efficiency and `80%` QE. The old main-rd path advertised an
+invalid `101%` efficiency while separately passing `1.0` to its star builder,
+so old products do not have one trustworthy global correction ratio. Relative
+to the advertised `101%` scalar, the new throughput factor is
+`0.58 * 0.80 / 1.01 = 0.4594`; relative to a path that already applied `80%` QE
+but used unity optical efficiency, it is `0.58`.
 
 ## Script Index
 
@@ -67,11 +83,47 @@ Detector-xy CSV conventions:
 
 | Script family | CSV | Rows | Coordinate/magnitude handling |
 | --- | --- | --- | --- |
-| `500x500_detectorxy` | `/home/cxgao/ET/Photsim7-data/ET_mag/310-50-2420_square_detector_xy.csv` | `17779` | `gmag` is used directly as ET magnitude; `x0,y0` are detector-centered pixel coordinates and are not rounded, randomized, or reprojected. |
+| `500x500_detectorxy` | `/home/cxgao/ET/Photsim7-data/ET_mag/310-50-2420_square_detector_xy.csv` | `17779` | `gmag` is Gaia G and enters ET photometry through the current numeric-equality approximation; `x0,y0` are detector-centered frame offsets and are not rounded, randomized, or reprojected. |
 | `700x700_detectorxy` | `/home/cxgao/ET/Photsim7-data/ET_mag/310-50-2420_square700pix_glt24_detector_xy.csv` | `36459` | Same convention. |
 
 The detailed parameter checklist for the three scattered-light branches is kept
 in `DETECTORXY_STRAYLIGHT_BRANCHES_PARAMETER_CHECKLIST.md`.
+
+## Output Contract
+
+Legacy NPY output remains the default:
+
+```text
+frames/frame_000000.npy
+cosmic_events/frame_000000_events.npy
+bias/frame_000000_column_noise_adu.npy
+frame_summaries/frame_000000.json
+preview/frame_000000.png
+```
+
+Every new frame also has
+`frame_summaries/frame_000000_schema.json` with schema id
+`photsim7.single_cadence_frame_products.v1`, units, domains, shape, coordinate
+convention, RNG trace, and package provenance. Current main-rd wrappers do not
+select packed HDF5 output; NPY compatibility remains authoritative for these
+runs. `export_last90_truth_tables.py` reads both the historical global-offset
+format and the package native-component format. New-format truth is projected
+per source and uses typed ET photometry.
+
+## Ownership Boundary
+
+Photsim7 owns catalog normalization/cache schema, magnitude-to-electron-rate
+conversion, projector selection, dynamic effects, PSF construction, detector
+response, detector electronics, cosmic injection, SeedTree streams, and frame
+product schemas. ET-mainsim retains CLI parsing, run labels, worker/GPU process
+scheduling, resume selection, scattered-light experiment schedules, and legacy
+path organization.
+
+The local PSF, renderer, and electronics helpers remain only as one-cycle
+compatibility code. `build_full_effect_timeseries(...)` and
+`jitter_integrated_psf_offsets(...)` cannot yet be removed because the
+out-of-scope `stamp_long` workflow still imports them; active `main_rd` workers
+do not call any of these helpers.
 
 ## Scattered-Light Branch Definition
 
