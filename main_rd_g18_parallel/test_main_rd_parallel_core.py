@@ -1187,6 +1187,16 @@ def test_launch_reuses_existing_star_cache_without_querying_catalog(
         ),
     )
     monkeypatch.setattr(core.subprocess, "Popen", fake_popen)
+    expected_git = {
+        "et_mainsim": {"commit": "e" * 40, "dirty": False},
+        "photsim7": {"commit": "p" * 40, "dirty": False},
+    }
+    monkeypatch.setattr(
+        core,
+        "source_git_provenance",
+        lambda: expected_git,
+        raising=False,
+    )
 
     core.launch_or_run(args, spec, Path("simulate.py"))
 
@@ -1196,6 +1206,7 @@ def test_launch_reuses_existing_star_cache_without_querying_catalog(
     with (tmp_path / "run" / "run_config.json").open(encoding="utf-8") as handle:
         run_config = json.load(handle)
     assert run_config["compatibility_adapter"] == "MainRdRunSpec"
+    assert run_config["git_provenance"] == expected_git
     assert run_config["simulation_spec"]["schema_id"] == "photsim7.simulation_spec"
     assert run_config["simulation_spec"]["schema_version"] == 1
     assert run_config["simulation_spec"]["observation"]["n_frames"] == 1

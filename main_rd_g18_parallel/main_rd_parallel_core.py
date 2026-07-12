@@ -1805,6 +1805,38 @@ def gpu_memory_snapshot() -> str:
         return f"unavailable: {exc}"
 
 
+def _git_repository_provenance(root: Path | str) -> dict[str, Any]:
+    path = Path(root).expanduser().resolve()
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        dirty = bool(
+            subprocess.check_output(
+                ["git", "-C", str(path), "status", "--porcelain"],
+                text=True,
+            ).strip()
+        )
+        return {"root": str(path), "commit": commit, "dirty": dirty}
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return {
+            "root": str(path),
+            "commit": None,
+            "dirty": None,
+            "error": str(exc),
+        }
+
+
+def source_git_provenance() -> dict[str, dict[str, Any]]:
+    return {
+        "et_mainsim": _git_repository_provenance(
+            Path(__file__).resolve().parents[1]
+        ),
+        "photsim7": _git_repository_provenance(PHOTSIM7_ROOT),
+    }
+
+
 def plot_preview(image_dn: np.ndarray, preview_path: Path, *, title: str) -> None:
     preview_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8.0, 8.0), dpi=150)
@@ -1953,6 +1985,7 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
         "spec": asdict(spec),
         "simulation_spec": typed_spec.to_json_dict(),
         "compatibility_adapter": "MainRdRunSpec",
+        "git_provenance": source_git_provenance(),
         "args": vars(args),
         "rank": int(args.worker_rank),
         "world_size": int(args.worker_world_size),
@@ -2299,6 +2332,7 @@ def launch_or_run(args: argparse.Namespace, spec: MainRdRunSpec, script_path: Pa
         "spec": asdict(spec),
         "simulation_spec": typed_spec.to_json_dict(),
         "compatibility_adapter": "MainRdRunSpec",
+        "git_provenance": source_git_provenance(),
         "args": vars(args),
         "star_cache": str(cache_path),
         "gpu_ids": gpu_ids,
