@@ -229,6 +229,34 @@ def _package_effect_timeseries(
     ), metadata
 
 
+def _select_package_catalog(catalog, max_stars: int | None):
+    if max_stars is None:
+        return catalog
+    from photsim7.catalog_sources import PreparedStarCatalog
+    from photsim7.photometry import normalize_magnitude_input
+
+    max_stars = int(max_stars)
+    if max_stars <= 0:
+        raise ValueError("max_stars must be positive when provided")
+    if catalog.n_sources <= max_stars:
+        return catalog
+    magnitude = normalize_magnitude_input(catalog.star_data, mag_type="ET").magnitude
+    selected_indices = np.argsort(magnitude)[:max_stars]
+    selected_data: dict[str, Any] = {}
+    for key, value in catalog.star_data.items():
+        array = np.asarray(value)
+        if array.ndim == 1 and len(array) == catalog.n_sources:
+            selected_data[key] = array[selected_indices]
+        else:
+            selected_data[key] = value
+    return PreparedStarCatalog(
+        star_data=selected_data,
+        metadata=dict(catalog.metadata),
+        schema_id=catalog.schema_id,
+        schema_version=catalog.schema_version,
+    )
+
+
 def load_run_context(run_dir: Path | str) -> RunContext:
     run_dir = Path(run_dir).expanduser()
     run_config = _load_json(run_dir / "run_config.json")
@@ -243,7 +271,10 @@ def load_run_context(run_dir: Path | str) -> RunContext:
         from photsim7.specs import SimulationSpec
 
         typed_spec = SimulationSpec.from_json_dict(run_config["simulation_spec"])
-        catalog = StarCatalogCache.read(star_cache)
+        catalog = _select_package_catalog(
+            StarCatalogCache.read(star_cache),
+            (run_config.get("args") or {}).get("max_stars"),
+        )
         star_data = dict(catalog.star_data)
         stars = build_star_table_from_catalog(typed_spec, catalog)
         photon_rate = np.asarray(

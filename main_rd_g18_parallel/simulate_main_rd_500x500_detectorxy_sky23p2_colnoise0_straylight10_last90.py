@@ -21,6 +21,7 @@ if __name__ == "__main__":
         spec_overrides={
             "run_label": "main_rd_500x500_detectorxy_310-50-2420_sky22_colnoise0_subpix1_straylight10_last90",
             "n_frames": 270,
+            "observing_duration_s": 2700.0,
             "mag_limit": 24.0,
             "star_source": "detector_xy_csv",
             "detector_xy_csv": str(DEFAULT_DETECTOR_XY_CSV),

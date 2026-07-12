@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import runpy
 import subprocess
 import sys
 import types
@@ -18,6 +19,36 @@ if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
 
 import main_rd_parallel_core as core
+
+
+@pytest.mark.parametrize(
+    "script_path",
+    sorted(MODULE_DIR.glob("simulate_main_rd_*.py")),
+    ids=lambda path: path.name,
+)
+def test_main_rd_entrypoint_overrides_form_valid_typed_adapter(
+    monkeypatch,
+    script_path,
+):
+    captured = {}
+
+    def fake_run_entrypoint(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(core, "run_entrypoint", fake_run_entrypoint)
+    monkeypatch.setitem(sys.modules, "main_rd_parallel_core", core)
+
+    runpy.run_path(str(script_path), run_name="__main__")
+
+    overrides = dict(captured.get("spec_overrides") or {})
+    spec = core.MainRdRunSpec(
+        frame_rows=int(captured["frame_rows"]),
+        frame_cols=int(captured["frame_cols"]),
+        **overrides,
+    )
+    assert spec.observing_duration_s == pytest.approx(
+        spec.n_frames * spec.exposure_s
+    )
 
 
 def test_path_constants_can_be_overridden_from_environment(tmp_path):
@@ -854,6 +885,24 @@ def test_build_main_rd_services_delegates_runtime_overrides(monkeypatch, tmp_pat
     assert typed.dynamic_effects.momentum_dump.enabled is False
     assert typed.dynamic_effects.psf_breathing.enabled is False
     assert typed.detector_response.enable_inter_pixel_response is False
+
+
+def test_effect_timeseries_artifacts_encode_disabled_effects():
+    typed_spec = core.MainRdRunSpec(
+        frame_rows=2,
+        frame_cols=3,
+        n_frames=2,
+        observing_duration_s=20.0,
+    ).to_simulation_spec()
+
+    arrays, metadata = core.effect_timeseries_artifacts(None, typed_spec)
+
+    np.testing.assert_allclose(arrays["frame_start_s"], [0.0, 10.0])
+    np.testing.assert_allclose(arrays["frame_mid_s"], [5.0, 15.0])
+    assert metadata["schema_id"] == "photsim7.effect_timeseries.v1"
+    assert metadata["timing"]["n_frames"] == 2
+    assert metadata["components"] == []
+    assert metadata["metadata"]["all_effects_disabled"] is True
 
 
 def test_run_worker_uses_package_pipeline_and_preserves_legacy_outputs(

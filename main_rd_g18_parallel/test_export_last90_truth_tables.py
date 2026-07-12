@@ -59,7 +59,7 @@ def _write_minimal_run(tmp_path: Path) -> Path:
     return run_dir
 
 
-def _write_package_timeline_run(tmp_path: Path) -> Path:
+def _write_package_timeline_run(tmp_path: Path, *, max_stars: int | None = None) -> Path:
     from photsim7.catalog_sources import PreparedStarCatalog, StarCatalogCache
     from photsim7.dynamic_effect_models import build_frame_timing
     from photsim7.dynamic_effects import (
@@ -162,6 +162,7 @@ def _write_package_timeline_run(tmp_path: Path) -> Path:
                 "simulation_spec": spec.to_json_dict(),
                 "star_cache": str(cache_path),
                 "selected_frame_indices": [0, 1],
+                "args": {"max_stars": max_stars},
             }
         ),
         encoding="utf-8",
@@ -240,3 +241,13 @@ def test_package_timeline_projects_per_source_truth_and_uses_typed_photometry(
     expected_rate = et_mag_to_detected_electron_rate(np.array([12.0, 13.0])).value
     np.testing.assert_allclose(frame["photon_rate_e_s"], expected_rate)
     assert context.effect_schema_id == "photsim7.effect_timeseries.v1"
+
+
+def test_package_timeline_replays_worker_brightest_source_selection(tmp_path):
+    run_dir = _write_package_timeline_run(tmp_path, max_stars=1)
+
+    context = exporter.load_run_context(run_dir)
+    frame = exporter.build_frame_truth_dataframe(context, 0)
+
+    assert list(frame["source_id"]) == [101]
+    assert context.effect_timeseries.source_geometry.n_sources == 1

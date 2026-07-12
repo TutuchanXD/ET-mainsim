@@ -1868,6 +1868,40 @@ def _legacy_cosmic_mask(mask: Any) -> np.ndarray:
     return array
 
 
+def effect_timeseries_artifacts(effect_timeseries, typed_spec):
+    if effect_timeseries is not None:
+        return effect_timeseries.to_arrays(), effect_timeseries.to_metadata()
+
+    observation = typed_spec.observation
+    integration_s = observation.integration_for(
+        typed_spec.detector.detector_type
+    ).to_value(u.s)
+    frame_start_s = np.asarray(
+        observation.resolved_frame_start_s,
+        dtype=np.float64,
+    )
+    split_hz = float(typed_spec.dynamic_effects.psd_motion.split_hz)
+    arrays = {
+        "frame_start_s": frame_start_s,
+        "frame_mid_s": frame_start_s + 0.5 * integration_s,
+    }
+    metadata = {
+        "schema_id": "photsim7.effect_timeseries.v1",
+        "schema_version": 1,
+        "timing": {
+            "n_frames": int(observation.resolved_n_frames),
+            "integration_s": float(integration_s),
+            "sampling_interval_s": float(
+                observation.sampling_interval.to_value(u.s)
+            ),
+            "split_hz": split_hz,
+        },
+        "components": [],
+        "metadata": {"all_effects_disabled": True},
+    }
+    return arrays, metadata
+
+
 def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
     ensure_local_imports()
     torch = require_torch()
@@ -1907,8 +1941,10 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
     if args.device.startswith("cuda"):
         torch.cuda.set_device(0)
         torch.cuda.reset_peak_memory_stats()
-    effect_arrays = services.effect_timeseries.to_arrays()
-    effect_metadata = services.effect_timeseries.to_metadata()
+    effect_arrays, effect_metadata = effect_timeseries_artifacts(
+        services.effect_timeseries,
+        typed_spec,
+    )
     if int(args.worker_rank) == 0:
         np.savez_compressed(run_dir / "effects_timeseries.npz", **effect_arrays)
         write_json(run_dir / "effects_timeseries.metadata.json", effect_metadata)
