@@ -11,13 +11,15 @@ if __name__ == "__main__":
         frame_rows=500,
         frame_cols=500,
         description=(
-            "Parallel detector-xy main_rd simulation, 500x500 pixels, 270 frames; "
+            "Parallel detector-xy main_rd simulation, 500x500 pixels, sky 22 mag/arcsec^2, "
+            "1x1 subpixel grid, 270 frames; "
             "frames 0-179 match the baseline, frames 180-269 add 10 e-/pix/frame "
-            "scattered light."
+            "scattered light. The legacy sky23p2 filename is retained for compatibility; "
+            "the configured sky value is 22 mag/arcsec^2."
         ),
         script_path=Path(__file__).resolve(),
         spec_overrides={
-            "run_label": "main_rd_500x500_detectorxy_310-50-2420_sky23p2_colnoise0_straylight10_last90",
+            "run_label": "main_rd_500x500_detectorxy_310-50-2420_sky22_colnoise0_subpix1_straylight10_last90",
             "n_frames": 270,
             "mag_limit": 24.0,
             "star_source": "detector_xy_csv",
@@ -27,17 +29,19 @@ if __name__ == "__main__":
             "detector_xy_x_column": "x0",
             "detector_xy_y_column": "y0",
             "synthetic_psf_field_angle_deg": 12.0,
-            "sky_surface_brightness_mag_arcsec2": 23.2,
-            "n_subpixels": 3,
+            "sky_surface_brightness_mag_arcsec2": 22.0,
+            "n_subpixels": 1,
             "column_noise_sigma_adu": 0.0,
             "scattered_light_e_s_pix": 0.0,
             "scattered_light_step_start_frame": 180,
             "scattered_light_step_e_pix_frame": 10.0,
             "notes": (
-                "Detector-xy 500x500 baseline with 270 frames. Frames 0-179 match "
-                "simulate_main_rd_500x500_detectorxy_sky23p2_colnoise0.py; frames "
-                "180-269 add 10 e-/pix/frame scattered light. All other effects are "
-                "unchanged."
+                "Legacy sky23p2 filename retained for compatibility. Detector-xy "
+                "500x500 baseline with sky background set through the "
+                "surface-brightness magnitude path at 22 mag/arcsec^2 and a 1x1 "
+                "subpixel grid. Star PSF field IDs are selected from each star's "
+                "main_rd detector position. Frames 180-269 add 10 e-/pix/frame "
+                "scattered light. All other effects are unchanged."
             ),
         },
     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import json
 import os
 import subprocess
@@ -20,12 +21,27 @@ import numpy as np
 from astropy import units as u
 
 
-ET_ROOT = Path("/home/cxgao/ET")
-PHOTSIM7_ROOT = ET_ROOT / "Photsim7"
-PHOTSIM7_DATA_DIR = ET_ROOT / "Photsim7-data"
-ET_FOCALPLANE_ROOT = ET_ROOT / "et_focalplane"
-GAIA_CATALOG_DIR = Path("/home/cxgao/gaia_dr3_19mag")
-RESULTS_ROOT = Path("/home/cxgao/Results/ET-mainsim/main_rd_g18_parallel")
+def env_path(name: str, default: str | Path) -> Path:
+    return Path(os.environ.get(name, str(default))).expanduser()
+
+
+def default_photsim7_root(et_root: Path) -> Path:
+    for dirname in ("Photsim7", "Photosim7"):
+        candidate = et_root / dirname
+        if candidate.exists():
+            return candidate
+    return et_root / "Photsim7"
+
+
+ET_ROOT = env_path("ET_ROOT", "/home/cxgao/ET")
+PHOTSIM7_ROOT = env_path("PHOTSIM7_ROOT", default_photsim7_root(ET_ROOT))
+PHOTSIM7_DATA_DIR = env_path(
+    "PHOTSIM7_DATA_DIR",
+    os.environ.get("ET_DATA_DIR", str(ET_ROOT / "Photsim7-data")),
+)
+ET_FOCALPLANE_ROOT = env_path("ET_FOCALPLANE_ROOT", ET_ROOT / "et_focalplane")
+GAIA_CATALOG_DIR = env_path("GAIA_CATALOG_DIR", "/home/cxgao/gaia_dr3_19mag")
+RESULTS_ROOT = env_path("RESULTS_ROOT", "/home/cxgao/Results/ET-mainsim/main_rd_g18_parallel")
 DEFAULT_MAG_DISTRIBUTION_CSV = PHOTSIM7_DATA_DIR / "ET_mag" / "310-50-2420.csv"
 DEFAULT_DETECTOR_XY_CSV = (
     PHOTSIM7_DATA_DIR / "ET_mag" / "310-50-2420_square_detector_xy.csv"
@@ -50,7 +66,7 @@ EXPOSURE = 10.0 * u.s
 OBSERVING_DURATION = 1800.0 * u.s
 N_FRAMES = 180
 
-SKY_SURFACE_BRIGHTNESS = 21.0
+SKY_SURFACE_BRIGHTNESS = 22.0
 DARK_CURRENT = 1.0 * u.electron / u.s / u.pix
 SCATTERED_LIGHT = 0.0 * u.electron / u.s / u.pix
 READOUT_NOISE = 6.0 * u.electron / u.pix
@@ -64,7 +80,7 @@ COSMIC_RAY_LIBRARY_PATH = "cosmic_ray/dark_test_10um/event_library_10um.npz"
 COSMIC_RAY_PIXEL_SIZE = 10.0 * u.um
 
 PSF_BUNDLE_NAME = "241006/D280mm-focus"
-N_SUBPIXELS = 3
+N_SUBPIXELS = 1
 JITTER_INTEGRATED_PSF_MODELS = 300
 JITTER_FRAMES_PER_MODEL = 600
 MOTION_SPLIT_HZ = 1.0 / EXPOSURE.to(u.s).value
@@ -163,16 +179,23 @@ def ensure_local_imports() -> None:
     os.environ.setdefault("ET_DATA_DIR", str(PHOTSIM7_DATA_DIR))
     photsim7_src = PHOTSIM7_ROOT / "photsim7"
     if not photsim7_src.exists():
-        raise FileNotFoundError(f"Photsim7 source not found: {photsim7_src}")
+        if importlib.util.find_spec("photsim7") is None:
+            raise FileNotFoundError(
+                f"Photsim7 source not found and no installed photsim7 package is importable: "
+                f"{photsim7_src}"
+            )
+    else:
+        existing = sys.modules.get("photsim7")
+        if existing is None or not hasattr(existing, "__path__"):
+            pkg = types.ModuleType("photsim7")
+            pkg.__path__ = [str(photsim7_src)]
+            pkg.__package__ = "photsim7"
+            sys.modules["photsim7"] = pkg
 
-    existing = sys.modules.get("photsim7")
-    if existing is None or not hasattr(existing, "__path__"):
-        pkg = types.ModuleType("photsim7")
-        pkg.__path__ = [str(photsim7_src)]
-        pkg.__package__ = "photsim7"
-        sys.modules["photsim7"] = pkg
-
-    for path in (ET_FOCALPLANE_ROOT / "src", PHOTSIM7_ROOT):
+    import_paths = [ET_FOCALPLANE_ROOT / "src"]
+    if photsim7_src.exists():
+        import_paths.append(PHOTSIM7_ROOT)
+    for path in import_paths:
         path_str = str(path)
         if path_str not in sys.path:
             sys.path.insert(0, path_str)
@@ -337,6 +360,70 @@ def sim_config_dict(
     }
 
 
+_ET_REGISTRY_CACHE = None
+
+
+def _et_registry():
+    global _ET_REGISTRY_CACHE
+    if _ET_REGISTRY_CACHE is None:
+        ensure_local_imports()
+        from et_coord import load_registry
+
+        _ET_REGISTRY_CACHE = load_registry(ET_FOCALPLANE_ROOT / "data")
+    return _ET_REGISTRY_CACHE
+
+
+def main_rd_field_geometry_from_absolute_detector_xy(
+    detector_xpix,
+    detector_ypix,
+    *,
+    detector_id: str = DETECTOR_ID,
+) -> dict[str, np.ndarray]:
+    """Return field coordinates and field angle for main_rd detector pixels."""
+    ensure_local_imports()
+    from et_coord.geometry import bilinear_forward_many
+
+    registry = _et_registry()
+    detector = registry.get_detector(detector_id)
+
+    xpix = np.asarray(detector_xpix, dtype=float)
+    ypix = np.asarray(detector_ypix, dtype=float)
+    xpix, ypix = np.broadcast_arrays(xpix, ypix)
+    flat_xpix = xpix.ravel()
+    flat_ypix = ypix.ravel()
+
+    u = flat_xpix / float(detector.pixel_width)
+    v = flat_ypix / float(detector.pixel_height)
+    field_xy = bilinear_forward_many(detector.field_corners, u, v).reshape(
+        xpix.shape + (2,)
+    )
+    field_x = field_xy[..., 0]
+    field_y = field_xy[..., 1]
+    field_angle = np.hypot(field_x, field_y)
+    return {
+        "field_x_deg": field_x.astype(float, copy=False),
+        "field_y_deg": field_y.astype(float, copy=False),
+        "field_angle_deg": field_angle.astype(float, copy=False),
+        "field_polar_angle_rad": np.arctan2(field_y, field_x).astype(
+            float,
+            copy=False,
+        ),
+    }
+
+
+def main_rd_field_geometry_from_frame_offsets(x0, y0) -> dict[str, np.ndarray]:
+    """Map crop/frame-relative star offsets to main_rd field geometry.
+
+    The parallel renderer stores star positions as offsets from the configured
+    target detector center.  The et_focalplane transform expects absolute
+    detector pixels, so this helper restores the main_rd absolute coordinates
+    before evaluating the field angle.
+    """
+    abs_xpix = TARGET_DETECTOR_XPIX + np.asarray(x0, dtype=float)
+    abs_ypix = TARGET_DETECTOR_YPIX + np.asarray(y0, dtype=float)
+    return main_rd_field_geometry_from_absolute_detector_xy(abs_xpix, abs_ypix)
+
+
 def star_summary(star_data: dict[str, Any]) -> dict[str, Any]:
     n_stars = int(len(star_data["x0"]))
     summary: dict[str, Any] = {"n_stars": n_stars}
@@ -485,6 +572,7 @@ def build_synthetic_mag_distribution_stars(
     y_abs = rng.uniform(0.0, float(frame_rows - 1), size=len(mags))
     x0 = x_abs - (int(frame_cols) - 1) / 2.0
     y0 = y_abs - (int(frame_rows) - 1) / 2.0
+    field_geometry = main_rd_field_geometry_from_frame_offsets(x0, y0)
 
     return {
         "x0": np.asarray(x0, dtype=float),
@@ -498,10 +586,10 @@ def build_synthetic_mag_distribution_stars(
         "detector_ypix": np.asarray(y_abs, dtype=float),
         "detector_xpix_shifted": np.asarray(x_abs, dtype=float),
         "detector_ypix_shifted": np.asarray(y_abs, dtype=float),
-        "field_x_deg": np.full(len(mags), float(psf_field_angle_deg), dtype=float),
-        "field_y_deg": np.zeros(len(mags), dtype=float),
-        "field_angle_deg": np.full(len(mags), float(psf_field_angle_deg), dtype=float),
-        "field_polar_angle_rad": np.zeros(len(mags), dtype=float),
+        "field_x_deg": field_geometry["field_x_deg"],
+        "field_y_deg": field_geometry["field_y_deg"],
+        "field_angle_deg": field_geometry["field_angle_deg"],
+        "field_polar_angle_rad": field_geometry["field_polar_angle_rad"],
     }
 
 
@@ -594,6 +682,7 @@ def build_detector_xy_stars(
     y0_arr = np.asarray(y0_values, dtype=float)
     x_shifted = x0_arr + (int(frame_cols) - 1) / 2.0
     y_shifted = y0_arr + (int(frame_rows) - 1) / 2.0
+    field_geometry = main_rd_field_geometry_from_frame_offsets(x0_arr, y0_arr)
     return {
         "x0": x0_arr,
         "y0": y0_arr,
@@ -606,14 +695,10 @@ def build_detector_xy_stars(
         "detector_ypix": np.asarray(y_shifted, dtype=float),
         "detector_xpix_shifted": np.asarray(x_shifted, dtype=float),
         "detector_ypix_shifted": np.asarray(y_shifted, dtype=float),
-        "field_x_deg": np.full(len(et_mag_arr), float(psf_field_angle_deg), dtype=float),
-        "field_y_deg": np.zeros(len(et_mag_arr), dtype=float),
-        "field_angle_deg": np.full(
-            len(et_mag_arr),
-            float(psf_field_angle_deg),
-            dtype=float,
-        ),
-        "field_polar_angle_rad": np.zeros(len(et_mag_arr), dtype=float),
+        "field_x_deg": field_geometry["field_x_deg"],
+        "field_y_deg": field_geometry["field_y_deg"],
+        "field_angle_deg": field_geometry["field_angle_deg"],
+        "field_polar_angle_rad": field_geometry["field_polar_angle_rad"],
     }
 
 
@@ -763,6 +848,16 @@ def prepare_star_cache(args: argparse.Namespace, spec: MainRdRunSpec) -> Path:
     return cache_path
 
 
+def resolve_or_prepare_star_cache(args: argparse.Namespace, spec: MainRdRunSpec) -> Path:
+    if args.star_cache is not None:
+        cache_path = Path(args.star_cache).expanduser()
+        if not cache_path.exists():
+            raise FileNotFoundError(f"--star-cache does not exist: {cache_path}")
+        print(f"[Star cache] reuse explicit {cache_path}")
+        return cache_path
+    return prepare_star_cache(args, spec)
+
+
 def build_star_catalog(
     *,
     star_data: dict[str, Any],
@@ -910,6 +1005,8 @@ def frame_motion_offsets(
     seed: int,
     enable_psd_motion: bool,
     psd_motion_path: Path | None,
+    exposure_s: float = EXPOSURE.to(u.s).value,
+    motion_split_hz: float | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     if not enable_psd_motion:
         offsets = np.zeros((int(n_frames), 2), dtype=np.float32)
@@ -923,8 +1020,11 @@ def frame_motion_offsets(
 
     psd = load_psd_motion(psd_motion_path)
     rng = np.random.default_rng(int(seed))
-    time_s = np.arange(int(n_frames), dtype=np.float64) * EXPOSURE.to(u.s).value
-    split_hz = MOTION_SPLIT_HZ
+    exposure_s = float(exposure_s)
+    if exposure_s <= 0.0:
+        raise ValueError(f"exposure_s must be positive, got {exposure_s}")
+    time_s = np.arange(int(n_frames), dtype=np.float64) * exposure_s
+    split_hz = float(motion_split_hz) if motion_split_hz is not None else 1.0 / exposure_s
     theta_arcsec = {
         axis: psd_axis_motion(
             psd,
@@ -948,6 +1048,7 @@ def frame_motion_offsets(
         "path": str(psd_motion_path),
         "seed": int(seed),
         "model": "reference low-frequency ET PSD roll/pitch/yaw drift, frequencies <= split_hz",
+        "exposure_s": float(exposure_s),
         "split_hz": float(split_hz),
         "field_angle_deg": REFERENCE_EFFECT_FIELD_ANGLE_DEG,
         "x_axis_angle_deg": REFERENCE_EFFECT_X_AXIS_ANGLE_DEG,
@@ -1222,13 +1323,21 @@ def build_full_effect_timeseries(
     enable_thermal: bool,
     enable_momentum_dump: bool,
     enable_psf_breathing: bool,
+    exposure_s: float = EXPOSURE.to(u.s).value,
+    motion_split_hz: float | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    time_s = np.arange(int(n_frames), dtype=np.float64) * EXPOSURE.to(u.s).value
+    exposure_s = float(exposure_s)
+    if exposure_s <= 0.0:
+        raise ValueError(f"exposure_s must be positive, got {exposure_s}")
+    split_hz = float(motion_split_hz) if motion_split_hz is not None else 1.0 / exposure_s
+    time_s = np.arange(int(n_frames), dtype=np.float64) * exposure_s
     psd_offsets, psd_meta = frame_motion_offsets(
         n_frames=int(n_frames),
         seed=int(seed) + 991,
         enable_psd_motion=bool(enable_psd_motion),
         psd_motion_path=psd_motion_path,
+        exposure_s=exposure_s,
+        motion_split_hz=split_hz,
     )
     dva_offsets, dva_meta = generate_dva_drift_offsets(time_s=time_s, enabled=enable_dva)
     thermal_offsets, thermal_meta = generate_thermal_drift_offsets(
@@ -1255,8 +1364,8 @@ def build_full_effect_timeseries(
         "psf_scale": psf_scale.astype(np.float32),
     }
     metadata = {
-        "motion_split_hz": MOTION_SPLIT_HZ,
-        "time_step_s": EXPOSURE.to(u.s).value,
+        "motion_split_hz": float(split_hz),
+        "time_step_s": float(exposure_s),
         "components": {
             "psd_spacecraft_roll_drift": psd_meta,
             "dva_drift": dva_meta,
@@ -1296,12 +1405,18 @@ def jitter_integrated_psf_offsets(
     psd_motion_path: Path | None,
     n_models: int,
     n_frames_per_model: int,
+    exposure_s: float = EXPOSURE.to(u.s).value,
+    motion_split_hz: float | None = None,
 ) -> tuple[np.ndarray | None, dict[str, Any]]:
     if not enable_jitter_integrated_psf:
         return None, {"enabled": False, "reason": "disabled"}
     if not enable_psd_motion:
         zeros = np.zeros((1, 2, 1), dtype=np.float32)
-        return zeros, {"enabled": True, "reason": "PSD motion disabled; zero-jitter PSF"}
+        return zeros, {
+            "enabled": True,
+            "reason": "PSD motion disabled; zero-jitter PSF",
+            "exposure_s": float(exposure_s),
+        }
     if psd_motion_path is None:
         raise ValueError("Jitter-integrated PSF requires --psd-motion-path")
 
@@ -1310,8 +1425,10 @@ def jitter_integrated_psf_offsets(
         raise FileNotFoundError(f"PSD motion file not found: {psd_motion_path}")
 
     psd = load_psd_motion(psd_motion_path)
-    split_hz = MOTION_SPLIT_HZ
-    exposure_s = EXPOSURE.to(u.s).value
+    exposure_s = float(exposure_s)
+    if exposure_s <= 0.0:
+        raise ValueError(f"exposure_s must be positive, got {exposure_s}")
+    split_hz = float(motion_split_hz) if motion_split_hz is not None else 1.0 / exposure_s
     time_s = np.linspace(0.0, exposure_s, int(n_frames_per_model), endpoint=False)
     pixel_scale_arcsec = PIXEL_SCALE.to(u.arcsec / u.pix).value
     rng = np.random.default_rng(int(seed))
@@ -1354,6 +1471,7 @@ def jitter_integrated_psf_offsets(
         "enabled": True,
         "path": str(psd_motion_path),
         "seed": int(seed),
+        "exposure_s": float(exposure_s),
         "split_hz": float(split_hz),
         "n_models": int(n_models),
         "n_frames_per_model": int(n_frames_per_model),
@@ -1544,6 +1662,7 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
         enable_thermal=bool(args.enable_thermal_drift),
         enable_momentum_dump=bool(args.enable_momentum_dump),
         enable_psf_breathing=bool(args.enable_psf_breathing),
+        exposure_s=float(spec.exposure_s),
     )
     xy_jitter_pix, jitter_metadata = jitter_integrated_psf_offsets(
         seed=int(args.seed) + 1999,
@@ -1552,6 +1671,7 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
         psd_motion_path=args.psd_motion_path,
         n_models=int(args.jitter_psf_models),
         n_frames_per_model=int(args.jitter_frames_per_model),
+        exposure_s=float(spec.exposure_s),
     )
 
     psf_manager, psf_field_ids, psf_field_id_counts = build_psf_manager(
@@ -1839,6 +1959,7 @@ def parse_common_args(
     *,
     default_frames: int = N_FRAMES,
     default_mag_limit: float = MAG_LIMIT,
+    default_jitter_psf_models: int = JITTER_INTEGRATED_PSF_MODELS,
 ) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--frames", type=int, default=default_frames)
@@ -1869,11 +1990,16 @@ def parse_common_args(
     parser.add_argument("--progress", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
+        "--prepare-star-cache-only",
+        action="store_true",
+        help="Build or validate the star cache and exit without launching workers.",
+    )
+    parser.add_argument(
         "--jitter-integrated-psf",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument("--jitter-psf-models", type=int, default=JITTER_INTEGRATED_PSF_MODELS)
+    parser.add_argument("--jitter-psf-models", type=int, default=default_jitter_psf_models)
     parser.add_argument("--jitter-frames-per-model", type=int, default=JITTER_FRAMES_PER_MODEL)
     parser.add_argument(
         "--psd-motion",
@@ -1940,9 +2066,14 @@ def launch_or_run(args: argparse.Namespace, spec: MainRdRunSpec, script_path: Pa
         )
         return
 
-    cache_path = prepare_star_cache(args, spec)
+    if getattr(args, "prepare_star_cache_only", False):
+        cache_path = resolve_or_prepare_star_cache(args, spec)
+        print(f"[Star cache] ready {cache_path}")
+        return
+
+    cache_path = resolve_or_prepare_star_cache(args, spec)
     if args.worker_rank is not None:
-        args.star_cache = cache_path if args.star_cache is None else args.star_cache
+        args.star_cache = cache_path
         run_worker(args, spec)
         return
 
@@ -2073,6 +2204,7 @@ def run_entrypoint(
         description,
         default_frames=int(spec.n_frames),
         default_mag_limit=float(spec.mag_limit),
+        default_jitter_psf_models=int(spec.n_jitter_integrated_psf_models),
     )
     args = parser.parse_args()
     launch_or_run(args, spec, script_path)
