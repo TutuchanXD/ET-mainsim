@@ -79,7 +79,8 @@ paths are preserved. New files are:
 
 `run_config.json` and worker summaries contain the canonical
 `simulation_spec`, `compatibility_adapter=MainRdRunSpec`, service provenance,
-catalog provenance, and effect schema. No SHA-256 is required by this migration.
+catalog provenance, effect schema, and exact ET-mainsim/Photsim7 Git commits
+with dirty-state flags. No SHA-256 is required by this migration.
 
 ## Temporary Compatibility Surface
 
@@ -98,14 +99,24 @@ them today.
 
 ## Verification
 
-Required evidence before merging:
+Completed evidence:
 
 - hermetic package contract with deterministic tiny frames;
 - real legacy 17,779-source cache read through `StarCatalogCache`;
 - worker delegation/output tests that fail if a legacy physics builder runs;
 - active-wrapper capture tests;
 - old and package-timeline truth-export tests;
-- full ET-mainsim local test selection;
-- full Photsim7 regression suite;
-- one isolated H100 `8900 x 9120`, one-cadence, physical Gaia `G<17` run with
-  exact Photsim7 and ET-mainsim Git provenance.
+- ET-mainsim: `91 passed` in `etbase`;
+- Photsim7: `485 passed` in `etbase`, excluding only the separately managed
+  legacy smoke runner;
+- local real-asset `500 x 500` package worker smoke and schema/truth readback;
+- H100 small smoke: Slurm job `202652`, `COMPLETED 0:0`;
+- H100 full validation: Slurm job `202658`, `COMPLETED 0:0`, one `10 s`
+  cadence, shape `(9120, 8900)`, `uint16`, 981,078 physical Gaia sources with
+  `gaia_g_mag <= 17`, 4,063 cosmic events, and
+  `photsim7.single_cadence_frame_products.v1`;
+- full-frame pipeline time `374.27 s`, peak CUDA allocation/reservation
+  `4065.67/4068 MiB`, followed by independent local SSHFS readback;
+- exact clean commits: Photsim7
+  `a347667e757ce1ec4a2e2a0b6379edf46bec6fef`, ET-mainsim
+  `e22f2e87335bbb2a9b72e7ea09fa451b947f7c4b`.

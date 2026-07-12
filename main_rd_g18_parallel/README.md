@@ -125,6 +125,25 @@ compatibility code. `build_full_effect_timeseries(...)` and
 out-of-scope `stamp_long` workflow still imports them; active `main_rd` workers
 do not call any of these helpers.
 
+## Order-12 Verification
+
+The migration was validated on H100 with one physical Gaia `G<=17` cadence:
+
+| Field | Result |
+| --- | --- |
+| Slurm job | `202658`, `COMPLETED 0:0` |
+| Shape and dtype | `(9120, 8900)`, `uint16` |
+| Sources | `981078`, maximum Gaia G `17.0` |
+| Pipeline time | `374.27 s` |
+| Peak CUDA | `4065.67 MiB` allocated, `4068 MiB` reserved |
+| Cosmic events | `4063` |
+| Product schema | `photsim7.single_cadence_frame_products.v1` |
+| Photsim7 commit | `a347667e757ce1ec4a2e2a0b6379edf46bec6fef` |
+| ET-mainsim commit | `e22f2e87335bbb2a9b72e7ea09fa451b947f7c4b` |
+
+Both repositories were clean in `run_config.json`; the frame, schema, events,
+and bias vector were independently read through the local SSHFS mount.
+
 ## Scattered-Light Branch Definition
 
 For the three `straylight10_last90` scripts:
