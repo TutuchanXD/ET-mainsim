@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import runpy
 import subprocess
 import sys
 import types
@@ -9,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from astropy import units as u
 
 
 MODULE_DIR = Path(__file__).resolve().parent
@@ -16,6 +19,36 @@ if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
 
 import main_rd_parallel_core as core
+
+
+@pytest.mark.parametrize(
+    "script_path",
+    sorted(MODULE_DIR.glob("simulate_main_rd_*.py")),
+    ids=lambda path: path.name,
+)
+def test_main_rd_entrypoint_overrides_form_valid_typed_adapter(
+    monkeypatch,
+    script_path,
+):
+    captured = {}
+
+    def fake_run_entrypoint(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(core, "run_entrypoint", fake_run_entrypoint)
+    monkeypatch.setitem(sys.modules, "main_rd_parallel_core", core)
+
+    runpy.run_path(str(script_path), run_name="__main__")
+
+    overrides = dict(captured.get("spec_overrides") or {})
+    spec = core.MainRdRunSpec(
+        frame_rows=int(captured["frame_rows"]),
+        frame_cols=int(captured["frame_cols"]),
+        **overrides,
+    )
+    assert spec.observing_duration_s == pytest.approx(
+        spec.n_frames * spec.exposure_s
+    )
 
 
 def test_path_constants_can_be_overridden_from_environment(tmp_path):
@@ -224,6 +257,84 @@ def test_default_run_spec_uses_sky22_and_single_subpixel():
     assert cfg["Subpixels Per Pixel Dim"] == 1
 
 
+@pytest.mark.parametrize(
+    ("star_source", "source_type"),
+    [
+        ("gaia_main_rd", "et_focalplane_query"),
+        ("synthetic_mag_distribution", "synthetic_mag_distribution"),
+        ("detector_xy_csv", "detector_xy_csv"),
+    ],
+)
+def test_main_rd_run_spec_builds_canonical_simulation_spec(star_source, source_type):
+    run_spec = core.MainRdRunSpec(
+        frame_rows=50,
+        frame_cols=60,
+        star_source=star_source,
+        exposure_s=3.0,
+        n_frames=4,
+        observing_duration_s=12.0,
+        sky_surface_brightness_mag_arcsec2=23.2,
+        readout_noise_e_pix=1.5,
+        n_subpixels=5,
+        scattered_light_e_s_pix=0.75,
+        psf_bundle_name="custom/psf",
+    )
+
+    spec = run_spec.to_simulation_spec(run_seed=42, compute_device="cpu")
+
+    assert spec.detector.shape == (50, 60)
+    assert spec.observation.exposure_duration == 3 * u.s
+    assert spec.observation.observing_duration == 12 * u.s
+    assert spec.observation.resolved_n_frames == 4
+    assert spec.instrument.optical_efficiency.to_value(u.percent) == pytest.approx(58.0)
+    assert spec.instrument.quantum_efficiency.to_value(u.percent) == pytest.approx(80.0)
+    assert spec.instrument.telescope_count == 1
+    assert spec.catalog.source_type == source_type
+    assert spec.catalog.photon_magnitude_system == "ET"
+    assert spec.detector.n_subpixels == 5
+    assert spec.readout.readout_noise == 1.5 * u.electron / u.pix
+    assert spec.sky.scattered_light == 0.75 * u.electron / u.s / u.pix
+    assert spec.psf.bundle_name == "psf/et/custom/psf"
+    assert spec.psf.field_id_policy == "nearest"
+    assert spec.psf.compute_device == "cpu"
+    assert spec.dynamic_effects.thermal_drift.profile == "main_rd_reference"
+    assert spec.dynamic_effects.momentum_dump.profile == (
+        "legacy_random_walk_within_circle"
+    )
+    assert spec.dynamic_effects.psf_breathing.profile == "main_rd_reference"
+    assert spec.rng.run_seed == 42
+
+
+def test_main_rd_run_spec_rejects_legacy_throughput_and_duration_conflicts():
+    with pytest.raises(ValueError, match="optical_efficiency_ratio"):
+        core.MainRdRunSpec(
+            frame_rows=10,
+            frame_cols=10,
+            optical_efficiency_ratio=1.01,
+        )
+
+    with pytest.raises(ValueError, match="observing_duration_s.*n_frames"):
+        core.MainRdRunSpec(
+            frame_rows=10,
+            frame_cols=10,
+            exposure_s=10.0,
+            n_frames=2,
+            observing_duration_s=30.0,
+        )
+
+
+def test_sim_config_dict_is_derived_from_typed_spec_throughput():
+    run_spec = core.MainRdRunSpec(frame_rows=5, frame_cols=7)
+
+    config = core.sim_config_dict(5, 7, spec=run_spec)
+    typed = run_spec.to_simulation_spec()
+
+    assert config["Detector Height"] == typed.to_config_dict()["Detector Height"]
+    assert config["Detector Width"] == typed.to_config_dict()["Detector Width"]
+    assert config["Optical Efficiency Ratio"].to_value(u.percent) == pytest.approx(58.0)
+    assert config["ET Quantum Efficiency"].to_value(u.percent) == pytest.approx(80.0)
+
+
 def test_frame_motion_offsets_uses_exposure_time_as_low_frequency_split(monkeypatch, tmp_path):
     psd_path = tmp_path / "psd.pkl"
     psd_path.write_bytes(b"placeholder")
@@ -357,6 +468,14 @@ def test_parse_common_args_accepts_script_specific_jitter_psf_default():
     assert override_args.jitter_psf_models == 7
 
 
+def test_parse_common_args_uses_data_registry_relative_psd_path():
+    parser = core.parse_common_args("test parser")
+
+    args = parser.parse_args([])
+
+    assert args.psd_motion_path == Path("pds/ET_psd3-2.pkl")
+
+
 def test_sim_config_dict_uses_run_spec_detector_values():
     spec = core.MainRdRunSpec(
         frame_rows=50,
@@ -364,6 +483,7 @@ def test_sim_config_dict_uses_run_spec_detector_values():
         sky_surface_brightness_mag_arcsec2=23.2,
         n_subpixels=5,
         exposure_s=3.0,
+        n_frames=4,
         observing_duration_s=12.0,
         dark_current_e_s_pix=0.25,
         scattered_light_e_s_pix=0.75,
@@ -397,7 +517,7 @@ def test_sim_config_dict_uses_run_spec_detector_values():
     assert cfg["Cosmic Ray Event Library Path"] == "custom_cosmic.npz"
     assert cfg["Cosmic Ray Event Library Pixel Size"].value == pytest.approx(8.0)
     assert cfg["Cosmic Ray Event Rate"].value == pytest.approx(7.0)
-    assert cfg["PSF Bundle Name"] == "custom/psf"
+    assert cfg["PSF Bundle Name"] == "psf/et/custom/psf"
     assert cfg["N Jitter-Integrated PSF Models"] == 2
     assert cfg["N Jitter Frames Per Model"] == 4
 
@@ -461,6 +581,8 @@ def test_apply_detector_chain_uses_run_spec_values(monkeypatch):
         frame_rows=1,
         frame_cols=1,
         exposure_s=3.0,
+        n_frames=1,
+        observing_duration_s=3.0,
         readout_noise_e_pix=0.0,
         full_well_electrons=10.0,
         gain_electrons_per_adu=2.0,
@@ -638,6 +760,383 @@ def test_prepare_star_cache_only_prepares_cache_without_launching(monkeypatch, t
     assert f"[Star cache] ready {cache_path}" in output
 
 
+def test_prepare_star_cache_delegates_to_photsim7_catalog_service(
+    monkeypatch,
+    tmp_path,
+):
+    from photsim7.catalog_sources import PreparedStarCatalog, StarCatalogCache
+    import photsim7.simulation_services as service_module
+
+    catalog = PreparedStarCatalog(
+        star_data={
+            "x0": np.array([0.0]),
+            "y0": np.array([0.0]),
+            "ra": np.array([10.0]),
+            "dec": np.array([20.0]),
+            "source_id": np.array([1]),
+            "gaia_g_mag": np.array([12.0]),
+        },
+        metadata={"source": {"type": "et_focalplane_query"}},
+    )
+    captured = {}
+
+    def fake_build(spec, *, data_registry):
+        captured["spec"] = spec
+        captured["data_registry"] = data_registry
+        return catalog
+
+    def fake_write(path, value):
+        captured["cache_path"] = Path(path)
+        captured["catalog"] = value
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b"cache")
+
+    monkeypatch.setattr(service_module, "build_catalog_from_spec", fake_build)
+    monkeypatch.setattr(StarCatalogCache, "write", staticmethod(fake_write))
+    monkeypatch.setattr(core, "PHOTSIM7_DATA_DIR", tmp_path / "data")
+    spec = core.MainRdRunSpec(frame_rows=5, frame_cols=7, n_frames=1, observing_duration_s=10.0)
+    args = argparse.Namespace(
+        output_root=tmp_path,
+        mag_limit=17.0,
+        force_star_cache=True,
+        catalog_dir=tmp_path / "gaia",
+        crop_margin_pix=2.0,
+        seed=123,
+    )
+
+    cache_path = core.prepare_star_cache(args, spec)
+
+    assert cache_path == captured["cache_path"]
+    assert captured["catalog"].metadata["et_mainsim"]["compatibility_adapter"] == (
+        "MainRdRunSpec"
+    )
+    assert captured["spec"].catalog.source_type == "et_focalplane_query"
+    assert captured["spec"].catalog.source_path == str(args.catalog_dir)
+    assert captured["spec"].catalog.background_stars_max_mag == 17.0
+    assert captured["spec"].rng.run_seed == 123
+
+
+def test_build_main_rd_services_delegates_runtime_overrides(monkeypatch, tmp_path):
+    from photsim7.catalog_sources import PreparedStarCatalog
+    import photsim7.simulation_services as service_module
+
+    catalog = PreparedStarCatalog(
+        star_data={
+            "x0": np.array([0.0]),
+            "y0": np.array([0.0]),
+            "ra": np.array([10.0]),
+            "dec": np.array([20.0]),
+            "source_id": np.array([1]),
+            "gaia_g_mag": np.array([12.0]),
+            "detector_id": "main_rd",
+            "detector_xpix": np.array([100.0]),
+            "detector_ypix": np.array([200.0]),
+        },
+        metadata={"source": {"type": "et_focalplane_query"}},
+    )
+    sentinel = object()
+    captured = {}
+
+    def fake_build(spec, **kwargs):
+        captured["spec"] = spec
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(service_module, "build_full_frame_services", fake_build)
+    monkeypatch.setattr(core, "PHOTSIM7_DATA_DIR", tmp_path / "data")
+    run_spec = core.MainRdRunSpec(frame_rows=5, frame_cols=7)
+    args = argparse.Namespace(
+        frames=2,
+        mag_limit=17.0,
+        seed=456,
+        device="cpu",
+        catalog_dir=tmp_path / "gaia",
+        crop_margin_pix=3.0,
+        jitter_integrated_psf=False,
+        jitter_psf_models=7,
+        jitter_frames_per_model=9,
+        enable_psd_motion=False,
+        psd_motion_path=tmp_path / "psd.pkl",
+        enable_dva_drift=False,
+        enable_thermal_drift=False,
+        enable_momentum_dump=False,
+        enable_psf_breathing=False,
+        no_detector_response=True,
+    )
+
+    services = core.build_main_rd_services(args, run_spec, catalog)
+
+    typed = captured["spec"]
+    assert services is sentinel
+    assert captured["catalog"] is catalog
+    assert captured["frame_exposure"] == 10 * u.s
+    assert typed.observation.resolved_n_frames == 2
+    assert typed.observation.observing_duration == 20 * u.s
+    assert typed.catalog.source_type == "et_focalplane_query"
+    assert typed.catalog.background_stars_max_mag == 17.0
+    assert typed.catalog.query_options["reference_field_angle_deg"] == pytest.approx(
+        run_spec.target_field_angle_deg
+    )
+    assert typed.catalog.query_options[
+        "reference_field_polar_angle_rad"
+    ] == pytest.approx(
+        np.arctan2(run_spec.target_field_y_deg, run_spec.target_field_x_deg)
+    )
+    assert typed.rng.run_seed == 456
+    assert typed.psf.compute_device == "cpu"
+    assert typed.psf.use_jitter_integrated_psf is False
+    assert typed.psf.n_jitter_integrated_psf_models == 7
+    assert typed.psf.n_jitter_frames_per_model == 9
+    assert typed.dynamic_effects.psd_motion.enabled is False
+    assert typed.dynamic_effects.dva.enabled is False
+    assert typed.dynamic_effects.thermal_drift.enabled is False
+    assert typed.dynamic_effects.momentum_dump.enabled is False
+    assert typed.dynamic_effects.psf_breathing.enabled is False
+    assert typed.detector_response.enable_inter_pixel_response is False
+
+
+def test_effect_timeseries_artifacts_encode_disabled_effects():
+    typed_spec = core.MainRdRunSpec(
+        frame_rows=2,
+        frame_cols=3,
+        n_frames=2,
+        observing_duration_s=20.0,
+    ).to_simulation_spec()
+
+    arrays, metadata = core.effect_timeseries_artifacts(None, typed_spec)
+
+    np.testing.assert_allclose(arrays["frame_start_s"], [0.0, 10.0])
+    np.testing.assert_allclose(arrays["frame_mid_s"], [5.0, 15.0])
+    assert metadata["schema_id"] == "photsim7.effect_timeseries.v1"
+    assert metadata["timing"]["n_frames"] == 2
+    assert metadata["components"] == []
+    assert metadata["metadata"]["all_effects_disabled"] is True
+
+
+def test_run_worker_uses_package_pipeline_and_preserves_legacy_outputs(
+    monkeypatch,
+    tmp_path,
+):
+    from photsim7.catalog_sources import PreparedStarCatalog, StarCatalogCache
+    from photsim7.detector_electronics import (
+        BiasColumnNoisePayload,
+        DetectorElectronicsResult,
+    )
+    from photsim7.frame_products import (
+        BiasColumnNoiseProduct,
+        CosmicEventProduct,
+        FrameArrayProduct,
+        SingleCadenceFrameProducts,
+    )
+    import photsim7.full_frame_pipeline as pipeline_module
+
+    spec = core.MainRdRunSpec(
+        frame_rows=2,
+        frame_cols=2,
+        run_label="package-worker-contract",
+        n_frames=1,
+        observing_duration_s=10.0,
+    )
+    cache_path = tmp_path / "stars.npz"
+    catalog = PreparedStarCatalog(
+        star_data={
+            "x0": np.array([0.0]),
+            "y0": np.array([0.0]),
+            "ra": np.array([10.0]),
+            "dec": np.array([20.0]),
+            "source_id": np.array([1]),
+            "gaia_g_mag": np.array([12.0]),
+            "detector_id": "main_rd",
+            "detector_xpix": np.array([4450.0]),
+            "detector_ypix": np.array([4560.0]),
+        },
+        metadata={"source": {"type": "et_focalplane_query"}},
+    )
+    StarCatalogCache.write(cache_path, catalog)
+
+    class FakeEffects:
+        def to_arrays(self):
+            return {
+                "frame_start_s": np.array([0.0]),
+                "frame_mid_s": np.array([5.0]),
+                "psd_drift": np.zeros((1, 3)),
+            }
+
+        def to_metadata(self):
+            return {"schema_id": "photsim7.effect_timeseries.v1"}
+
+    typed_spec = spec.to_simulation_spec(run_seed=321, compute_device="cpu")
+    services = types.SimpleNamespace(
+        spec=typed_spec,
+        catalog=catalog,
+        effect_timeseries=FakeEffects(),
+        psf_result=types.SimpleNamespace(provenance={"factory": "test"}),
+        provenance={"schema_id": "photsim7.full_frame_services.v1"},
+    )
+    calls = {"service_count": 0, "pipeline": []}
+
+    def fake_build_services(args, run_spec, prepared_catalog):
+        calls["service_count"] += 1
+        assert run_spec is spec
+        assert prepared_catalog.metadata["source"]["type"] == "et_focalplane_query"
+        return services
+
+    events = np.array([(0,)], dtype=[("frame_index", "i8")])
+    mask = np.array([[False, True], [False, False]])
+    column_noise = np.array([0.25, -0.5], dtype=np.float32)
+    final_frame = np.array([[11, 12], [13, 14]], dtype=np.uint16)
+    stellar_mean = np.full((2, 2), 3.5, dtype=np.float32)
+
+    def fake_run(typed, **kwargs):
+        calls["pipeline"].append((typed, kwargs))
+        cosmic_payload = types.SimpleNamespace(events=events, mask=mask)
+        bias_payload = BiasColumnNoisePayload(
+            bias_level_adu=3500.0,
+            column_noise_sigma_adu=5.0,
+            column_noise_vector_adu=column_noise,
+        )
+        detector_result = DetectorElectronicsResult(
+            image_dn=final_frame,
+            image_adu_before_adc=final_frame.astype(np.float32),
+            saturation_count=0,
+            bias_metadata=bias_payload,
+            cosmic_metadata=cosmic_payload,
+            domain_transitions=("electrons", "dn"),
+            rng_trace={"schema_id": "photsim7.rng_trace.v1", "entries": []},
+        )
+        products = SingleCadenceFrameProducts(
+            frame_index=0,
+            detector_id="main_rd",
+            final_frame=FrameArrayProduct(
+                name="final_frame",
+                array=final_frame,
+                unit="dn",
+                domain="dn",
+            ),
+            electron_components={
+                "stellar_mean": FrameArrayProduct(
+                    name="stellar_mean",
+                    array=stellar_mean,
+                    unit="electron",
+                    domain="electrons",
+                )
+            },
+            cosmic_events=CosmicEventProduct(events=events, mask=mask),
+            bias_column_noise_adu=BiasColumnNoiseProduct.from_payload(bias_payload),
+            frame_summary={
+                "frame_index": 0,
+                "mean_cosmic_events_per_frame": 0.5,
+                "actual_cosmic_events": 1,
+                "cosmic_mask_pixels": 1,
+            },
+            provenance={"pipeline": {"api": "run_single_cadence_full_frame"}},
+        )
+        writer = kwargs["artifact_writer"]
+        paths = writer.write_frame(
+            0,
+            final_frame,
+            summary=dict(products.frame_summary),
+            cosmic_events=cosmic_payload,
+            column_noise_adu=column_noise,
+        )
+        paths["frame_product_schema"] = writer.write_frame_product_schema(products)
+        return types.SimpleNamespace(
+            frame_products=products,
+            renderer_components={"stellar_mean": stellar_mean},
+            detector_result=detector_result,
+            provenance=products.provenance,
+            artifact_paths=paths,
+        )
+
+    def legacy_builder_called(*_args, **_kwargs):
+        raise AssertionError("legacy main-rd physics builder was called")
+
+    monkeypatch.setattr(core, "build_main_rd_services", fake_build_services)
+    monkeypatch.setattr(pipeline_module, "run_single_cadence_full_frame", fake_run)
+    monkeypatch.setattr(core, "build_full_effect_timeseries", legacy_builder_called)
+    monkeypatch.setattr(core, "jitter_integrated_psf_offsets", legacy_builder_called)
+    monkeypatch.setattr(core, "build_psf_manager", legacy_builder_called)
+    monkeypatch.setattr(core, "build_star_catalog", legacy_builder_called)
+    monkeypatch.setattr(core, "build_detector_response_sampler", legacy_builder_called)
+    monkeypatch.setattr(core, "make_renderer", legacy_builder_called)
+    monkeypatch.setattr(core, "apply_detector_chain", legacy_builder_called)
+    monkeypatch.setattr(core, "gpu_memory_snapshot", lambda: "test")
+    args = argparse.Namespace(
+        frame_indices=None,
+        frames=1,
+        device="cpu",
+        jitter_psf_models=1,
+        jitter_frames_per_model=1,
+        output_root=tmp_path,
+        mag_limit=17.0,
+        star_cache=cache_path,
+        max_stars=None,
+        worker_rank=0,
+        worker_world_size=1,
+        seed=321,
+        overwrite=True,
+        preview_count=0,
+        save_column_noise=True,
+        save_cosmic_mask=True,
+        save_stellar_mean=True,
+        progress=False,
+        catalog_dir=tmp_path,
+        crop_margin_pix=2.0,
+        jitter_integrated_psf=False,
+        enable_psd_motion=False,
+        psd_motion_path=tmp_path / "psd.pkl",
+        enable_dva_drift=False,
+        enable_thermal_drift=False,
+        enable_momentum_dump=False,
+        enable_psf_breathing=False,
+        no_detector_response=True,
+    )
+
+    core.run_worker(args, spec)
+
+    run_dir = tmp_path / spec.run_label
+    assert calls["service_count"] == 1
+    assert len(calls["pipeline"]) == 1
+    assert calls["pipeline"][0][0] is typed_spec
+    assert calls["pipeline"][0][1]["services"] is services
+    assert calls["pipeline"][0][1]["frame_index"] == 0
+    assert calls["pipeline"][0][1]["worker_rank"] == 0
+    np.testing.assert_array_equal(
+        np.load(run_dir / "frames/frame_000000.npy"),
+        final_frame,
+    )
+    np.testing.assert_array_equal(
+        np.load(run_dir / "cosmic_events/frame_000000_events.npy"),
+        events,
+    )
+    np.testing.assert_array_equal(
+        np.load(run_dir / "cosmic_events/frame_000000_mask.npy"),
+        mask,
+    )
+    np.testing.assert_allclose(
+        np.load(run_dir / "bias/frame_000000_column_noise_adu.npy"),
+        column_noise,
+    )
+    np.testing.assert_allclose(
+        np.load(run_dir / "frames/frame_000000_stellar_mean_e.npy"),
+        stellar_mean,
+    )
+    with (run_dir / "frame_summaries/frame_000000_schema.json").open(
+        encoding="utf-8"
+    ) as handle:
+        schema = json.load(handle)
+    assert schema["schema_id"] == "photsim7.single_cadence_frame_products.v1"
+    assert schema["arrays"]["final_frame"]["unit"] == "dn"
+    with (run_dir / "frame_summaries/frame_000000.json").open(
+        encoding="utf-8"
+    ) as handle:
+        summary = json.load(handle)
+    assert summary["package_frame_summary"]["actual_cosmic_events"] == 1
+    assert summary["package_schema_path"].endswith("frame_000000_schema.json")
+    with np.load(run_dir / "effects_timeseries.npz") as payload:
+        assert set(payload.files) == {"frame_start_s", "frame_mid_s", "psd_drift"}
+
+
 def test_launch_reuses_existing_star_cache_without_querying_catalog(
     monkeypatch,
     tmp_path,
@@ -696,9 +1195,34 @@ def test_launch_reuses_existing_star_cache_without_querying_catalog(
         ),
     )
     monkeypatch.setattr(core.subprocess, "Popen", fake_popen)
+    expected_git = {
+        "et_mainsim": {"commit": "e" * 40, "dirty": False},
+        "photsim7": {"commit": "p" * 40, "dirty": False},
+    }
+    monkeypatch.setattr(
+        core,
+        "source_git_provenance",
+        lambda: expected_git,
+        raising=False,
+    )
 
     core.launch_or_run(args, spec, Path("simulate.py"))
 
     assert len(popen_calls) == 1
     assert "--star-cache" in popen_calls[0][0]
     assert str(cache_path) in popen_calls[0][0]
+    with (tmp_path / "run" / "run_config.json").open(encoding="utf-8") as handle:
+        run_config = json.load(handle)
+    assert run_config["compatibility_adapter"] == "MainRdRunSpec"
+    assert run_config["git_provenance"] == expected_git
+    assert run_config["simulation_spec"]["schema_id"] == "photsim7.simulation_spec"
+    assert run_config["simulation_spec"]["schema_version"] == 1
+    assert run_config["simulation_spec"]["observation"]["n_frames"] == 1
+    assert run_config["simulation_spec"]["instrument"]["optical_efficiency"] == {
+        "value": pytest.approx(58.0),
+        "unit": "%",
+    }
+    assert run_config["simulation_spec"]["instrument"]["quantum_efficiency"] == {
+        "value": pytest.approx(80.0),
+        "unit": "%",
+    }

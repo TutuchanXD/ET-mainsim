@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
+from astropy import units as u
 
 
 RESULTS_ROOT = Path("/home/cxgao/Results/ET-mainsim/main_rd_g18_parallel")
@@ -68,6 +69,8 @@ class RunContext:
     effects: dict[str, np.ndarray]
     photon_rate_e_s: np.ndarray
     photon_count_e_frame: np.ndarray
+    effect_schema_id: str | None = None
+    effect_timeseries: Any = None
 
 
 def et_mag_to_photon_rate_e_s(et_mag: np.ndarray | float) -> np.ndarray:
@@ -132,12 +135,126 @@ def _optional_array(
     return np.full(length, default, dtype=float)
 
 
+def _effect_time_array(effects: dict[str, np.ndarray]) -> np.ndarray:
+    if "time_s" in effects:
+        return np.asarray(effects["time_s"], dtype=float)
+    if "frame_start_s" in effects:
+        return np.asarray(effects["frame_start_s"], dtype=float)
+    raise KeyError("effects_timeseries is missing time_s or frame_start_s")
+
+
 def _selected_frame_indices(run_config: dict[str, Any], effects: dict[str, np.ndarray]) -> list[int]:
     selected = run_config.get("selected_frame_indices")
     if selected:
         return [int(frame_index) for frame_index in selected]
-    frames = int((run_config.get("args") or {}).get("frames", len(effects["time_s"])))
+    frames = int(
+        (run_config.get("args") or {}).get("frames", len(_effect_time_array(effects)))
+    )
     return list(range(frames))
+
+
+def _package_effect_timeseries(
+    *,
+    run_dir: Path,
+    effects: dict[str, np.ndarray],
+    spec,
+    catalog,
+):
+    from photsim7.dynamic_effect_models import build_frame_timing
+    from photsim7.dynamic_effects import (
+        EffectComponent,
+        EffectSourceGeometry,
+        EffectTimeseries,
+    )
+    from photsim7.simulation_services import build_projector_from_spec
+
+    metadata_path = run_dir / "effects_timeseries.metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            "Package effects_timeseries requires its metadata sidecar: "
+            f"{metadata_path}"
+        )
+    metadata = _load_json(metadata_path)
+    timing_metadata = dict(metadata["timing"])
+    timing = build_frame_timing(
+        frame_start_s=_effect_time_array(effects),
+        integration_s=float(timing_metadata["integration_s"]),
+        sampling_interval_s=timing_metadata.get("sampling_interval_s"),
+        split_hz=float(timing_metadata["split_hz"]),
+    )
+    components = []
+    for component_metadata in metadata.get("components", []):
+        name = str(component_metadata["name"])
+        if name not in effects:
+            raise KeyError(
+                f"effects_timeseries is missing package component {name!r}"
+            )
+        components.append(
+            EffectComponent(
+                name=name,
+                values=effects[name],
+                unit=component_metadata["unit"],
+                coordinate_frame=component_metadata["coordinate_frame"],
+                scope=component_metadata["scope"],
+                axes=tuple(component_metadata["axes"]),
+                model_id=component_metadata["model_id"],
+                enabled=bool(component_metadata["enabled"]),
+                metadata=component_metadata.get("metadata", {}),
+            )
+        )
+    projector = build_projector_from_spec(spec, catalog)
+    source_geometry = getattr(projector, "source_geometry", None)
+    if source_geometry is None:
+        source_values = dict(catalog.star_data)
+        source_values.setdefault(
+            "source_id",
+            np.arange(catalog.n_sources, dtype=np.int64),
+        )
+        detector_id = source_values.get("detector_id")
+        if detector_id is not None and np.asarray(detector_id).ndim == 0:
+            source_values["detector_id"] = np.full(
+                catalog.n_sources,
+                str(detector_id),
+                dtype=object,
+            )
+        source_geometry = EffectSourceGeometry.from_mapping(source_values)
+    return EffectTimeseries(
+        timing=timing,
+        components=tuple(components),
+        source_geometry=source_geometry,
+        projector=projector,
+        jitter_integrated_psf_offsets=effects.get("xy_jitter_pix"),
+        metadata=metadata.get("metadata", {}),
+        rng_trace=metadata.get("rng_trace"),
+    ), metadata
+
+
+def _select_package_catalog(catalog, max_stars: int | None):
+    if max_stars is None:
+        return catalog
+    from photsim7.catalog_sources import PreparedStarCatalog
+    from photsim7.photometry import normalize_magnitude_input
+
+    max_stars = int(max_stars)
+    if max_stars <= 0:
+        raise ValueError("max_stars must be positive when provided")
+    if catalog.n_sources <= max_stars:
+        return catalog
+    magnitude = normalize_magnitude_input(catalog.star_data, mag_type="ET").magnitude
+    selected_indices = np.argsort(magnitude)[:max_stars]
+    selected_data: dict[str, Any] = {}
+    for key, value in catalog.star_data.items():
+        array = np.asarray(value)
+        if array.ndim == 1 and len(array) == catalog.n_sources:
+            selected_data[key] = array[selected_indices]
+        else:
+            selected_data[key] = value
+    return PreparedStarCatalog(
+        star_data=selected_data,
+        metadata=dict(catalog.metadata),
+        schema_id=catalog.schema_id,
+        schema_version=catalog.schema_version,
+    )
 
 
 def load_run_context(run_dir: Path | str) -> RunContext:
@@ -146,11 +263,39 @@ def load_run_context(run_dir: Path | str) -> RunContext:
     spec = dict(run_config["spec"])
     effects = _load_npz_arrays(run_dir / "effects_timeseries.npz")
     star_cache = _find_star_cache(run_dir, run_config)
-    star_data = _load_npz_arrays(star_cache)
+    effect_timeseries = None
+    effect_schema_id = None
+    if "simulation_spec" in run_config:
+        from photsim7.catalog_sources import StarCatalogCache
+        from photsim7.simulation_services import build_star_table_from_catalog
+        from photsim7.specs import SimulationSpec
 
-    et_mag = _required_array(star_data, "et_mag", "gmag", "kp_mag").astype(float)
-    photon_rate = et_mag_to_photon_rate_e_s(et_mag)
-    exposure_s = float(spec.get("exposure_s", 10.0))
+        typed_spec = SimulationSpec.from_json_dict(run_config["simulation_spec"])
+        catalog = _select_package_catalog(
+            StarCatalogCache.read(star_cache),
+            (run_config.get("args") or {}).get("max_stars"),
+        )
+        star_data = dict(catalog.star_data)
+        stars = build_star_table_from_catalog(typed_spec, catalog)
+        photon_rate = np.asarray(
+            stars["Detected Electron Rate"].to_value(u.electron / u.s),
+            dtype=float,
+        )
+        exposure_s = typed_spec.observation.integration_for(
+            typed_spec.detector.detector_type
+        ).to_value(u.s)
+        effect_timeseries, effect_metadata = _package_effect_timeseries(
+            run_dir=run_dir,
+            effects=effects,
+            spec=typed_spec,
+            catalog=catalog,
+        )
+        effect_schema_id = str(effect_metadata["schema_id"])
+    else:
+        star_data = _load_npz_arrays(star_cache)
+        et_mag = _required_array(star_data, "et_mag", "gmag", "kp_mag").astype(float)
+        photon_rate = et_mag_to_photon_rate_e_s(et_mag)
+        exposure_s = float(spec.get("exposure_s", 10.0))
     photon_count = photon_rate * exposure_s
 
     return RunContext(
@@ -165,6 +310,8 @@ def load_run_context(run_dir: Path | str) -> RunContext:
         effects=effects,
         photon_rate_e_s=photon_rate,
         photon_count_e_frame=photon_count,
+        effect_schema_id=effect_schema_id,
+        effect_timeseries=effect_timeseries,
     )
 
 
@@ -186,10 +333,11 @@ def _scattered_light_for_frame(context: RunContext, frame_index: int) -> tuple[f
 
 def build_frame_truth_dataframe(context: RunContext, frame_index: int) -> pd.DataFrame:
     frame_index = int(frame_index)
-    if frame_index < 0 or frame_index >= len(context.effects["time_s"]):
+    time_s = _effect_time_array(context.effects)
+    if frame_index < 0 or frame_index >= len(time_s):
         raise IndexError(
             f"Frame {frame_index} is outside effects_timeseries range 0.."
-            f"{len(context.effects['time_s']) - 1}"
+            f"{len(time_s) - 1}"
         )
 
     star_data = context.star_data
@@ -197,10 +345,77 @@ def build_frame_truth_dataframe(context: RunContext, frame_index: int) -> pd.Dat
     n_stars = len(source_id)
     x0 = _required_array(star_data, "x0").astype(float)
     y0 = _required_array(star_data, "y0").astype(float)
-    x_static = _required_array(star_data, "detector_xpix", "detector_xpix_shifted").astype(float)
-    y_static = _required_array(star_data, "detector_ypix", "detector_ypix_shifted").astype(float)
-    et_mag = _required_array(star_data, "et_mag", "gmag", "kp_mag").astype(float)
-    gmag = _optional_array(star_data, "gmag", length=n_stars, default=np.nan).astype(float)
+    if context.effect_timeseries is None:
+        x_static = _required_array(
+            star_data,
+            "detector_xpix",
+            "detector_xpix_shifted",
+        ).astype(float)
+        y_static = _required_array(
+            star_data,
+            "detector_ypix",
+            "detector_ypix_shifted",
+        ).astype(float)
+        dx, dy = _effect_xy(context.effects, "total_motion_pix", frame_index)
+        total_offsets = np.broadcast_to([dx, dy], (n_stars, 2)).copy()
+        psd_offsets = np.broadcast_to(
+            _effect_xy(context.effects, "psd_drift_pix", frame_index),
+            (n_stars, 2),
+        ).copy()
+        dva_offsets = np.broadcast_to(
+            _effect_xy(context.effects, "dva_drift_pix", frame_index),
+            (n_stars, 2),
+        ).copy()
+        thermal_offsets = np.broadcast_to(
+            _effect_xy(context.effects, "thermal_drift_pix", frame_index),
+            (n_stars, 2),
+        ).copy()
+        momentum_offsets = np.broadcast_to(
+            _effect_xy(context.effects, "momentum_dump_pix", frame_index),
+            (n_stars, 2),
+        ).copy()
+        psf_scale = np.full(
+            n_stars,
+            float(context.effects["psf_scale"][frame_index]),
+        )
+    else:
+        x_static = x0 + (float(context.frame_cols) - 1.0) / 2.0
+        y_static = y0 + (float(context.frame_rows) - 1.0) / 2.0
+        cadence = context.effect_timeseries.for_cadence(
+            frame_index,
+            base_x_pix=x_static,
+            base_y_pix=y_static,
+        )
+        total_offsets = np.asarray(cadence.source_offsets_pix, dtype=float)
+        zeros = np.zeros_like(total_offsets)
+        psd_offsets = np.asarray(
+            cadence.component_offsets_pix.get("psd_drift", zeros),
+            dtype=float,
+        )
+        dva_offsets = np.asarray(
+            cadence.component_offsets_pix.get("dva", zeros),
+            dtype=float,
+        )
+        thermal_offsets = np.asarray(
+            cadence.component_offsets_pix.get("thermal", zeros),
+            dtype=float,
+        )
+        momentum_offsets = np.asarray(
+            cadence.component_offsets_pix.get("momentum_dump", zeros),
+            dtype=float,
+        )
+        psf_scale = np.asarray(cadence.star_psf_scales, dtype=float)
+    et_mag = _required_array(
+        star_data,
+        "et_mag",
+        "gaia_g_mag",
+        "gmag",
+        "kp_mag",
+    ).astype(float)
+    gmag = np.asarray(
+        star_data.get("gmag", star_data.get("gaia_g_mag", np.full(n_stars, np.nan))),
+        dtype=float,
+    )
     ra = _optional_array(star_data, "ra", length=n_stars, default=np.nan).astype(float)
     dec = _optional_array(star_data, "dec", length=n_stars, default=np.nan).astype(float)
     field_angle = _optional_array(
@@ -210,15 +425,10 @@ def build_frame_truth_dataframe(context: RunContext, frame_index: int) -> pd.Dat
         default=np.nan,
     ).astype(float)
 
-    dx, dy = _effect_xy(context.effects, "total_motion_pix", frame_index)
-    psd_dx, psd_dy = _effect_xy(context.effects, "psd_drift_pix", frame_index)
-    dva_dx, dva_dy = _effect_xy(context.effects, "dva_drift_pix", frame_index)
-    thermal_dx, thermal_dy = _effect_xy(context.effects, "thermal_drift_pix", frame_index)
-    momentum_dx, momentum_dy = _effect_xy(context.effects, "momentum_dump_pix", frame_index)
     scattered_rate, scattered_count = _scattered_light_for_frame(context, frame_index)
 
-    x_truth = x_static + dx
-    y_truth = y_static + dy
+    x_truth = x_static + total_offsets[:, 0]
+    y_truth = y_static + total_offsets[:, 1]
     valid = (
         (x_truth >= 0.0)
         & (x_truth < float(context.frame_cols))
@@ -230,15 +440,15 @@ def build_frame_truth_dataframe(context: RunContext, frame_index: int) -> pd.Dat
         {
             "run_name": context.run_name,
             "frame_index": frame_index,
-            "time_s": float(context.effects["time_s"][frame_index]),
+            "time_s": float(time_s[frame_index]),
             "star_index": np.arange(n_stars, dtype=np.int64),
             "source_id": source_id,
             "ra_deg": ra,
             "dec_deg": dec,
             "x0_centered_pix": x0,
             "y0_centered_pix": y0,
-            "x0_truth_centered_pix": x0 + dx,
-            "y0_truth_centered_pix": y0 + dy,
+            "x0_truth_centered_pix": x0 + total_offsets[:, 0],
+            "y0_truth_centered_pix": y0 + total_offsets[:, 1],
             "x_detector_static_pix": x_static,
             "y_detector_static_pix": y_static,
             "x_detector_truth_pix": x_truth,
@@ -250,17 +460,17 @@ def build_frame_truth_dataframe(context: RunContext, frame_index: int) -> pd.Dat
             "photon_rate_e_s": context.photon_rate_e_s,
             "photon_count_e_frame": context.photon_count_e_frame,
             "ideal_photon_snr": np.sqrt(np.clip(context.photon_count_e_frame, 0.0, None)),
-            "psf_scale": float(context.effects["psf_scale"][frame_index]),
-            "motion_offset_x_pix": dx,
-            "motion_offset_y_pix": dy,
-            "psd_dx_pix": psd_dx,
-            "psd_dy_pix": psd_dy,
-            "dva_dx_pix": dva_dx,
-            "dva_dy_pix": dva_dy,
-            "thermal_dx_pix": thermal_dx,
-            "thermal_dy_pix": thermal_dy,
-            "momentum_dump_dx_pix": momentum_dx,
-            "momentum_dump_dy_pix": momentum_dy,
+            "psf_scale": psf_scale,
+            "motion_offset_x_pix": total_offsets[:, 0],
+            "motion_offset_y_pix": total_offsets[:, 1],
+            "psd_dx_pix": psd_offsets[:, 0],
+            "psd_dy_pix": psd_offsets[:, 1],
+            "dva_dx_pix": dva_offsets[:, 0],
+            "dva_dy_pix": dva_offsets[:, 1],
+            "thermal_dx_pix": thermal_offsets[:, 0],
+            "thermal_dy_pix": thermal_offsets[:, 1],
+            "momentum_dump_dx_pix": momentum_offsets[:, 0],
+            "momentum_dump_dy_pix": momentum_offsets[:, 1],
             "scattered_light_e_s_pix": scattered_rate,
             "scattered_light_e_pix_frame": scattered_count,
         }

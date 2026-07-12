@@ -23,8 +23,8 @@ if __name__ == "__main__":
         frame_rows=9120,
         frame_cols=8900,
         description=(
-            "Single-cadence 10 s full main_rd smoke render with "
-            "SingleCadenceFullFrameRenderer."
+            "Single-cadence 10 s full main_rd smoke render through Photsim7 "
+            "run_single_cadence_full_frame."
         ),
         script_path=Path(__file__).resolve(),
         spec_overrides={
@@ -36,6 +36,8 @@ if __name__ == "__main__":
             "n_subpixels": 1,
             "exposure_s": 10.0,
             "observing_duration_s": 10.0,
+            "optical_efficiency_ratio": 0.58,
+            "quantum_efficiency_ratio": 0.80,
             "scattered_light_e_s_pix": 0.0,
             "scattered_light_step_start_frame": None,
             "scattered_light_step_e_pix_frame": 0.0,
@@ -43,7 +45,8 @@ if __name__ == "__main__":
                 "Full main_rd one-frame smoke render. Background uses the "
                 "surface-brightness magnitude path at 22 mag/arcsec^2; subpixel "
                 "grid is 1x1; per-star PSF field IDs are selected from each "
-                "star's main_rd field angle."
+                "star's main_rd field angle. The active cadence path uses the "
+                "Photsim7 package pipeline and typed simulation spec."
             ),
         },
     )

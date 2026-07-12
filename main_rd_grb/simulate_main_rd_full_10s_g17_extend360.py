@@ -28,7 +28,8 @@ if __name__ == "__main__":
         frame_rows=9120,
         frame_cols=8900,
         description=(
-            "Continuation render for the existing full main_rd G<17 10 s run. "
+            "Continuation through Photsim7 run_single_cadence_full_frame for the "
+            "existing full main_rd G<17 10 s run. "
             "Use --frames 360 with --frame-indices 120..359 to extend the "
             "existing directory without overwriting frames 0..119."
         ),
@@ -42,6 +43,8 @@ if __name__ == "__main__":
             "n_subpixels": 1,
             "exposure_s": EXPOSURE_S,
             "observing_duration_s": TOTAL_FRAMES * EXPOSURE_S,
+            "optical_efficiency_ratio": 0.58,
+            "quantum_efficiency_ratio": 0.80,
             "scattered_light_e_s_pix": 0.0,
             "scattered_light_step_start_frame": None,
             "scattered_light_step_e_pix_frame": 0.0,
@@ -51,7 +54,8 @@ if __name__ == "__main__":
                 "The physical configuration matches the original G<17, sky 22 "
                 "mag/arcsec^2, subpixel 1x1, 100 JI-PSF, ET_psd3-2 setup. "
                 "The intended run renders only frames 120..359 while the full "
-                "dynamic-effect timeline is evaluated for 360 frames."
+                "dynamic-effect timeline is evaluated for 360 frames through "
+                "the typed Photsim7 package services."
             ),
         },
     )

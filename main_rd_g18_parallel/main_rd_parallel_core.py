@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 import types
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -138,6 +138,8 @@ class MainRdRunSpec:
     scattered_light_step_start_frame: int | None = None
     scattered_light_step_e_pix_frame: float = 0.0
     readout_noise_e_pix: float = 6.0
+    optical_efficiency_ratio: float = 0.58
+    quantum_efficiency_ratio: float = 0.80
     full_well_electrons: float = FULL_WELL_ELECTRONS
     gain_electrons_per_adu: float = GAIN_ELECTRONS_PER_ADU
     adc_bit_depth: int = ADC_BIT_DEPTH
@@ -152,6 +154,8 @@ class MainRdRunSpec:
     n_jitter_integrated_psf_models: int = JITTER_INTEGRATED_PSF_MODELS
     n_jitter_frames_per_model: int = JITTER_FRAMES_PER_MODEL
     motion_split_hz: float = MOTION_SPLIT_HZ
+    enable_psd_motion: bool = True
+    psd_motion_path: str = "pds/ET_psd3-2.pkl"
     enable_dva_drift: bool = True
     dva_field_angle_deg: float = DVA_FIELD_ANGLE_DEG
     dva_theta_deg: float = DVA_THETA_DEG
@@ -173,6 +177,297 @@ class MainRdRunSpec:
         "centroid, faster terms are integrated into the PSF. DVA drift, thermal "
         "drift, momentum dumps, and WEED PSF breathing follow et_sim_10_etpsd3-2.py."
     )
+
+    def __post_init__(self) -> None:
+        if int(self.frame_rows) <= 0 or int(self.frame_cols) <= 0:
+            raise ValueError("frame_rows and frame_cols must be positive")
+        if float(self.exposure_s) <= 0.0:
+            raise ValueError("exposure_s must be positive")
+        if int(self.n_frames) <= 0:
+            raise ValueError("n_frames must be positive")
+        derived_duration = int(self.n_frames) * float(self.exposure_s)
+        if not np.isclose(float(self.observing_duration_s), derived_duration):
+            raise ValueError(
+                "observing_duration_s conflicts with n_frames * exposure_s: "
+                f"{self.observing_duration_s} vs {derived_duration}"
+            )
+        for name in ("optical_efficiency_ratio", "quantum_efficiency_ratio"):
+            value = float(getattr(self, name))
+            if value < 0.0 or value > 1.0:
+                raise ValueError(f"{name} must be in the inclusive range [0, 1]")
+        if self.star_source not in {
+            "gaia_main_rd",
+            "synthetic_mag_distribution",
+            "detector_xy_csv",
+        }:
+            raise ValueError(
+                "star_source must be 'gaia_main_rd', "
+                "'synthetic_mag_distribution', or 'detector_xy_csv'"
+            )
+
+    def to_simulation_spec(
+        self,
+        *,
+        run_seed: int = 0,
+        compute_device: str = "cpu",
+        source_path: str | Path | None = None,
+        registry_data_dir: str | Path | None = None,
+        cache_path: str | Path | None = None,
+        crop_margin_pix: float = 2.0,
+    ):
+        """Return the canonical Photsim7 contract for this run adapter."""
+
+        ensure_local_imports()
+        from photsim7.background import sky_surface_brightness_to_background_flux
+        from photsim7.spec_factories import make_et_main_detector_spec
+        from photsim7.specs import (
+            CatalogSpec,
+            CosmicRaySpec,
+            DetectorResponseSpec,
+            DvaSpec,
+            DynamicEffectsSpec,
+            MomentumDumpSpec,
+            PsdMotionSpec,
+            PsfBreathingSpec,
+            ThermalDriftSpec,
+        )
+
+        base = make_et_main_detector_spec(
+            shape=(int(self.frame_rows), int(self.frame_cols)),
+            detector_id=self.detector_id,
+            run_seed=int(run_seed),
+        )
+        exposure = float(self.exposure_s) * u.s
+        duration = int(self.n_frames) * exposure
+        pixel_scale = float(self.pixel_scale_arcsec_per_pix) * u.arcsec / u.pix
+        background_flux = sky_surface_brightness_to_background_flux(
+            float(self.sky_surface_brightness_mag_arcsec2),
+            pixel_scale,
+            magnitude_system="ET",
+            aperture_diameter=base.instrument.aperture_diameter,
+            optical_efficiency=float(self.optical_efficiency_ratio),
+            quantum_efficiency=float(self.quantum_efficiency_ratio),
+        )
+
+        reference_options = {
+            "reference_field_angle_deg": float(self.synthetic_psf_field_angle_deg),
+            "reference_field_polar_angle_rad": float(
+                np.arctan2(self.target_field_y_deg, self.target_field_x_deg)
+            ),
+            "metadata": {
+                "default_field_angle_deg": float(self.synthetic_psf_field_angle_deg)
+            },
+        }
+        if self.star_source == "gaia_main_rd":
+            source_type = "et_focalplane_query"
+            resolved_source_path = GAIA_CATALOG_DIR if source_path is None else source_path
+            resolved_registry = (
+                ET_FOCALPLANE_ROOT / "data"
+                if registry_data_dir is None
+                else registry_data_dir
+            )
+            query_options = {
+                "apply_offset": False,
+                "mag_lim": float(self.mag_limit),
+                "detector_id": self.detector_id,
+                "crop_to_simulation_frame": True,
+                "crop_margin_pix": float(crop_margin_pix),
+                "et_focalplane_src": str(ET_FOCALPLANE_ROOT / "src"),
+                "reference_field_angle_deg": float(
+                    self.target_field_angle_deg
+                ),
+                "reference_field_polar_angle_rad": float(
+                    np.arctan2(self.target_field_y_deg, self.target_field_x_deg)
+                ),
+            }
+            source_id_column = "source_id"
+            magnitude_column = "g_mean_mag"
+            x_column = "x0"
+            y_column = "y0"
+        elif self.star_source == "synthetic_mag_distribution":
+            source_type = "synthetic_mag_distribution"
+            resolved_source_path = (
+                self.mag_distribution_csv if source_path is None else source_path
+            )
+            resolved_registry = ""
+            query_options = dict(reference_options)
+            query_options["mag_limit"] = float(self.mag_limit)
+            source_id_column = None
+            magnitude_column = self.mag_distribution_column
+            x_column = "x0"
+            y_column = "y0"
+        else:
+            source_type = "detector_xy_csv"
+            resolved_source_path = (
+                self.detector_xy_csv if source_path is None else source_path
+            )
+            resolved_registry = ""
+            query_options = dict(reference_options)
+            source_id_column = self.detector_xy_source_id_column
+            magnitude_column = self.detector_xy_mag_column
+            x_column = self.detector_xy_x_column
+            y_column = self.detector_xy_y_column
+
+        bundle_name = str(self.psf_bundle_name).strip()
+        if not bundle_name.lower().startswith("kp_") and not bundle_name.startswith(
+            "psf/"
+        ):
+            bundle_name = f"psf/et/{bundle_name}"
+
+        return replace(
+            base,
+            observation=replace(
+                base.observation,
+                exposure_duration=exposure,
+                readout_duration=0 * u.s,
+                observing_duration=duration,
+                n_frames=int(self.n_frames),
+                simulation_cadence_mult=1,
+            ),
+            instrument=replace(
+                base.instrument,
+                telescope_count=1,
+                optical_efficiency=float(self.optical_efficiency_ratio) * 100 * u.percent,
+                quantum_efficiency=float(self.quantum_efficiency_ratio) * 100 * u.percent,
+            ),
+            detector=replace(
+                base.detector,
+                shape=(int(self.frame_rows), int(self.frame_cols)),
+                pixel_width=float(self.pixel_width_um) * u.um,
+                pixel_scale=pixel_scale,
+                n_subpixels=int(self.n_subpixels),
+            ),
+            readout=replace(
+                base.readout,
+                enable_adc_digitization=True,
+                full_well_electrons=float(self.full_well_electrons) * u.electron,
+                readout_noise=float(self.readout_noise_e_pix) * u.electron / u.pix,
+                gain_electrons_per_adu=(
+                    float(self.gain_electrons_per_adu) * u.electron / u.adu
+                ),
+                adc_bit_depth=int(self.adc_bit_depth),
+                adc_min_value=0.0,
+                adc_round_values=True,
+                bias_level_adu=float(self.bias_level_adu) * u.adu,
+                column_noise_sigma_adu=float(self.column_noise_sigma_adu) * u.adu,
+                save_bias_metadata=True,
+            ),
+            sky=replace(
+                base.sky,
+                background_flux=background_flux,
+                sky_background_mode="surface_brightness",
+                sky_background_surface_brightness=(
+                    float(self.sky_surface_brightness_mag_arcsec2)
+                ),
+                sky_background_magnitude_system="ET",
+                dark_current=(
+                    float(self.dark_current_e_s_pix) * u.electron / u.s / u.pix
+                ),
+                scattered_light=(
+                    float(self.scattered_light_e_s_pix)
+                    * u.electron
+                    / u.s
+                    / u.pix
+                ),
+                subtract_nonstellar_mean=False,
+            ),
+            catalog=CatalogSpec(
+                source_type=source_type,
+                source_path=str(resolved_source_path),
+                source_id_column=source_id_column,
+                magnitude_column=magnitude_column,
+                x_column=x_column,
+                y_column=y_column,
+                input_magnitude_system="Gaia_G",
+                photon_magnitude_system="ET",
+                magnitude_conversion="gaia_g_vega_equals_et_ab_g2v_approx",
+                background_stars_max_mag=float(self.mag_limit),
+                target_max_offset=0 * u.pix,
+                telescope_fov_max_offset=0 * u.pix,
+                target_ra_deg=float(self.target_ra_deg),
+                target_dec_deg=float(self.target_dec_deg),
+                target_detector_xpix=float(self.target_detector_xpix),
+                target_detector_ypix=float(self.target_detector_ypix),
+                registry_data_dir=str(resolved_registry),
+                cache_path="" if cache_path is None else str(cache_path),
+                query_options=query_options,
+                inject_transits=False,
+                optimal_aperture_algorithm="Kepler",
+            ),
+            detector_response=DetectorResponseSpec(
+                enable_inter_pixel_response=True,
+                inter_prv_rms=float(self.inter_pixel_response_sigma) * 100 * u.percent,
+                inter_prv_nominal=100 * u.percent,
+                enable_intra_pixel_response=True,
+                intra_prv_rms=float(self.intra_pixel_response_sigma) * 100 * u.percent,
+                enable_pixel_phase_response=True,
+                pixel_response_profile_mod="flux conserved",
+                pixel_phase_profile_path=(
+                    "detector/pixel_response_profile_teff5500_feh-0.1_"
+                    "logg4.4_pfc_v240423.npy"
+                ),
+                scripted_sensitivity_enabled=False,
+                whole_pixel_gain_normal_enabled=False,
+                whole_pixel_gain_sinusoidal_enabled=False,
+                enable_flat_field_correction=False,
+                flat_field_uncertainty=0 * u.percent,
+            ),
+            cosmic_rays=CosmicRaySpec(
+                enabled=True,
+                event_library_path=self.cosmic_ray_library_path,
+                event_library_pixel_size=float(self.cosmic_ray_pixel_size_um) * u.um,
+                event_rate=(
+                    float(self.cosmic_ray_event_rate_cm2_s) / (u.cm**2 * u.s)
+                ),
+                seed=0,
+            ),
+            psf=replace(
+                base.psf,
+                bundle_name=bundle_name,
+                field_id="nearest",
+                field_id_policy=None,
+                use_jitter_integrated_psf=bool(self.use_jitter_integrated_psf),
+                n_jitter_integrated_psf_models=(
+                    int(self.n_jitter_integrated_psf_models)
+                ),
+                n_jitter_frames_per_model=int(self.n_jitter_frames_per_model),
+                compute_device=str(compute_device),
+                float_precision=32,
+                warp_frame_batch_size=10,
+                pad_to_detector_shape=False,
+            ),
+            dynamic_effects=DynamicEffectsSpec(
+                psd_motion=PsdMotionSpec(
+                    enabled=bool(self.enable_psd_motion),
+                    profile="et_attitude_xyz",
+                    et_psd_path=str(self.psd_motion_path),
+                    split_hz=float(self.motion_split_hz),
+                ),
+                dva=DvaSpec(enabled=bool(self.enable_dva_drift)),
+                thermal_drift=ThermalDriftSpec(
+                    enabled=bool(self.enable_thermal_drift),
+                    profile=(
+                        "main_rd_reference" if self.enable_thermal_drift else None
+                    ),
+                    time_policy="normalized_observation_phase",
+                ),
+                momentum_dump=MomentumDumpSpec(
+                    enabled=bool(self.enable_momentum_dump),
+                    profile=self.momentum_dump_model,
+                    cycle=float(self.momentum_dump_cycle_day) * u.day,
+                    legacy_radius_arcsec=(
+                        float(self.momentum_dump_r68_arcsec) * u.arcsec
+                    ),
+                ),
+                psf_breathing=PsfBreathingSpec(
+                    enabled=bool(self.enable_psf_breathing),
+                    profile=(
+                        "main_rd_reference" if self.enable_psf_breathing else None
+                    ),
+                    time_policy="normalized_observation_phase",
+                ),
+            ),
+        )
 
 
 def ensure_local_imports() -> None:
@@ -242,122 +537,25 @@ def sim_config_dict(
     n_subpixels: int | None = None,
     scattered_light_e_s_pix: float | None = None,
 ) -> dict[str, Any]:
-    ensure_local_imports()
-    from photsim7.background import sky_surface_brightness_to_background_flux
-
     if spec is None:
-        pixel_scale = PIXEL_SCALE
-        pixel_width = PIXEL_WIDTH
-        exposure = EXPOSURE
-        observing_duration = OBSERVING_DURATION
-        sky_surface_brightness_mag_arcsec2 = (
-            SKY_SURFACE_BRIGHTNESS
-            if sky_surface_brightness_mag_arcsec2 is None
-            else float(sky_surface_brightness_mag_arcsec2)
+        spec = MainRdRunSpec(
+            frame_rows=int(frame_rows),
+            frame_cols=int(frame_cols),
         )
-        n_subpixels = N_SUBPIXELS if n_subpixels is None else int(n_subpixels)
-        scattered_light_e_s_pix = (
-            0.0 if scattered_light_e_s_pix is None else float(scattered_light_e_s_pix)
+    if (int(frame_rows), int(frame_cols)) != (spec.frame_rows, spec.frame_cols):
+        raise ValueError("frame_rows/frame_cols conflict with MainRdRunSpec")
+    overrides: dict[str, Any] = {}
+    if sky_surface_brightness_mag_arcsec2 is not None:
+        overrides["sky_surface_brightness_mag_arcsec2"] = float(
+            sky_surface_brightness_mag_arcsec2
         )
-        dark_current = DARK_CURRENT
-        readout_noise = READOUT_NOISE
-        full_well_electrons = FULL_WELL_ELECTRONS
-        gain_electrons_per_adu = GAIN_ELECTRONS_PER_ADU
-        adc_bit_depth = ADC_BIT_DEPTH
-        bias_level_adu = BIAS_LEVEL_ADU
-        column_noise_sigma_adu = COLUMN_NOISE_SIGMA_ADU
-        cosmic_ray_library_path = COSMIC_RAY_LIBRARY_PATH
-        cosmic_ray_pixel_size = COSMIC_RAY_PIXEL_SIZE
-        cosmic_ray_event_rate = COSMIC_RAY_EVENT_RATE
-        psf_bundle_name = PSF_BUNDLE_NAME
-        use_jitter_integrated_psf = True
-        n_jitter_integrated_psf_models = JITTER_INTEGRATED_PSF_MODELS
-        n_jitter_frames_per_model = JITTER_FRAMES_PER_MODEL
-    else:
-        pixel_scale = float(spec.pixel_scale_arcsec_per_pix) * u.arcsec / u.pix
-        pixel_width = float(spec.pixel_width_um) * u.um
-        exposure = float(spec.exposure_s) * u.s
-        observing_duration = float(spec.observing_duration_s) * u.s
-        sky_surface_brightness_mag_arcsec2 = (
-            float(spec.sky_surface_brightness_mag_arcsec2)
-            if sky_surface_brightness_mag_arcsec2 is None
-            else float(sky_surface_brightness_mag_arcsec2)
-        )
-        n_subpixels = int(spec.n_subpixels if n_subpixels is None else n_subpixels)
-        scattered_light_e_s_pix = (
-            float(spec.scattered_light_e_s_pix)
-            if scattered_light_e_s_pix is None
-            else float(scattered_light_e_s_pix)
-        )
-        dark_current = float(spec.dark_current_e_s_pix) * u.electron / u.s / u.pix
-        readout_noise = float(spec.readout_noise_e_pix) * u.electron / u.pix
-        full_well_electrons = float(spec.full_well_electrons)
-        gain_electrons_per_adu = float(spec.gain_electrons_per_adu)
-        adc_bit_depth = int(spec.adc_bit_depth)
-        bias_level_adu = float(spec.bias_level_adu)
-        column_noise_sigma_adu = float(spec.column_noise_sigma_adu)
-        cosmic_ray_library_path = spec.cosmic_ray_library_path
-        cosmic_ray_pixel_size = float(spec.cosmic_ray_pixel_size_um) * u.um
-        cosmic_ray_event_rate = float(spec.cosmic_ray_event_rate_cm2_s) / (u.cm**2 * u.s)
-        psf_bundle_name = spec.psf_bundle_name
-        use_jitter_integrated_psf = bool(spec.use_jitter_integrated_psf)
-        n_jitter_integrated_psf_models = int(spec.n_jitter_integrated_psf_models)
-        n_jitter_frames_per_model = int(spec.n_jitter_frames_per_model)
-
-    background_flux = sky_surface_brightness_to_background_flux(
-        sky_surface_brightness_mag_arcsec2,
-        pixel_scale,
-        magnitude_system="ET",
-    )
-    return {
-        "Detector Width": int(frame_cols) * u.pix,
-        "Detector Height": int(frame_rows) * u.pix,
-        "Subpixels Per Pixel Dim": int(n_subpixels),
-        "Pixel Scale": pixel_scale,
-        "Pixel Width": pixel_width,
-        "Exposure Duration": exposure,
-        "Observing Duration": observing_duration,
-        "Simulation Cadence Mult": 1,
-        "Background Flux": background_flux,
-        "Sky Background Mode": "surface_brightness",
-        "Sky Background Surface Brightness": sky_surface_brightness_mag_arcsec2,
-        "Sky Background Magnitude System": "ET",
-        "Subtract Nonstellar Mean": False,
-        "Dark Current": dark_current,
-        "Scattered Light": float(scattered_light_e_s_pix) * u.electron / u.s / u.pix,
-        "Readout Noise": readout_noise,
-        "Enable ADC Digitization": True,
-        "Full Well Electrons": full_well_electrons * u.electron,
-        "Gain Electrons Per ADU": gain_electrons_per_adu * u.electron / u.adu,
-        "ADC Bit Depth": adc_bit_depth,
-        "ADC Min Value": 0.0,
-        "ADC Round Values": True,
-        "Bias Level ADU": bias_level_adu * u.adu,
-        "Column Noise Sigma ADU": column_noise_sigma_adu * u.adu,
-        "Save Bias Metadata": True,
-        "Enable Cosmic Rays": True,
-        "Cosmic Ray Event Library Path": cosmic_ray_library_path,
-        "Cosmic Ray Event Library Pixel Size": cosmic_ray_pixel_size,
-        "Cosmic Ray Event Rate": cosmic_ray_event_rate,
-        "Cosmic Ray Seed": 0,
-        "Inter-PRV (RMS)": 1.0 * u.percent,
-        "Inter-PRV (Nominal)": 100.0 * u.percent,
-        "Intra-PRV (RMS)": 1.0 * u.percent,
-        "Pixel Response Profile Mod": "flux conserved",
-        "Enable Flat Field Correction": False,
-        "Flat Field Uncertainty": 0.0 * u.percent,
-        "Enable DVA Drifts": False,
-        "Thermal Defocus Model": "none",
-        "Thermal Defocus Amplitude": 0.0 * u.percent,
-        "Thermal Defocus Offset": 100.0 * u.percent,
-        "PSF Bundle Name": psf_bundle_name,
-        "PSF Field ID": "nearest",
-        "Use Jitter-Integrated PSF": use_jitter_integrated_psf,
-        "N Jitter-Integrated PSF Models": n_jitter_integrated_psf_models,
-        "N Jitter Frames Per Model": n_jitter_frames_per_model,
-        "Telescope Count": 1,
-        "Optical Efficiency Ratio": 101.0 * u.percent,
-    }
+    if n_subpixels is not None:
+        overrides["n_subpixels"] = int(n_subpixels)
+    if scattered_light_e_s_pix is not None:
+        overrides["scattered_light_e_s_pix"] = float(scattered_light_e_s_pix)
+    if overrides:
+        spec = replace(spec, **overrides)
+    return spec.to_simulation_spec().to_config_dict()
 
 
 _ET_REGISTRY_CACHE = None
@@ -484,11 +682,10 @@ def star_summary(star_data: dict[str, Any]) -> dict[str, Any]:
 
 
 def star_et_magnitude(star_data: dict[str, Any]) -> np.ndarray:
-    if "et_mag" in star_data:
-        return np.asarray(star_data["et_mag"], dtype=float)
-    if "kp_mag" in star_data:
-        return np.asarray(star_data["kp_mag"], dtype=float)
-    raise KeyError("star_data must contain 'et_mag' or legacy 'kp_mag'")
+    ensure_local_imports()
+    from photsim7.photometry import normalize_magnitude_input
+
+    return normalize_magnitude_input(star_data, mag_type="ET").magnitude
 
 
 def star_data_for_photsim7_catalog(star_data: dict[str, Any]) -> dict[str, Any]:
@@ -725,26 +922,21 @@ def legacy_star_cache_path(output_root: Path, frame_rows: int, frame_cols: int, 
 
 
 def save_star_cache(path: Path, star_data: dict[str, Any], metadata: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    n_stars = len(star_data["x0"])
-    payload: dict[str, Any] = {}
-    for key, value in star_data.items():
-        arr = np.asarray(value)
-        if arr.ndim == 1 and len(arr) == n_stars:
-            payload[key] = arr
-    payload["__metadata_json__"] = np.array(json.dumps(metadata, default=_json_default))
-    np.savez_compressed(path, **payload)
+    ensure_local_imports()
+    from photsim7.catalog_sources import PreparedStarCatalog, StarCatalogCache
+
+    StarCatalogCache.write(
+        path,
+        PreparedStarCatalog(star_data=star_data, metadata=metadata),
+    )
 
 
 def load_star_cache(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    with np.load(path, allow_pickle=True) as data:
-        metadata = json.loads(str(data["__metadata_json__"].item()))
-        star_data = {
-            key: np.asarray(data[key])
-            for key in data.files
-            if key != "__metadata_json__"
-        }
-    return star_data, metadata
+    ensure_local_imports()
+    from photsim7.catalog_sources import StarCatalogCache
+
+    catalog = StarCatalogCache.read(path)
+    return dict(catalog.star_data), dict(catalog.metadata)
 
 
 def prepare_star_cache(args: argparse.Namespace, spec: MainRdRunSpec) -> Path:
@@ -754,92 +946,39 @@ def prepare_star_cache(args: argparse.Namespace, spec: MainRdRunSpec) -> Path:
         print(f"[Star cache] reuse {cache_path}")
         return cache_path
 
+    ensure_local_imports()
+    from photsim7.catalog_sources import StarCatalogCache
+    from photsim7.data_registry import DataRegistry
+    from photsim7.simulation_services import build_catalog_from_spec
+
     start = time.perf_counter()
-    if spec.star_source == "gaia_main_rd":
-        print(
-            "[Star cache] querying Gaia catalog "
-            f"detector={DETECTOR_ID} frame={spec.frame_cols}x{spec.frame_rows} G<{args.mag_limit:g}"
-        )
-        star_data = query_main_rd_stars(
-            frame_rows=spec.frame_rows,
-            frame_cols=spec.frame_cols,
-            mag_limit=args.mag_limit,
-            catalog_dir=args.catalog_dir,
-            crop_margin_pix=args.crop_margin_pix,
-        )
-        source_metadata = {
-            "star_source": spec.star_source,
-            "catalog_dir": str(Path(args.catalog_dir).expanduser()),
-            "crop_margin_pix": float(args.crop_margin_pix),
-        }
-    elif spec.star_source == "synthetic_mag_distribution":
-        print(
-            "[Star cache] building synthetic magnitude-distribution catalog "
-            f"frame={spec.frame_cols}x{spec.frame_rows} {spec.mag_distribution_column}<={args.mag_limit:g} "
-            f"csv={spec.mag_distribution_csv}"
-        )
-        star_data = build_synthetic_mag_distribution_stars(
-            csv_path=spec.mag_distribution_csv,
-            mag_column=spec.mag_distribution_column,
-            mag_limit=args.mag_limit,
-            frame_rows=spec.frame_rows,
-            frame_cols=spec.frame_cols,
-            seed=int(args.seed),
-            psf_field_angle_deg=float(spec.synthetic_psf_field_angle_deg),
-        )
-        source_metadata = {
-            "star_source": spec.star_source,
-            "mag_distribution_csv": str(Path(spec.mag_distribution_csv).expanduser()),
-            "mag_distribution_column": spec.mag_distribution_column,
-            "gaia_g_mag_treated_as_et_mag": True,
-            "synthetic_position_seed": int(args.seed),
-            "synthetic_position_model": "uniform independent x/y centers within the image bounds",
-            "synthetic_psf_field_angle_deg": float(spec.synthetic_psf_field_angle_deg),
-        }
-    elif spec.star_source == "detector_xy_csv":
-        print(
-            "[Star cache] building detector-xy catalog "
-            f"frame={spec.frame_cols}x{spec.frame_rows} csv={spec.detector_xy_csv}"
-        )
-        star_data = build_detector_xy_stars(
-            csv_path=spec.detector_xy_csv,
-            frame_rows=spec.frame_rows,
-            frame_cols=spec.frame_cols,
-            psf_field_angle_deg=float(spec.synthetic_psf_field_angle_deg),
-            source_id_column=spec.detector_xy_source_id_column,
-            mag_column=spec.detector_xy_mag_column,
-            x_column=spec.detector_xy_x_column,
-            y_column=spec.detector_xy_y_column,
-        )
-        source_metadata = {
-            "star_source": spec.star_source,
-            "detector_xy_csv": str(Path(spec.detector_xy_csv).expanduser()),
-            "detector_xy_source_id_column": spec.detector_xy_source_id_column,
-            "detector_xy_mag_column": spec.detector_xy_mag_column,
-            "detector_xy_x_column": spec.detector_xy_x_column,
-            "detector_xy_y_column": spec.detector_xy_y_column,
-            "gmag_used_directly_as_et_mag": True,
-            "position_model": (
-                "CSV x0/y0 are used directly as detector-centered pixel coordinates"
-            ),
-            "round_positions": False,
-            "reproject_positions": False,
-            "synthetic_psf_field_angle_deg": float(spec.synthetic_psf_field_angle_deg),
-        }
-    else:
-        raise ValueError(
-            f"Unsupported star_source={spec.star_source!r}; "
-            "expected 'gaia_main_rd', 'synthetic_mag_distribution', or 'detector_xy_csv'"
-        )
+    runtime_spec = replace(
+        spec,
+        mag_limit=float(args.mag_limit),
+    )
+    source_path = args.catalog_dir if spec.star_source == "gaia_main_rd" else None
+    typed_spec = runtime_spec.to_simulation_spec(
+        run_seed=int(args.seed),
+        source_path=source_path,
+        registry_data_dir=ET_FOCALPLANE_ROOT / "data",
+        crop_margin_pix=float(args.crop_margin_pix),
+    )
+    catalog = build_catalog_from_spec(
+        typed_spec,
+        data_registry=DataRegistry(data_root=PHOTSIM7_DATA_DIR),
+    )
     elapsed = time.perf_counter() - start
     metadata = {
         "spec": asdict(spec),
         "mag_limit": float(args.mag_limit),
         "query_elapsed_s": float(elapsed),
-        "summary": star_summary(star_data),
-        **source_metadata,
+        "summary": star_summary(dict(catalog.star_data)),
+        "star_source": spec.star_source,
+        "compatibility_adapter": "MainRdRunSpec",
+        "simulation_spec": typed_spec.to_json_dict(),
     }
-    save_star_cache(cache_path, star_data, metadata)
+    catalog = catalog.with_metadata(et_mainsim=metadata)
+    StarCatalogCache.write(cache_path, catalog)
     write_json(cache_path.with_suffix(".summary.json"), metadata)
     print(
         f"[Star cache] saved {cache_path} "
@@ -856,6 +995,70 @@ def resolve_or_prepare_star_cache(args: argparse.Namespace, spec: MainRdRunSpec)
         print(f"[Star cache] reuse explicit {cache_path}")
         return cache_path
     return prepare_star_cache(args, spec)
+
+
+def _runtime_run_spec(args: argparse.Namespace, spec: MainRdRunSpec) -> MainRdRunSpec:
+    frames = int(args.frames)
+    return replace(
+        spec,
+        mag_limit=float(args.mag_limit),
+        n_frames=frames,
+        observing_duration_s=frames * float(spec.exposure_s),
+        use_jitter_integrated_psf=bool(args.jitter_integrated_psf),
+        n_jitter_integrated_psf_models=int(args.jitter_psf_models),
+        n_jitter_frames_per_model=int(args.jitter_frames_per_model),
+        enable_psd_motion=bool(args.enable_psd_motion),
+        psd_motion_path=str(args.psd_motion_path),
+        enable_dva_drift=bool(args.enable_dva_drift),
+        enable_thermal_drift=bool(args.enable_thermal_drift),
+        enable_momentum_dump=bool(args.enable_momentum_dump),
+        enable_psf_breathing=bool(args.enable_psf_breathing),
+        motion_split_hz=1.0 / float(spec.exposure_s),
+    )
+
+
+def build_main_rd_simulation_spec(
+    args: argparse.Namespace,
+    spec: MainRdRunSpec,
+):
+    """Resolve CLI overrides into the canonical package simulation spec."""
+
+    runtime_spec = _runtime_run_spec(args, spec)
+    source_path = args.catalog_dir if spec.star_source == "gaia_main_rd" else None
+    typed_spec = runtime_spec.to_simulation_spec(
+        run_seed=int(args.seed),
+        compute_device=str(args.device),
+        source_path=source_path,
+        registry_data_dir=ET_FOCALPLANE_ROOT / "data",
+        crop_margin_pix=float(args.crop_margin_pix),
+    )
+    if bool(args.no_detector_response):
+        typed_spec = replace(
+            typed_spec,
+            detector_response=replace(
+                typed_spec.detector_response,
+                enable_inter_pixel_response=False,
+                enable_intra_pixel_response=False,
+                enable_pixel_phase_response=False,
+            ),
+        )
+    return typed_spec
+
+
+def build_main_rd_services(args: argparse.Namespace, spec: MainRdRunSpec, catalog):
+    """Build the reusable Photsim7 service bundle for one worker."""
+
+    ensure_local_imports()
+    from photsim7.data_registry import DataRegistry
+    from photsim7.simulation_services import build_full_frame_services
+
+    typed_spec = build_main_rd_simulation_spec(args, spec)
+    return build_full_frame_services(
+        typed_spec,
+        frame_exposure=float(spec.exposure_s) * u.s,
+        catalog=catalog,
+        data_registry=DataRegistry(data_root=PHOTSIM7_DATA_DIR),
+    )
 
 
 def build_star_catalog(
@@ -1608,6 +1811,38 @@ def gpu_memory_snapshot() -> str:
         return f"unavailable: {exc}"
 
 
+def _git_repository_provenance(root: Path | str) -> dict[str, Any]:
+    path = Path(root).expanduser().resolve()
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        dirty = bool(
+            subprocess.check_output(
+                ["git", "-C", str(path), "status", "--porcelain"],
+                text=True,
+            ).strip()
+        )
+        return {"root": str(path), "commit": commit, "dirty": dirty}
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return {
+            "root": str(path),
+            "commit": None,
+            "dirty": None,
+            "error": str(exc),
+        }
+
+
+def source_git_provenance() -> dict[str, dict[str, Any]]:
+    return {
+        "et_mainsim": _git_repository_provenance(
+            Path(__file__).resolve().parents[1]
+        ),
+        "photsim7": _git_repository_provenance(PHOTSIM7_ROOT),
+    }
+
+
 def plot_preview(image_dn: np.ndarray, preview_path: Path, *, title: str) -> None:
     preview_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8.0, 8.0), dpi=150)
@@ -1621,9 +1856,100 @@ def plot_preview(image_dn: np.ndarray, preview_path: Path, *, title: str) -> Non
     plt.close(fig)
 
 
+def _as_numpy(value: Any) -> np.ndarray:
+    if hasattr(value, "detach") and callable(value.detach):
+        value = value.detach()
+    if hasattr(value, "cpu") and callable(value.cpu):
+        value = value.cpu()
+    if hasattr(value, "numpy") and callable(value.numpy):
+        value = value.numpy()
+    return np.asarray(value)
+
+
+def _select_brightest_catalog(catalog, max_stars: int | None):
+    if max_stars is None or catalog.n_sources <= int(max_stars):
+        return catalog
+    ensure_local_imports()
+    from photsim7.catalog_sources import PreparedStarCatalog
+
+    max_stars = int(max_stars)
+    if max_stars <= 0:
+        raise ValueError("max_stars must be positive when provided")
+    order = np.argsort(star_et_magnitude(dict(catalog.star_data)))[:max_stars]
+    selected: dict[str, Any] = {}
+    for key, value in catalog.star_data.items():
+        array = np.asarray(value)
+        if array.ndim == 1 and len(array) == catalog.n_sources:
+            selected[key] = array[order]
+        else:
+            selected[key] = value
+    return PreparedStarCatalog(
+        star_data=selected,
+        metadata={
+            **dict(catalog.metadata),
+            "et_mainsim_selection": {
+                "policy": "brightest",
+                "max_stars": max_stars,
+                "input_n_sources": int(catalog.n_sources),
+                "output_n_sources": int(len(order)),
+            },
+        },
+        schema_id=catalog.schema_id,
+        schema_version=catalog.schema_version,
+    )
+
+
+def _legacy_cosmic_mask(mask: Any) -> np.ndarray:
+    array = _as_numpy(mask)
+    if array.ndim == 3 and array.shape[0] == 1:
+        return array[0]
+    return array
+
+
+def effect_timeseries_artifacts(effect_timeseries, typed_spec):
+    if effect_timeseries is not None:
+        return effect_timeseries.to_arrays(), effect_timeseries.to_metadata()
+
+    observation = typed_spec.observation
+    integration_s = observation.integration_for(
+        typed_spec.detector.detector_type
+    ).to_value(u.s)
+    frame_start_s = np.asarray(
+        observation.resolved_frame_start_s,
+        dtype=np.float64,
+    )
+    split_hz = float(typed_spec.dynamic_effects.psd_motion.split_hz)
+    arrays = {
+        "frame_start_s": frame_start_s,
+        "frame_mid_s": frame_start_s + 0.5 * integration_s,
+    }
+    metadata = {
+        "schema_id": "photsim7.effect_timeseries.v1",
+        "schema_version": 1,
+        "timing": {
+            "n_frames": int(observation.resolved_n_frames),
+            "integration_s": float(integration_s),
+            "sampling_interval_s": float(
+                observation.sampling_interval.to_value(u.s)
+            ),
+            "split_hz": split_hz,
+        },
+        "components": [],
+        "metadata": {"all_effects_disabled": True},
+    }
+    return arrays, metadata
+
+
 def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
     ensure_local_imports()
     torch = require_torch()
+    from photsim7.catalog_sources import StarCatalogCache
+    from photsim7.full_frame_artifacts import (
+        FullFrameArtifactOptions,
+        FullFrameArtifactWriter,
+    )
+    from photsim7.full_frame_pipeline import run_single_cadence_full_frame
+
     frame_indices = selected_frame_indices(args.frame_indices, args.frames)
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
@@ -1643,97 +1969,40 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
         path.mkdir(parents=True, exist_ok=True)
 
     cache_path = Path(args.star_cache).expanduser()
-    star_data, cache_metadata = load_star_cache(cache_path)
-    if args.max_stars is not None:
-        star_data = select_brightest(star_data, args.max_stars)
+    catalog = _select_brightest_catalog(
+        StarCatalogCache.read(cache_path),
+        args.max_stars,
+    )
+    services = build_main_rd_services(args, spec, catalog)
+    typed_spec = services.spec
 
     if args.device.startswith("cuda"):
         torch.cuda.set_device(0)
         torch.cuda.reset_peak_memory_stats()
-    torch.manual_seed(int(args.seed))
-    np.random.seed(int(args.seed))
-
-    effect_arrays, effect_metadata = build_full_effect_timeseries(
-        n_frames=int(args.frames),
-        seed=int(args.seed),
-        enable_psd_motion=bool(args.enable_psd_motion),
-        psd_motion_path=args.psd_motion_path,
-        enable_dva=bool(args.enable_dva_drift),
-        enable_thermal=bool(args.enable_thermal_drift),
-        enable_momentum_dump=bool(args.enable_momentum_dump),
-        enable_psf_breathing=bool(args.enable_psf_breathing),
-        exposure_s=float(spec.exposure_s),
+    effect_arrays, effect_metadata = effect_timeseries_artifacts(
+        services.effect_timeseries,
+        typed_spec,
     )
-    xy_jitter_pix, jitter_metadata = jitter_integrated_psf_offsets(
-        seed=int(args.seed) + 1999,
-        enable_psd_motion=bool(args.enable_psd_motion),
-        enable_jitter_integrated_psf=bool(args.jitter_integrated_psf),
-        psd_motion_path=args.psd_motion_path,
-        n_models=int(args.jitter_psf_models),
-        n_frames_per_model=int(args.jitter_frames_per_model),
-        exposure_s=float(spec.exposure_s),
-    )
-
-    psf_manager, psf_field_ids, psf_field_id_counts = build_psf_manager(
-        frame_rows=spec.frame_rows,
-        frame_cols=spec.frame_cols,
-        device=args.device,
-        star_data=star_data,
-        n_subpixels=int(spec.n_subpixels),
-        psf_bundle_name=spec.psf_bundle_name,
-        pixel_scale_arcsec_per_pix=float(spec.pixel_scale_arcsec_per_pix),
-        integrate_jitter=bool(args.jitter_integrated_psf),
-        xy_jitter_pix=xy_jitter_pix,
-        n_jitter_integrated_psf_models=int(args.jitter_psf_models),
-        n_jitter_frames_per_model=int(args.jitter_frames_per_model),
-    )
-    stars = build_star_catalog(
-        star_data=star_data,
-        frame_rows=spec.frame_rows,
-        frame_cols=spec.frame_cols,
-        psf_field_ids=psf_field_ids,
-        frame_exposure_s=float(spec.exposure_s),
-    )
-    detector_response_sampler = None
-    if not args.no_detector_response:
-        detector_response_sampler = build_detector_response_sampler(
-            frame_rows=spec.frame_rows,
-            frame_cols=spec.frame_cols,
-            n_subpixels=int(spec.n_subpixels),
-            device=args.device,
-            seed=int(args.seed),
-        )
-    run_sim_config = sim_config_dict(spec.frame_rows, spec.frame_cols, spec=spec)
-    renderer = make_renderer(
-        sim_config=run_sim_config,
-        frame_exposure_s=float(spec.exposure_s),
-        device=args.device,
-        stars=stars,
-        psf_model_manager=psf_manager,
-        detector_response_sampler=detector_response_sampler,
-    )
-    background_flux_per_pixel = run_sim_config["Background Flux"]
-    dark_current_per_pixel = run_sim_config["Dark Current"]
-    cosmic_ray_library = load_cosmic_ray_event_library(spec)
-
-    base_x = np.asarray(stars["Detector Xpix Shifted"], dtype=np.float64)
-    base_y = np.asarray(stars["Detector Ypix Shifted"], dtype=np.float64)
     if int(args.worker_rank) == 0:
         np.savez_compressed(run_dir / "effects_timeseries.npz", **effect_arrays)
+        write_json(run_dir / "effects_timeseries.metadata.json", effect_metadata)
 
     worker_summary = {
         "spec": asdict(spec),
+        "simulation_spec": typed_spec.to_json_dict(),
+        "compatibility_adapter": "MainRdRunSpec",
+        "git_provenance": source_git_provenance(),
         "args": vars(args),
         "rank": int(args.worker_rank),
         "world_size": int(args.worker_world_size),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "device": args.device,
         "star_cache": str(cache_path),
-        "star_cache_metadata": cache_metadata,
-        "rendered_star_summary": star_summary(star_data),
-        "psf_field_id_counts": psf_field_id_counts,
+        "star_cache_metadata": dict(catalog.metadata),
+        "rendered_star_summary": star_summary(dict(catalog.star_data)),
+        "psf": dict(services.psf_result.provenance),
+        "services": dict(services.provenance),
         "effects": effect_metadata,
-        "jitter_integrated_psf": jitter_metadata,
         "gpu_memory_before": gpu_memory_snapshot(),
     }
     write_json(run_dir / f"worker_{args.worker_rank:02d}_start.json", worker_summary)
@@ -1754,118 +2023,92 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
             continue
 
         frame_start = time.perf_counter()
-        frame_seed = int(args.seed) + frame_index * 1009
-        torch.manual_seed(frame_seed)
-        if args.device.startswith("cuda"):
-            torch.cuda.manual_seed_all(frame_seed)
-            torch.cuda.synchronize()
-
-        offset_x, offset_y = effect_arrays["total_motion_pix"][frame_index]
-        psf_scale = float(effect_arrays["psf_scale"][frame_index])
-        jitter_model_index = (
-            int(frame_index) % int(args.jitter_psf_models)
-            if bool(args.jitter_integrated_psf)
-            else None
-        )
         scattered_light_per_pixel = scattered_light_for_frame(spec, frame_index)
-        render_start = time.perf_counter()
-        components = renderer.render_single_cadence(
-            enable_stellar_photon_noise=True,
-            enable_background_light=True,
-            enable_scattered_light=bool(scattered_light_per_pixel.value != 0.0),
-            enable_dark_current=True,
-            enable_readout_noise=False,
-            background_flux_per_pixel=background_flux_per_pixel,
-            scattered_light_per_pixel=scattered_light_per_pixel,
-            dark_current_per_pixel=dark_current_per_pixel,
-            readout_noise=0.0 * u.electron / u.pix,
-            subtract_nonstellar_mean=False,
-            star_x_positions_pix=base_x + float(offset_x),
-            star_y_positions_pix=base_y + float(offset_y),
-            star_psf_scales=np.full(len(stars), psf_scale, dtype=np.float32),
-            jitter_model_index=jitter_model_index,
-            progress=bool(args.progress),
-            return_numpy=False,
+        artifact_writer = FullFrameArtifactWriter(
+            run_dir,
+            options=FullFrameArtifactOptions(
+                save_frame_summaries=True,
+                save_cosmic_events=True,
+                save_bias=bool(args.save_column_noise),
+                save_preview=frame_index < int(args.preview_count),
+            ),
         )
-        if args.device.startswith("cuda"):
-            torch.cuda.synchronize()
-        render_elapsed = time.perf_counter() - render_start
-
-        electronics_start = time.perf_counter()
-        image_dn, cosmic_payload, col_noise, mean_events = apply_detector_chain(
-            image_electrons=components["final_image"],
+        pipeline_start = time.perf_counter()
+        result = run_single_cadence_full_frame(
+            typed_spec,
+            services=services,
             frame_index=frame_index,
-            frame_rows=spec.frame_rows,
-            frame_cols=spec.frame_cols,
-            seed=int(args.seed),
-            spec=spec,
-            cosmic_ray_library=cosmic_ray_library,
+            renderer_options={
+                "enable_stellar_photon_noise": True,
+                "enable_background_light": True,
+                "enable_scattered_light": bool(
+                    scattered_light_per_pixel.value != 0.0
+                ),
+                "enable_dark_current": True,
+                "scattered_light_per_pixel": scattered_light_per_pixel,
+                "progress": bool(args.progress),
+            },
+            worker_rank=int(args.worker_rank),
+            rng_trace_scope={"run_label": run_dir.name},
+            artifact_writer=artifact_writer,
         )
         if args.device.startswith("cuda"):
             torch.cuda.synchronize()
-        electronics_elapsed = time.perf_counter() - electronics_start
+        pipeline_elapsed = time.perf_counter() - pipeline_start
 
-        image_np = image_dn.detach().cpu().numpy()
-        np.save(frame_path, image_np)
-        np.save(events_dir / f"frame_{frame_index:06d}_events.npy", cosmic_payload.events)
-        if args.save_column_noise:
-            np.save(
-                bias_dir / f"frame_{frame_index:06d}_column_noise_adu.npy",
-                col_noise.detach().cpu().numpy(),
-            )
-        if args.save_cosmic_mask:
-            np.save(
-                events_dir / f"frame_{frame_index:06d}_mask.npy",
-                cosmic_payload.mask[0],
-            )
+        image_np = _as_numpy(result.frame_products.final_frame.array)
+        cosmic_payload = result.detector_result.cosmic_metadata
+        if args.save_cosmic_mask and cosmic_payload is not None:
+            mask = getattr(cosmic_payload, "mask", None)
+            if mask is not None:
+                np.save(
+                    events_dir / f"frame_{frame_index:06d}_mask.npy",
+                    _legacy_cosmic_mask(mask),
+                )
         if args.save_stellar_mean:
+            stellar_mean = result.renderer_components.get("stellar_mean")
+            if stellar_mean is None:
+                raise KeyError(
+                    "Photsim7 pipeline did not return the stellar_mean component"
+                )
             np.save(
                 frames_dir / f"frame_{frame_index:06d}_stellar_mean_e.npy",
-                components["stellar_mean"].detach().cpu().numpy().astype(np.float32),
+                _as_numpy(stellar_mean).astype(np.float32),
             )
 
-        if frame_index < int(args.preview_count):
-            plot_preview(
-                image_np,
-                preview_dir / f"frame_{frame_index:06d}.png",
-                title=(
-                    f"main_rd {spec.frame_cols}x{spec.frame_rows} G<{args.mag_limit:g} "
-                    f"frame {frame_index}"
-                ),
-            )
+        package_summary = dict(result.frame_products.frame_summary or {})
+        package_schema_path = result.artifact_paths.get("frame_product_schema")
+        actual_events = int(package_summary.get("actual_cosmic_events", 0))
+        cosmic_mask_pixels = int(package_summary.get("cosmic_mask_pixels", 0))
 
         peak_allocated_mb = (
-            torch.cuda.max_memory_allocated() / 1024**2 if args.device.startswith("cuda") else None
+            torch.cuda.max_memory_allocated() / 1024**2
+            if args.device.startswith("cuda")
+            else None
         )
         peak_reserved_mb = (
-            torch.cuda.max_memory_reserved() / 1024**2 if args.device.startswith("cuda") else None
+            torch.cuda.max_memory_reserved() / 1024**2
+            if args.device.startswith("cuda")
+            else None
         )
         frame_summary = {
+            "artifact_schema_version": 1,
             "frame_index": int(frame_index),
             "rank": int(args.worker_rank),
             "device": args.device,
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-            "n_stars": int(len(stars)),
-            "render_elapsed_s": float(render_elapsed),
-            "electronics_elapsed_s": float(electronics_elapsed),
+            "n_stars": int(catalog.n_sources),
+            "pipeline_elapsed_s": float(pipeline_elapsed),
             "total_elapsed_s": float(time.perf_counter() - frame_start),
-            "motion_offset_x_pix": float(offset_x),
-            "motion_offset_y_pix": float(offset_y),
-            "psf_scale": float(psf_scale),
             "scattered_light_e_s_pix": float(scattered_light_per_pixel.value),
             "scattered_light_e_pix_frame": float(
                 scattered_light_per_pixel.value * float(spec.exposure_s)
             ),
-            "effect_components": {
-                "psd_drift_pix": effect_arrays["psd_drift_pix"][frame_index],
-                "dva_drift_pix": effect_arrays["dva_drift_pix"][frame_index],
-                "thermal_drift_pix": effect_arrays["thermal_drift_pix"][frame_index],
-                "momentum_dump_pix": effect_arrays["momentum_dump_pix"][frame_index],
-            },
-            "jitter_model_index": None if jitter_model_index is None else int(jitter_model_index),
-            "mean_cosmic_events_per_frame": float(mean_events),
-            "actual_cosmic_events": int(len(cosmic_payload.events)),
-            "cosmic_mask_pixels": int(np.count_nonzero(cosmic_payload.mask)),
+            "mean_cosmic_events_per_frame": float(
+                package_summary.get("mean_cosmic_events_per_frame", 0.0)
+            ),
+            "actual_cosmic_events": actual_events,
+            "cosmic_mask_pixels": cosmic_mask_pixels,
             "image_dtype": str(image_np.dtype),
             "image_min": int(np.min(image_np)),
             "image_p50": float(np.percentile(image_np, 50)),
@@ -1878,15 +2121,20 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
             "peak_cuda_allocated_mb": peak_allocated_mb,
             "peak_cuda_reserved_mb": peak_reserved_mb,
             "frame_path": str(frame_path),
+            "package_schema_path": (
+                None if package_schema_path is None else str(package_schema_path)
+            ),
+            "package_frame_summary": package_summary,
+            "package_provenance": dict(result.provenance),
         }
         write_json(summary_path, frame_summary)
         print(
             f"[Worker {args.worker_rank}] frame={frame_index:06d} "
-            f"render={render_elapsed:.2f}s electronics={electronics_elapsed:.2f}s "
-            f"events={len(cosmic_payload.events)} sat={frame_summary['saturated_pixels']}"
+            f"pipeline={pipeline_elapsed:.2f}s events={actual_events} "
+            f"sat={frame_summary['saturated_pixels']}"
         )
 
-        del components, image_dn, image_np, cosmic_payload, col_noise
+        del result, image_np
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
 
@@ -2040,7 +2288,7 @@ def parse_common_args(
     parser.add_argument(
         "--psd-motion-path",
         type=Path,
-        default=Path("/home/cxgao/ET/photsim6_cache/ET_psd3-2.pkl"),
+        default=Path("pds/ET_psd3-2.pkl"),
     )
     parser.add_argument("--worker-rank", type=int, default=None)
     parser.add_argument("--worker-world-size", type=int, default=None)
@@ -2085,8 +2333,12 @@ def launch_or_run(args: argparse.Namespace, spec: MainRdRunSpec, script_path: Pa
     run_dir = output_root / run_dir_name(spec, args.mag_limit)
     log_dir = run_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    typed_spec = build_main_rd_simulation_spec(args, spec)
     parent_summary = {
         "spec": asdict(spec),
+        "simulation_spec": typed_spec.to_json_dict(),
+        "compatibility_adapter": "MainRdRunSpec",
+        "git_provenance": source_git_provenance(),
         "args": vars(args),
         "star_cache": str(cache_path),
         "gpu_ids": gpu_ids,
