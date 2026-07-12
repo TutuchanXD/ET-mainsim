@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from astropy import units as u
 
 
 MODULE_DIR = Path(__file__).resolve().parent
@@ -224,6 +225,84 @@ def test_default_run_spec_uses_sky22_and_single_subpixel():
     assert cfg["Subpixels Per Pixel Dim"] == 1
 
 
+@pytest.mark.parametrize(
+    ("star_source", "source_type"),
+    [
+        ("gaia_main_rd", "et_focalplane_query"),
+        ("synthetic_mag_distribution", "synthetic_mag_distribution"),
+        ("detector_xy_csv", "detector_xy_csv"),
+    ],
+)
+def test_main_rd_run_spec_builds_canonical_simulation_spec(star_source, source_type):
+    run_spec = core.MainRdRunSpec(
+        frame_rows=50,
+        frame_cols=60,
+        star_source=star_source,
+        exposure_s=3.0,
+        n_frames=4,
+        observing_duration_s=12.0,
+        sky_surface_brightness_mag_arcsec2=23.2,
+        readout_noise_e_pix=1.5,
+        n_subpixels=5,
+        scattered_light_e_s_pix=0.75,
+        psf_bundle_name="custom/psf",
+    )
+
+    spec = run_spec.to_simulation_spec(run_seed=42, compute_device="cpu")
+
+    assert spec.detector.shape == (50, 60)
+    assert spec.observation.exposure_duration == 3 * u.s
+    assert spec.observation.observing_duration == 12 * u.s
+    assert spec.observation.resolved_n_frames == 4
+    assert spec.instrument.optical_efficiency.to_value(u.percent) == pytest.approx(58.0)
+    assert spec.instrument.quantum_efficiency.to_value(u.percent) == pytest.approx(80.0)
+    assert spec.instrument.telescope_count == 1
+    assert spec.catalog.source_type == source_type
+    assert spec.catalog.photon_magnitude_system == "ET"
+    assert spec.detector.n_subpixels == 5
+    assert spec.readout.readout_noise == 1.5 * u.electron / u.pix
+    assert spec.sky.scattered_light == 0.75 * u.electron / u.s / u.pix
+    assert spec.psf.bundle_name == "psf/et/custom/psf"
+    assert spec.psf.field_id_policy == "nearest"
+    assert spec.psf.compute_device == "cpu"
+    assert spec.dynamic_effects.thermal_drift.profile == "main_rd_reference"
+    assert spec.dynamic_effects.momentum_dump.profile == (
+        "legacy_random_walk_within_circle"
+    )
+    assert spec.dynamic_effects.psf_breathing.profile == "main_rd_reference"
+    assert spec.rng.run_seed == 42
+
+
+def test_main_rd_run_spec_rejects_legacy_throughput_and_duration_conflicts():
+    with pytest.raises(ValueError, match="optical_efficiency_ratio"):
+        core.MainRdRunSpec(
+            frame_rows=10,
+            frame_cols=10,
+            optical_efficiency_ratio=1.01,
+        )
+
+    with pytest.raises(ValueError, match="observing_duration_s.*n_frames"):
+        core.MainRdRunSpec(
+            frame_rows=10,
+            frame_cols=10,
+            exposure_s=10.0,
+            n_frames=2,
+            observing_duration_s=30.0,
+        )
+
+
+def test_sim_config_dict_is_derived_from_typed_spec_throughput():
+    run_spec = core.MainRdRunSpec(frame_rows=5, frame_cols=7)
+
+    config = core.sim_config_dict(5, 7, spec=run_spec)
+    typed = run_spec.to_simulation_spec()
+
+    assert config["Detector Height"] == typed.to_config_dict()["Detector Height"]
+    assert config["Detector Width"] == typed.to_config_dict()["Detector Width"]
+    assert config["Optical Efficiency Ratio"].to_value(u.percent) == pytest.approx(58.0)
+    assert config["ET Quantum Efficiency"].to_value(u.percent) == pytest.approx(80.0)
+
+
 def test_frame_motion_offsets_uses_exposure_time_as_low_frequency_split(monkeypatch, tmp_path):
     psd_path = tmp_path / "psd.pkl"
     psd_path.write_bytes(b"placeholder")
@@ -364,6 +443,7 @@ def test_sim_config_dict_uses_run_spec_detector_values():
         sky_surface_brightness_mag_arcsec2=23.2,
         n_subpixels=5,
         exposure_s=3.0,
+        n_frames=4,
         observing_duration_s=12.0,
         dark_current_e_s_pix=0.25,
         scattered_light_e_s_pix=0.75,
@@ -397,7 +477,7 @@ def test_sim_config_dict_uses_run_spec_detector_values():
     assert cfg["Cosmic Ray Event Library Path"] == "custom_cosmic.npz"
     assert cfg["Cosmic Ray Event Library Pixel Size"].value == pytest.approx(8.0)
     assert cfg["Cosmic Ray Event Rate"].value == pytest.approx(7.0)
-    assert cfg["PSF Bundle Name"] == "custom/psf"
+    assert cfg["PSF Bundle Name"] == "psf/et/custom/psf"
     assert cfg["N Jitter-Integrated PSF Models"] == 2
     assert cfg["N Jitter Frames Per Model"] == 4
 
@@ -461,6 +541,8 @@ def test_apply_detector_chain_uses_run_spec_values(monkeypatch):
         frame_rows=1,
         frame_cols=1,
         exposure_s=3.0,
+        n_frames=1,
+        observing_duration_s=3.0,
         readout_noise_e_pix=0.0,
         full_well_electrons=10.0,
         gain_electrons_per_adu=2.0,

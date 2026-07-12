@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 import types
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -138,6 +138,8 @@ class MainRdRunSpec:
     scattered_light_step_start_frame: int | None = None
     scattered_light_step_e_pix_frame: float = 0.0
     readout_noise_e_pix: float = 6.0
+    optical_efficiency_ratio: float = 0.58
+    quantum_efficiency_ratio: float = 0.80
     full_well_electrons: float = FULL_WELL_ELECTRONS
     gain_electrons_per_adu: float = GAIN_ELECTRONS_PER_ADU
     adc_bit_depth: int = ADC_BIT_DEPTH
@@ -152,6 +154,8 @@ class MainRdRunSpec:
     n_jitter_integrated_psf_models: int = JITTER_INTEGRATED_PSF_MODELS
     n_jitter_frames_per_model: int = JITTER_FRAMES_PER_MODEL
     motion_split_hz: float = MOTION_SPLIT_HZ
+    enable_psd_motion: bool = True
+    psd_motion_path: str = "pds/ET_psd3-2.pkl"
     enable_dva_drift: bool = True
     dva_field_angle_deg: float = DVA_FIELD_ANGLE_DEG
     dva_theta_deg: float = DVA_THETA_DEG
@@ -173,6 +177,290 @@ class MainRdRunSpec:
         "centroid, faster terms are integrated into the PSF. DVA drift, thermal "
         "drift, momentum dumps, and WEED PSF breathing follow et_sim_10_etpsd3-2.py."
     )
+
+    def __post_init__(self) -> None:
+        if int(self.frame_rows) <= 0 or int(self.frame_cols) <= 0:
+            raise ValueError("frame_rows and frame_cols must be positive")
+        if float(self.exposure_s) <= 0.0:
+            raise ValueError("exposure_s must be positive")
+        if int(self.n_frames) <= 0:
+            raise ValueError("n_frames must be positive")
+        derived_duration = int(self.n_frames) * float(self.exposure_s)
+        if not np.isclose(float(self.observing_duration_s), derived_duration):
+            raise ValueError(
+                "observing_duration_s conflicts with n_frames * exposure_s: "
+                f"{self.observing_duration_s} vs {derived_duration}"
+            )
+        for name in ("optical_efficiency_ratio", "quantum_efficiency_ratio"):
+            value = float(getattr(self, name))
+            if value < 0.0 or value > 1.0:
+                raise ValueError(f"{name} must be in the inclusive range [0, 1]")
+        if self.star_source not in {
+            "gaia_main_rd",
+            "synthetic_mag_distribution",
+            "detector_xy_csv",
+        }:
+            raise ValueError(
+                "star_source must be 'gaia_main_rd', "
+                "'synthetic_mag_distribution', or 'detector_xy_csv'"
+            )
+
+    def to_simulation_spec(
+        self,
+        *,
+        run_seed: int = 0,
+        compute_device: str = "cpu",
+        source_path: str | Path | None = None,
+        registry_data_dir: str | Path | None = None,
+        cache_path: str | Path | None = None,
+        crop_margin_pix: float = 2.0,
+    ):
+        """Return the canonical Photsim7 contract for this run adapter."""
+
+        ensure_local_imports()
+        from photsim7.background import sky_surface_brightness_to_background_flux
+        from photsim7.spec_factories import make_et_main_detector_spec
+        from photsim7.specs import (
+            CatalogSpec,
+            CosmicRaySpec,
+            DetectorResponseSpec,
+            DvaSpec,
+            DynamicEffectsSpec,
+            MomentumDumpSpec,
+            PsdMotionSpec,
+            PsfBreathingSpec,
+            ThermalDriftSpec,
+        )
+
+        base = make_et_main_detector_spec(
+            shape=(int(self.frame_rows), int(self.frame_cols)),
+            detector_id=self.detector_id,
+            run_seed=int(run_seed),
+        )
+        exposure = float(self.exposure_s) * u.s
+        duration = int(self.n_frames) * exposure
+        pixel_scale = float(self.pixel_scale_arcsec_per_pix) * u.arcsec / u.pix
+        background_flux = sky_surface_brightness_to_background_flux(
+            float(self.sky_surface_brightness_mag_arcsec2),
+            pixel_scale,
+            magnitude_system="ET",
+            aperture_diameter=base.instrument.aperture_diameter,
+            optical_efficiency=float(self.optical_efficiency_ratio),
+            quantum_efficiency=float(self.quantum_efficiency_ratio),
+        )
+
+        reference_options = {
+            "reference_field_angle_deg": float(self.synthetic_psf_field_angle_deg),
+            "reference_field_polar_angle_rad": float(
+                np.arctan2(self.target_field_y_deg, self.target_field_x_deg)
+            ),
+            "metadata": {
+                "default_field_angle_deg": float(self.synthetic_psf_field_angle_deg)
+            },
+        }
+        if self.star_source == "gaia_main_rd":
+            source_type = "et_focalplane_query"
+            resolved_source_path = GAIA_CATALOG_DIR if source_path is None else source_path
+            resolved_registry = (
+                ET_FOCALPLANE_ROOT / "data"
+                if registry_data_dir is None
+                else registry_data_dir
+            )
+            query_options = {
+                "apply_offset": False,
+                "mag_lim": float(self.mag_limit),
+                "detector_id": self.detector_id,
+                "crop_to_simulation_frame": True,
+                "crop_margin_pix": float(crop_margin_pix),
+                "et_focalplane_src": str(ET_FOCALPLANE_ROOT / "src"),
+            }
+            source_id_column = "source_id"
+            magnitude_column = "g_mean_mag"
+            x_column = "x0"
+            y_column = "y0"
+        elif self.star_source == "synthetic_mag_distribution":
+            source_type = "synthetic_mag_distribution"
+            resolved_source_path = (
+                self.mag_distribution_csv if source_path is None else source_path
+            )
+            resolved_registry = ""
+            query_options = dict(reference_options)
+            query_options["mag_limit"] = float(self.mag_limit)
+            source_id_column = None
+            magnitude_column = self.mag_distribution_column
+            x_column = "x0"
+            y_column = "y0"
+        else:
+            source_type = "detector_xy_csv"
+            resolved_source_path = (
+                self.detector_xy_csv if source_path is None else source_path
+            )
+            resolved_registry = ""
+            query_options = dict(reference_options)
+            source_id_column = self.detector_xy_source_id_column
+            magnitude_column = self.detector_xy_mag_column
+            x_column = self.detector_xy_x_column
+            y_column = self.detector_xy_y_column
+
+        bundle_name = str(self.psf_bundle_name).strip()
+        if not bundle_name.lower().startswith("kp_") and not bundle_name.startswith(
+            "psf/"
+        ):
+            bundle_name = f"psf/et/{bundle_name}"
+
+        return replace(
+            base,
+            observation=replace(
+                base.observation,
+                exposure_duration=exposure,
+                readout_duration=0 * u.s,
+                observing_duration=duration,
+                simulation_cadence_mult=1,
+            ),
+            instrument=replace(
+                base.instrument,
+                telescope_count=1,
+                optical_efficiency=float(self.optical_efficiency_ratio) * 100 * u.percent,
+                quantum_efficiency=float(self.quantum_efficiency_ratio) * 100 * u.percent,
+            ),
+            detector=replace(
+                base.detector,
+                shape=(int(self.frame_rows), int(self.frame_cols)),
+                pixel_width=float(self.pixel_width_um) * u.um,
+                pixel_scale=pixel_scale,
+                n_subpixels=int(self.n_subpixels),
+            ),
+            readout=replace(
+                base.readout,
+                enable_adc_digitization=True,
+                full_well_electrons=float(self.full_well_electrons) * u.electron,
+                readout_noise=float(self.readout_noise_e_pix) * u.electron / u.pix,
+                gain_electrons_per_adu=(
+                    float(self.gain_electrons_per_adu) * u.electron / u.adu
+                ),
+                adc_bit_depth=int(self.adc_bit_depth),
+                adc_min_value=0.0,
+                adc_round_values=True,
+                bias_level_adu=float(self.bias_level_adu) * u.adu,
+                column_noise_sigma_adu=float(self.column_noise_sigma_adu) * u.adu,
+                save_bias_metadata=True,
+            ),
+            sky=replace(
+                base.sky,
+                background_flux=background_flux,
+                sky_background_mode="surface_brightness",
+                sky_background_surface_brightness=(
+                    float(self.sky_surface_brightness_mag_arcsec2)
+                ),
+                sky_background_magnitude_system="ET",
+                dark_current=(
+                    float(self.dark_current_e_s_pix) * u.electron / u.s / u.pix
+                ),
+                scattered_light=(
+                    float(self.scattered_light_e_s_pix)
+                    * u.electron
+                    / u.s
+                    / u.pix
+                ),
+                subtract_nonstellar_mean=False,
+            ),
+            catalog=CatalogSpec(
+                source_type=source_type,
+                source_path=str(resolved_source_path),
+                source_id_column=source_id_column,
+                magnitude_column=magnitude_column,
+                x_column=x_column,
+                y_column=y_column,
+                input_magnitude_system="Gaia_G",
+                photon_magnitude_system="ET",
+                magnitude_conversion="gaia_g_vega_equals_et_ab_g2v_approx",
+                background_stars_max_mag=float(self.mag_limit),
+                target_max_offset=0 * u.pix,
+                telescope_fov_max_offset=0 * u.pix,
+                target_ra_deg=float(self.target_ra_deg),
+                target_dec_deg=float(self.target_dec_deg),
+                target_detector_xpix=float(self.target_detector_xpix),
+                target_detector_ypix=float(self.target_detector_ypix),
+                registry_data_dir=str(resolved_registry),
+                cache_path="" if cache_path is None else str(cache_path),
+                query_options=query_options,
+                inject_transits=False,
+                optimal_aperture_algorithm="Kepler",
+            ),
+            detector_response=DetectorResponseSpec(
+                enable_inter_pixel_response=True,
+                inter_prv_rms=float(self.inter_pixel_response_sigma) * 100 * u.percent,
+                inter_prv_nominal=100 * u.percent,
+                enable_intra_pixel_response=True,
+                intra_prv_rms=float(self.intra_pixel_response_sigma) * 100 * u.percent,
+                enable_pixel_phase_response=True,
+                pixel_response_profile_mod="flux conserved",
+                pixel_phase_profile_path=(
+                    "detector/pixel_response_profile_teff5500_feh-0.1_"
+                    "logg4.4_pfc_v240423.npy"
+                ),
+                scripted_sensitivity_enabled=False,
+                whole_pixel_gain_normal_enabled=False,
+                whole_pixel_gain_sinusoidal_enabled=False,
+                enable_flat_field_correction=False,
+                flat_field_uncertainty=0 * u.percent,
+            ),
+            cosmic_rays=CosmicRaySpec(
+                enabled=True,
+                event_library_path=self.cosmic_ray_library_path,
+                event_library_pixel_size=float(self.cosmic_ray_pixel_size_um) * u.um,
+                event_rate=(
+                    float(self.cosmic_ray_event_rate_cm2_s) / (u.cm**2 * u.s)
+                ),
+                seed=0,
+            ),
+            psf=replace(
+                base.psf,
+                bundle_name=bundle_name,
+                field_id="nearest",
+                field_id_policy=None,
+                use_jitter_integrated_psf=bool(self.use_jitter_integrated_psf),
+                n_jitter_integrated_psf_models=(
+                    int(self.n_jitter_integrated_psf_models)
+                ),
+                n_jitter_frames_per_model=int(self.n_jitter_frames_per_model),
+                compute_device=str(compute_device),
+                float_precision=32,
+                warp_frame_batch_size=10,
+                pad_to_detector_shape=False,
+            ),
+            dynamic_effects=DynamicEffectsSpec(
+                psd_motion=PsdMotionSpec(
+                    enabled=bool(self.enable_psd_motion),
+                    profile="et_attitude_xyz",
+                    et_psd_path=str(self.psd_motion_path),
+                    split_hz=float(self.motion_split_hz),
+                ),
+                dva=DvaSpec(enabled=bool(self.enable_dva_drift)),
+                thermal_drift=ThermalDriftSpec(
+                    enabled=bool(self.enable_thermal_drift),
+                    profile=(
+                        "main_rd_reference" if self.enable_thermal_drift else None
+                    ),
+                    time_policy="normalized_observation_phase",
+                ),
+                momentum_dump=MomentumDumpSpec(
+                    enabled=bool(self.enable_momentum_dump),
+                    profile=self.momentum_dump_model,
+                    cycle=float(self.momentum_dump_cycle_day) * u.day,
+                    legacy_radius_arcsec=(
+                        float(self.momentum_dump_r68_arcsec) * u.arcsec
+                    ),
+                ),
+                psf_breathing=PsfBreathingSpec(
+                    enabled=bool(self.enable_psf_breathing),
+                    profile=(
+                        "main_rd_reference" if self.enable_psf_breathing else None
+                    ),
+                    time_policy="normalized_observation_phase",
+                ),
+            ),
+        )
 
 
 def ensure_local_imports() -> None:
@@ -242,122 +530,25 @@ def sim_config_dict(
     n_subpixels: int | None = None,
     scattered_light_e_s_pix: float | None = None,
 ) -> dict[str, Any]:
-    ensure_local_imports()
-    from photsim7.background import sky_surface_brightness_to_background_flux
-
     if spec is None:
-        pixel_scale = PIXEL_SCALE
-        pixel_width = PIXEL_WIDTH
-        exposure = EXPOSURE
-        observing_duration = OBSERVING_DURATION
-        sky_surface_brightness_mag_arcsec2 = (
-            SKY_SURFACE_BRIGHTNESS
-            if sky_surface_brightness_mag_arcsec2 is None
-            else float(sky_surface_brightness_mag_arcsec2)
+        spec = MainRdRunSpec(
+            frame_rows=int(frame_rows),
+            frame_cols=int(frame_cols),
         )
-        n_subpixels = N_SUBPIXELS if n_subpixels is None else int(n_subpixels)
-        scattered_light_e_s_pix = (
-            0.0 if scattered_light_e_s_pix is None else float(scattered_light_e_s_pix)
+    if (int(frame_rows), int(frame_cols)) != (spec.frame_rows, spec.frame_cols):
+        raise ValueError("frame_rows/frame_cols conflict with MainRdRunSpec")
+    overrides: dict[str, Any] = {}
+    if sky_surface_brightness_mag_arcsec2 is not None:
+        overrides["sky_surface_brightness_mag_arcsec2"] = float(
+            sky_surface_brightness_mag_arcsec2
         )
-        dark_current = DARK_CURRENT
-        readout_noise = READOUT_NOISE
-        full_well_electrons = FULL_WELL_ELECTRONS
-        gain_electrons_per_adu = GAIN_ELECTRONS_PER_ADU
-        adc_bit_depth = ADC_BIT_DEPTH
-        bias_level_adu = BIAS_LEVEL_ADU
-        column_noise_sigma_adu = COLUMN_NOISE_SIGMA_ADU
-        cosmic_ray_library_path = COSMIC_RAY_LIBRARY_PATH
-        cosmic_ray_pixel_size = COSMIC_RAY_PIXEL_SIZE
-        cosmic_ray_event_rate = COSMIC_RAY_EVENT_RATE
-        psf_bundle_name = PSF_BUNDLE_NAME
-        use_jitter_integrated_psf = True
-        n_jitter_integrated_psf_models = JITTER_INTEGRATED_PSF_MODELS
-        n_jitter_frames_per_model = JITTER_FRAMES_PER_MODEL
-    else:
-        pixel_scale = float(spec.pixel_scale_arcsec_per_pix) * u.arcsec / u.pix
-        pixel_width = float(spec.pixel_width_um) * u.um
-        exposure = float(spec.exposure_s) * u.s
-        observing_duration = float(spec.observing_duration_s) * u.s
-        sky_surface_brightness_mag_arcsec2 = (
-            float(spec.sky_surface_brightness_mag_arcsec2)
-            if sky_surface_brightness_mag_arcsec2 is None
-            else float(sky_surface_brightness_mag_arcsec2)
-        )
-        n_subpixels = int(spec.n_subpixels if n_subpixels is None else n_subpixels)
-        scattered_light_e_s_pix = (
-            float(spec.scattered_light_e_s_pix)
-            if scattered_light_e_s_pix is None
-            else float(scattered_light_e_s_pix)
-        )
-        dark_current = float(spec.dark_current_e_s_pix) * u.electron / u.s / u.pix
-        readout_noise = float(spec.readout_noise_e_pix) * u.electron / u.pix
-        full_well_electrons = float(spec.full_well_electrons)
-        gain_electrons_per_adu = float(spec.gain_electrons_per_adu)
-        adc_bit_depth = int(spec.adc_bit_depth)
-        bias_level_adu = float(spec.bias_level_adu)
-        column_noise_sigma_adu = float(spec.column_noise_sigma_adu)
-        cosmic_ray_library_path = spec.cosmic_ray_library_path
-        cosmic_ray_pixel_size = float(spec.cosmic_ray_pixel_size_um) * u.um
-        cosmic_ray_event_rate = float(spec.cosmic_ray_event_rate_cm2_s) / (u.cm**2 * u.s)
-        psf_bundle_name = spec.psf_bundle_name
-        use_jitter_integrated_psf = bool(spec.use_jitter_integrated_psf)
-        n_jitter_integrated_psf_models = int(spec.n_jitter_integrated_psf_models)
-        n_jitter_frames_per_model = int(spec.n_jitter_frames_per_model)
-
-    background_flux = sky_surface_brightness_to_background_flux(
-        sky_surface_brightness_mag_arcsec2,
-        pixel_scale,
-        magnitude_system="ET",
-    )
-    return {
-        "Detector Width": int(frame_cols) * u.pix,
-        "Detector Height": int(frame_rows) * u.pix,
-        "Subpixels Per Pixel Dim": int(n_subpixels),
-        "Pixel Scale": pixel_scale,
-        "Pixel Width": pixel_width,
-        "Exposure Duration": exposure,
-        "Observing Duration": observing_duration,
-        "Simulation Cadence Mult": 1,
-        "Background Flux": background_flux,
-        "Sky Background Mode": "surface_brightness",
-        "Sky Background Surface Brightness": sky_surface_brightness_mag_arcsec2,
-        "Sky Background Magnitude System": "ET",
-        "Subtract Nonstellar Mean": False,
-        "Dark Current": dark_current,
-        "Scattered Light": float(scattered_light_e_s_pix) * u.electron / u.s / u.pix,
-        "Readout Noise": readout_noise,
-        "Enable ADC Digitization": True,
-        "Full Well Electrons": full_well_electrons * u.electron,
-        "Gain Electrons Per ADU": gain_electrons_per_adu * u.electron / u.adu,
-        "ADC Bit Depth": adc_bit_depth,
-        "ADC Min Value": 0.0,
-        "ADC Round Values": True,
-        "Bias Level ADU": bias_level_adu * u.adu,
-        "Column Noise Sigma ADU": column_noise_sigma_adu * u.adu,
-        "Save Bias Metadata": True,
-        "Enable Cosmic Rays": True,
-        "Cosmic Ray Event Library Path": cosmic_ray_library_path,
-        "Cosmic Ray Event Library Pixel Size": cosmic_ray_pixel_size,
-        "Cosmic Ray Event Rate": cosmic_ray_event_rate,
-        "Cosmic Ray Seed": 0,
-        "Inter-PRV (RMS)": 1.0 * u.percent,
-        "Inter-PRV (Nominal)": 100.0 * u.percent,
-        "Intra-PRV (RMS)": 1.0 * u.percent,
-        "Pixel Response Profile Mod": "flux conserved",
-        "Enable Flat Field Correction": False,
-        "Flat Field Uncertainty": 0.0 * u.percent,
-        "Enable DVA Drifts": False,
-        "Thermal Defocus Model": "none",
-        "Thermal Defocus Amplitude": 0.0 * u.percent,
-        "Thermal Defocus Offset": 100.0 * u.percent,
-        "PSF Bundle Name": psf_bundle_name,
-        "PSF Field ID": "nearest",
-        "Use Jitter-Integrated PSF": use_jitter_integrated_psf,
-        "N Jitter-Integrated PSF Models": n_jitter_integrated_psf_models,
-        "N Jitter Frames Per Model": n_jitter_frames_per_model,
-        "Telescope Count": 1,
-        "Optical Efficiency Ratio": 101.0 * u.percent,
-    }
+    if n_subpixels is not None:
+        overrides["n_subpixels"] = int(n_subpixels)
+    if scattered_light_e_s_pix is not None:
+        overrides["scattered_light_e_s_pix"] = float(scattered_light_e_s_pix)
+    if overrides:
+        spec = replace(spec, **overrides)
+    return spec.to_simulation_spec().to_config_dict()
 
 
 _ET_REGISTRY_CACHE = None
