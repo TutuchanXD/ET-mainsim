@@ -1807,9 +1807,66 @@ def plot_preview(image_dn: np.ndarray, preview_path: Path, *, title: str) -> Non
     plt.close(fig)
 
 
+def _as_numpy(value: Any) -> np.ndarray:
+    if hasattr(value, "detach") and callable(value.detach):
+        value = value.detach()
+    if hasattr(value, "cpu") and callable(value.cpu):
+        value = value.cpu()
+    if hasattr(value, "numpy") and callable(value.numpy):
+        value = value.numpy()
+    return np.asarray(value)
+
+
+def _select_brightest_catalog(catalog, max_stars: int | None):
+    if max_stars is None or catalog.n_sources <= int(max_stars):
+        return catalog
+    ensure_local_imports()
+    from photsim7.catalog_sources import PreparedStarCatalog
+
+    max_stars = int(max_stars)
+    if max_stars <= 0:
+        raise ValueError("max_stars must be positive when provided")
+    order = np.argsort(star_et_magnitude(dict(catalog.star_data)))[:max_stars]
+    selected: dict[str, Any] = {}
+    for key, value in catalog.star_data.items():
+        array = np.asarray(value)
+        if array.ndim == 1 and len(array) == catalog.n_sources:
+            selected[key] = array[order]
+        else:
+            selected[key] = value
+    return PreparedStarCatalog(
+        star_data=selected,
+        metadata={
+            **dict(catalog.metadata),
+            "et_mainsim_selection": {
+                "policy": "brightest",
+                "max_stars": max_stars,
+                "input_n_sources": int(catalog.n_sources),
+                "output_n_sources": int(len(order)),
+            },
+        },
+        schema_id=catalog.schema_id,
+        schema_version=catalog.schema_version,
+    )
+
+
+def _legacy_cosmic_mask(mask: Any) -> np.ndarray:
+    array = _as_numpy(mask)
+    if array.ndim == 3 and array.shape[0] == 1:
+        return array[0]
+    return array
+
+
 def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
     ensure_local_imports()
     torch = require_torch()
+    from photsim7.catalog_sources import StarCatalogCache
+    from photsim7.full_frame_artifacts import (
+        FullFrameArtifactOptions,
+        FullFrameArtifactWriter,
+    )
+    from photsim7.full_frame_pipeline import run_single_cadence_full_frame
+
     frame_indices = selected_frame_indices(args.frame_indices, args.frames)
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
@@ -1829,97 +1886,37 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
         path.mkdir(parents=True, exist_ok=True)
 
     cache_path = Path(args.star_cache).expanduser()
-    star_data, cache_metadata = load_star_cache(cache_path)
-    if args.max_stars is not None:
-        star_data = select_brightest(star_data, args.max_stars)
+    catalog = _select_brightest_catalog(
+        StarCatalogCache.read(cache_path),
+        args.max_stars,
+    )
+    services = build_main_rd_services(args, spec, catalog)
+    typed_spec = services.spec
 
     if args.device.startswith("cuda"):
         torch.cuda.set_device(0)
         torch.cuda.reset_peak_memory_stats()
-    torch.manual_seed(int(args.seed))
-    np.random.seed(int(args.seed))
-
-    effect_arrays, effect_metadata = build_full_effect_timeseries(
-        n_frames=int(args.frames),
-        seed=int(args.seed),
-        enable_psd_motion=bool(args.enable_psd_motion),
-        psd_motion_path=args.psd_motion_path,
-        enable_dva=bool(args.enable_dva_drift),
-        enable_thermal=bool(args.enable_thermal_drift),
-        enable_momentum_dump=bool(args.enable_momentum_dump),
-        enable_psf_breathing=bool(args.enable_psf_breathing),
-        exposure_s=float(spec.exposure_s),
-    )
-    xy_jitter_pix, jitter_metadata = jitter_integrated_psf_offsets(
-        seed=int(args.seed) + 1999,
-        enable_psd_motion=bool(args.enable_psd_motion),
-        enable_jitter_integrated_psf=bool(args.jitter_integrated_psf),
-        psd_motion_path=args.psd_motion_path,
-        n_models=int(args.jitter_psf_models),
-        n_frames_per_model=int(args.jitter_frames_per_model),
-        exposure_s=float(spec.exposure_s),
-    )
-
-    psf_manager, psf_field_ids, psf_field_id_counts = build_psf_manager(
-        frame_rows=spec.frame_rows,
-        frame_cols=spec.frame_cols,
-        device=args.device,
-        star_data=star_data,
-        n_subpixels=int(spec.n_subpixels),
-        psf_bundle_name=spec.psf_bundle_name,
-        pixel_scale_arcsec_per_pix=float(spec.pixel_scale_arcsec_per_pix),
-        integrate_jitter=bool(args.jitter_integrated_psf),
-        xy_jitter_pix=xy_jitter_pix,
-        n_jitter_integrated_psf_models=int(args.jitter_psf_models),
-        n_jitter_frames_per_model=int(args.jitter_frames_per_model),
-    )
-    stars = build_star_catalog(
-        star_data=star_data,
-        frame_rows=spec.frame_rows,
-        frame_cols=spec.frame_cols,
-        psf_field_ids=psf_field_ids,
-        frame_exposure_s=float(spec.exposure_s),
-    )
-    detector_response_sampler = None
-    if not args.no_detector_response:
-        detector_response_sampler = build_detector_response_sampler(
-            frame_rows=spec.frame_rows,
-            frame_cols=spec.frame_cols,
-            n_subpixels=int(spec.n_subpixels),
-            device=args.device,
-            seed=int(args.seed),
-        )
-    run_sim_config = sim_config_dict(spec.frame_rows, spec.frame_cols, spec=spec)
-    renderer = make_renderer(
-        sim_config=run_sim_config,
-        frame_exposure_s=float(spec.exposure_s),
-        device=args.device,
-        stars=stars,
-        psf_model_manager=psf_manager,
-        detector_response_sampler=detector_response_sampler,
-    )
-    background_flux_per_pixel = run_sim_config["Background Flux"]
-    dark_current_per_pixel = run_sim_config["Dark Current"]
-    cosmic_ray_library = load_cosmic_ray_event_library(spec)
-
-    base_x = np.asarray(stars["Detector Xpix Shifted"], dtype=np.float64)
-    base_y = np.asarray(stars["Detector Ypix Shifted"], dtype=np.float64)
+    effect_arrays = services.effect_timeseries.to_arrays()
+    effect_metadata = services.effect_timeseries.to_metadata()
     if int(args.worker_rank) == 0:
         np.savez_compressed(run_dir / "effects_timeseries.npz", **effect_arrays)
+        write_json(run_dir / "effects_timeseries.metadata.json", effect_metadata)
 
     worker_summary = {
         "spec": asdict(spec),
+        "simulation_spec": typed_spec.to_json_dict(),
+        "compatibility_adapter": "MainRdRunSpec",
         "args": vars(args),
         "rank": int(args.worker_rank),
         "world_size": int(args.worker_world_size),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "device": args.device,
         "star_cache": str(cache_path),
-        "star_cache_metadata": cache_metadata,
-        "rendered_star_summary": star_summary(star_data),
-        "psf_field_id_counts": psf_field_id_counts,
+        "star_cache_metadata": dict(catalog.metadata),
+        "rendered_star_summary": star_summary(dict(catalog.star_data)),
+        "psf": dict(services.psf_result.provenance),
+        "services": dict(services.provenance),
         "effects": effect_metadata,
-        "jitter_integrated_psf": jitter_metadata,
         "gpu_memory_before": gpu_memory_snapshot(),
     }
     write_json(run_dir / f"worker_{args.worker_rank:02d}_start.json", worker_summary)
@@ -1940,118 +1937,92 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
             continue
 
         frame_start = time.perf_counter()
-        frame_seed = int(args.seed) + frame_index * 1009
-        torch.manual_seed(frame_seed)
-        if args.device.startswith("cuda"):
-            torch.cuda.manual_seed_all(frame_seed)
-            torch.cuda.synchronize()
-
-        offset_x, offset_y = effect_arrays["total_motion_pix"][frame_index]
-        psf_scale = float(effect_arrays["psf_scale"][frame_index])
-        jitter_model_index = (
-            int(frame_index) % int(args.jitter_psf_models)
-            if bool(args.jitter_integrated_psf)
-            else None
-        )
         scattered_light_per_pixel = scattered_light_for_frame(spec, frame_index)
-        render_start = time.perf_counter()
-        components = renderer.render_single_cadence(
-            enable_stellar_photon_noise=True,
-            enable_background_light=True,
-            enable_scattered_light=bool(scattered_light_per_pixel.value != 0.0),
-            enable_dark_current=True,
-            enable_readout_noise=False,
-            background_flux_per_pixel=background_flux_per_pixel,
-            scattered_light_per_pixel=scattered_light_per_pixel,
-            dark_current_per_pixel=dark_current_per_pixel,
-            readout_noise=0.0 * u.electron / u.pix,
-            subtract_nonstellar_mean=False,
-            star_x_positions_pix=base_x + float(offset_x),
-            star_y_positions_pix=base_y + float(offset_y),
-            star_psf_scales=np.full(len(stars), psf_scale, dtype=np.float32),
-            jitter_model_index=jitter_model_index,
-            progress=bool(args.progress),
-            return_numpy=False,
+        artifact_writer = FullFrameArtifactWriter(
+            run_dir,
+            options=FullFrameArtifactOptions(
+                save_frame_summaries=True,
+                save_cosmic_events=True,
+                save_bias=bool(args.save_column_noise),
+                save_preview=frame_index < int(args.preview_count),
+            ),
         )
-        if args.device.startswith("cuda"):
-            torch.cuda.synchronize()
-        render_elapsed = time.perf_counter() - render_start
-
-        electronics_start = time.perf_counter()
-        image_dn, cosmic_payload, col_noise, mean_events = apply_detector_chain(
-            image_electrons=components["final_image"],
+        pipeline_start = time.perf_counter()
+        result = run_single_cadence_full_frame(
+            typed_spec,
+            services=services,
             frame_index=frame_index,
-            frame_rows=spec.frame_rows,
-            frame_cols=spec.frame_cols,
-            seed=int(args.seed),
-            spec=spec,
-            cosmic_ray_library=cosmic_ray_library,
+            renderer_options={
+                "enable_stellar_photon_noise": True,
+                "enable_background_light": True,
+                "enable_scattered_light": bool(
+                    scattered_light_per_pixel.value != 0.0
+                ),
+                "enable_dark_current": True,
+                "scattered_light_per_pixel": scattered_light_per_pixel,
+                "progress": bool(args.progress),
+            },
+            worker_rank=int(args.worker_rank),
+            rng_trace_scope={"run_label": run_dir.name},
+            artifact_writer=artifact_writer,
         )
         if args.device.startswith("cuda"):
             torch.cuda.synchronize()
-        electronics_elapsed = time.perf_counter() - electronics_start
+        pipeline_elapsed = time.perf_counter() - pipeline_start
 
-        image_np = image_dn.detach().cpu().numpy()
-        np.save(frame_path, image_np)
-        np.save(events_dir / f"frame_{frame_index:06d}_events.npy", cosmic_payload.events)
-        if args.save_column_noise:
-            np.save(
-                bias_dir / f"frame_{frame_index:06d}_column_noise_adu.npy",
-                col_noise.detach().cpu().numpy(),
-            )
-        if args.save_cosmic_mask:
-            np.save(
-                events_dir / f"frame_{frame_index:06d}_mask.npy",
-                cosmic_payload.mask[0],
-            )
+        image_np = _as_numpy(result.frame_products.final_frame.array)
+        cosmic_payload = result.detector_result.cosmic_metadata
+        if args.save_cosmic_mask and cosmic_payload is not None:
+            mask = getattr(cosmic_payload, "mask", None)
+            if mask is not None:
+                np.save(
+                    events_dir / f"frame_{frame_index:06d}_mask.npy",
+                    _legacy_cosmic_mask(mask),
+                )
         if args.save_stellar_mean:
+            stellar_mean = result.renderer_components.get("stellar_mean")
+            if stellar_mean is None:
+                raise KeyError(
+                    "Photsim7 pipeline did not return the stellar_mean component"
+                )
             np.save(
                 frames_dir / f"frame_{frame_index:06d}_stellar_mean_e.npy",
-                components["stellar_mean"].detach().cpu().numpy().astype(np.float32),
+                _as_numpy(stellar_mean).astype(np.float32),
             )
 
-        if frame_index < int(args.preview_count):
-            plot_preview(
-                image_np,
-                preview_dir / f"frame_{frame_index:06d}.png",
-                title=(
-                    f"main_rd {spec.frame_cols}x{spec.frame_rows} G<{args.mag_limit:g} "
-                    f"frame {frame_index}"
-                ),
-            )
+        package_summary = dict(result.frame_products.frame_summary or {})
+        package_schema_path = result.artifact_paths.get("frame_product_schema")
+        actual_events = int(package_summary.get("actual_cosmic_events", 0))
+        cosmic_mask_pixels = int(package_summary.get("cosmic_mask_pixels", 0))
 
         peak_allocated_mb = (
-            torch.cuda.max_memory_allocated() / 1024**2 if args.device.startswith("cuda") else None
+            torch.cuda.max_memory_allocated() / 1024**2
+            if args.device.startswith("cuda")
+            else None
         )
         peak_reserved_mb = (
-            torch.cuda.max_memory_reserved() / 1024**2 if args.device.startswith("cuda") else None
+            torch.cuda.max_memory_reserved() / 1024**2
+            if args.device.startswith("cuda")
+            else None
         )
         frame_summary = {
+            "artifact_schema_version": 1,
             "frame_index": int(frame_index),
             "rank": int(args.worker_rank),
             "device": args.device,
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-            "n_stars": int(len(stars)),
-            "render_elapsed_s": float(render_elapsed),
-            "electronics_elapsed_s": float(electronics_elapsed),
+            "n_stars": int(catalog.n_sources),
+            "pipeline_elapsed_s": float(pipeline_elapsed),
             "total_elapsed_s": float(time.perf_counter() - frame_start),
-            "motion_offset_x_pix": float(offset_x),
-            "motion_offset_y_pix": float(offset_y),
-            "psf_scale": float(psf_scale),
             "scattered_light_e_s_pix": float(scattered_light_per_pixel.value),
             "scattered_light_e_pix_frame": float(
                 scattered_light_per_pixel.value * float(spec.exposure_s)
             ),
-            "effect_components": {
-                "psd_drift_pix": effect_arrays["psd_drift_pix"][frame_index],
-                "dva_drift_pix": effect_arrays["dva_drift_pix"][frame_index],
-                "thermal_drift_pix": effect_arrays["thermal_drift_pix"][frame_index],
-                "momentum_dump_pix": effect_arrays["momentum_dump_pix"][frame_index],
-            },
-            "jitter_model_index": None if jitter_model_index is None else int(jitter_model_index),
-            "mean_cosmic_events_per_frame": float(mean_events),
-            "actual_cosmic_events": int(len(cosmic_payload.events)),
-            "cosmic_mask_pixels": int(np.count_nonzero(cosmic_payload.mask)),
+            "mean_cosmic_events_per_frame": float(
+                package_summary.get("mean_cosmic_events_per_frame", 0.0)
+            ),
+            "actual_cosmic_events": actual_events,
+            "cosmic_mask_pixels": cosmic_mask_pixels,
             "image_dtype": str(image_np.dtype),
             "image_min": int(np.min(image_np)),
             "image_p50": float(np.percentile(image_np, 50)),
@@ -2064,15 +2035,20 @@ def run_worker(args: argparse.Namespace, spec: MainRdRunSpec) -> None:
             "peak_cuda_allocated_mb": peak_allocated_mb,
             "peak_cuda_reserved_mb": peak_reserved_mb,
             "frame_path": str(frame_path),
+            "package_schema_path": (
+                None if package_schema_path is None else str(package_schema_path)
+            ),
+            "package_frame_summary": package_summary,
+            "package_provenance": dict(result.provenance),
         }
         write_json(summary_path, frame_summary)
         print(
             f"[Worker {args.worker_rank}] frame={frame_index:06d} "
-            f"render={render_elapsed:.2f}s electronics={electronics_elapsed:.2f}s "
-            f"events={len(cosmic_payload.events)} sat={frame_summary['saturated_pixels']}"
+            f"pipeline={pipeline_elapsed:.2f}s events={actual_events} "
+            f"sat={frame_summary['saturated_pixels']}"
         )
 
-        del components, image_dn, image_np, cosmic_payload, col_noise
+        del result, image_np
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
 
