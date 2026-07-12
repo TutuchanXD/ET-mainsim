@@ -874,6 +874,14 @@ def test_build_main_rd_services_delegates_runtime_overrides(monkeypatch, tmp_pat
     assert typed.observation.observing_duration == 20 * u.s
     assert typed.catalog.source_type == "et_focalplane_query"
     assert typed.catalog.background_stars_max_mag == 17.0
+    assert typed.catalog.query_options["reference_field_angle_deg"] == pytest.approx(
+        run_spec.target_field_angle_deg
+    )
+    assert typed.catalog.query_options[
+        "reference_field_polar_angle_rad"
+    ] == pytest.approx(
+        np.arctan2(run_spec.target_field_y_deg, run_spec.target_field_x_deg)
+    )
     assert typed.rng.run_seed == 456
     assert typed.psf.compute_device == "cpu"
     assert typed.psf.use_jitter_integrated_psf is False

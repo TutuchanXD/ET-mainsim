@@ -273,6 +273,12 @@ class MainRdRunSpec:
                 "crop_to_simulation_frame": True,
                 "crop_margin_pix": float(crop_margin_pix),
                 "et_focalplane_src": str(ET_FOCALPLANE_ROOT / "src"),
+                "reference_field_angle_deg": float(
+                    self.target_field_angle_deg
+                ),
+                "reference_field_polar_angle_rad": float(
+                    np.arctan2(self.target_field_y_deg, self.target_field_x_deg)
+                ),
             }
             source_id_column = "source_id"
             magnitude_column = "g_mean_mag"
