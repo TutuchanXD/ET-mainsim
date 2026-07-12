@@ -675,11 +675,10 @@ def star_summary(star_data: dict[str, Any]) -> dict[str, Any]:
 
 
 def star_et_magnitude(star_data: dict[str, Any]) -> np.ndarray:
-    if "et_mag" in star_data:
-        return np.asarray(star_data["et_mag"], dtype=float)
-    if "kp_mag" in star_data:
-        return np.asarray(star_data["kp_mag"], dtype=float)
-    raise KeyError("star_data must contain 'et_mag' or legacy 'kp_mag'")
+    ensure_local_imports()
+    from photsim7.photometry import normalize_magnitude_input
+
+    return normalize_magnitude_input(star_data, mag_type="ET").magnitude
 
 
 def star_data_for_photsim7_catalog(star_data: dict[str, Any]) -> dict[str, Any]:
@@ -916,26 +915,21 @@ def legacy_star_cache_path(output_root: Path, frame_rows: int, frame_cols: int, 
 
 
 def save_star_cache(path: Path, star_data: dict[str, Any], metadata: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    n_stars = len(star_data["x0"])
-    payload: dict[str, Any] = {}
-    for key, value in star_data.items():
-        arr = np.asarray(value)
-        if arr.ndim == 1 and len(arr) == n_stars:
-            payload[key] = arr
-    payload["__metadata_json__"] = np.array(json.dumps(metadata, default=_json_default))
-    np.savez_compressed(path, **payload)
+    ensure_local_imports()
+    from photsim7.catalog_sources import PreparedStarCatalog, StarCatalogCache
+
+    StarCatalogCache.write(
+        path,
+        PreparedStarCatalog(star_data=star_data, metadata=metadata),
+    )
 
 
 def load_star_cache(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    with np.load(path, allow_pickle=True) as data:
-        metadata = json.loads(str(data["__metadata_json__"].item()))
-        star_data = {
-            key: np.asarray(data[key])
-            for key in data.files
-            if key != "__metadata_json__"
-        }
-    return star_data, metadata
+    ensure_local_imports()
+    from photsim7.catalog_sources import StarCatalogCache
+
+    catalog = StarCatalogCache.read(path)
+    return dict(catalog.star_data), dict(catalog.metadata)
 
 
 def prepare_star_cache(args: argparse.Namespace, spec: MainRdRunSpec) -> Path:
@@ -945,92 +939,39 @@ def prepare_star_cache(args: argparse.Namespace, spec: MainRdRunSpec) -> Path:
         print(f"[Star cache] reuse {cache_path}")
         return cache_path
 
+    ensure_local_imports()
+    from photsim7.catalog_sources import StarCatalogCache
+    from photsim7.data_registry import DataRegistry
+    from photsim7.simulation_services import build_catalog_from_spec
+
     start = time.perf_counter()
-    if spec.star_source == "gaia_main_rd":
-        print(
-            "[Star cache] querying Gaia catalog "
-            f"detector={DETECTOR_ID} frame={spec.frame_cols}x{spec.frame_rows} G<{args.mag_limit:g}"
-        )
-        star_data = query_main_rd_stars(
-            frame_rows=spec.frame_rows,
-            frame_cols=spec.frame_cols,
-            mag_limit=args.mag_limit,
-            catalog_dir=args.catalog_dir,
-            crop_margin_pix=args.crop_margin_pix,
-        )
-        source_metadata = {
-            "star_source": spec.star_source,
-            "catalog_dir": str(Path(args.catalog_dir).expanduser()),
-            "crop_margin_pix": float(args.crop_margin_pix),
-        }
-    elif spec.star_source == "synthetic_mag_distribution":
-        print(
-            "[Star cache] building synthetic magnitude-distribution catalog "
-            f"frame={spec.frame_cols}x{spec.frame_rows} {spec.mag_distribution_column}<={args.mag_limit:g} "
-            f"csv={spec.mag_distribution_csv}"
-        )
-        star_data = build_synthetic_mag_distribution_stars(
-            csv_path=spec.mag_distribution_csv,
-            mag_column=spec.mag_distribution_column,
-            mag_limit=args.mag_limit,
-            frame_rows=spec.frame_rows,
-            frame_cols=spec.frame_cols,
-            seed=int(args.seed),
-            psf_field_angle_deg=float(spec.synthetic_psf_field_angle_deg),
-        )
-        source_metadata = {
-            "star_source": spec.star_source,
-            "mag_distribution_csv": str(Path(spec.mag_distribution_csv).expanduser()),
-            "mag_distribution_column": spec.mag_distribution_column,
-            "gaia_g_mag_treated_as_et_mag": True,
-            "synthetic_position_seed": int(args.seed),
-            "synthetic_position_model": "uniform independent x/y centers within the image bounds",
-            "synthetic_psf_field_angle_deg": float(spec.synthetic_psf_field_angle_deg),
-        }
-    elif spec.star_source == "detector_xy_csv":
-        print(
-            "[Star cache] building detector-xy catalog "
-            f"frame={spec.frame_cols}x{spec.frame_rows} csv={spec.detector_xy_csv}"
-        )
-        star_data = build_detector_xy_stars(
-            csv_path=spec.detector_xy_csv,
-            frame_rows=spec.frame_rows,
-            frame_cols=spec.frame_cols,
-            psf_field_angle_deg=float(spec.synthetic_psf_field_angle_deg),
-            source_id_column=spec.detector_xy_source_id_column,
-            mag_column=spec.detector_xy_mag_column,
-            x_column=spec.detector_xy_x_column,
-            y_column=spec.detector_xy_y_column,
-        )
-        source_metadata = {
-            "star_source": spec.star_source,
-            "detector_xy_csv": str(Path(spec.detector_xy_csv).expanduser()),
-            "detector_xy_source_id_column": spec.detector_xy_source_id_column,
-            "detector_xy_mag_column": spec.detector_xy_mag_column,
-            "detector_xy_x_column": spec.detector_xy_x_column,
-            "detector_xy_y_column": spec.detector_xy_y_column,
-            "gmag_used_directly_as_et_mag": True,
-            "position_model": (
-                "CSV x0/y0 are used directly as detector-centered pixel coordinates"
-            ),
-            "round_positions": False,
-            "reproject_positions": False,
-            "synthetic_psf_field_angle_deg": float(spec.synthetic_psf_field_angle_deg),
-        }
-    else:
-        raise ValueError(
-            f"Unsupported star_source={spec.star_source!r}; "
-            "expected 'gaia_main_rd', 'synthetic_mag_distribution', or 'detector_xy_csv'"
-        )
+    runtime_spec = replace(
+        spec,
+        mag_limit=float(args.mag_limit),
+    )
+    source_path = args.catalog_dir if spec.star_source == "gaia_main_rd" else None
+    typed_spec = runtime_spec.to_simulation_spec(
+        run_seed=int(args.seed),
+        source_path=source_path,
+        registry_data_dir=ET_FOCALPLANE_ROOT / "data",
+        crop_margin_pix=float(args.crop_margin_pix),
+    )
+    catalog = build_catalog_from_spec(
+        typed_spec,
+        data_registry=DataRegistry(data_root=PHOTSIM7_DATA_DIR),
+    )
     elapsed = time.perf_counter() - start
     metadata = {
         "spec": asdict(spec),
         "mag_limit": float(args.mag_limit),
         "query_elapsed_s": float(elapsed),
-        "summary": star_summary(star_data),
-        **source_metadata,
+        "summary": star_summary(dict(catalog.star_data)),
+        "star_source": spec.star_source,
+        "compatibility_adapter": "MainRdRunSpec",
+        "simulation_spec": typed_spec.to_json_dict(),
     }
-    save_star_cache(cache_path, star_data, metadata)
+    catalog = catalog.with_metadata(et_mainsim=metadata)
+    StarCatalogCache.write(cache_path, catalog)
     write_json(cache_path.with_suffix(".summary.json"), metadata)
     print(
         f"[Star cache] saved {cache_path} "
@@ -1047,6 +988,60 @@ def resolve_or_prepare_star_cache(args: argparse.Namespace, spec: MainRdRunSpec)
         print(f"[Star cache] reuse explicit {cache_path}")
         return cache_path
     return prepare_star_cache(args, spec)
+
+
+def _runtime_run_spec(args: argparse.Namespace, spec: MainRdRunSpec) -> MainRdRunSpec:
+    frames = int(args.frames)
+    return replace(
+        spec,
+        mag_limit=float(args.mag_limit),
+        n_frames=frames,
+        observing_duration_s=frames * float(spec.exposure_s),
+        use_jitter_integrated_psf=bool(args.jitter_integrated_psf),
+        n_jitter_integrated_psf_models=int(args.jitter_psf_models),
+        n_jitter_frames_per_model=int(args.jitter_frames_per_model),
+        enable_psd_motion=bool(args.enable_psd_motion),
+        psd_motion_path=str(args.psd_motion_path),
+        enable_dva_drift=bool(args.enable_dva_drift),
+        enable_thermal_drift=bool(args.enable_thermal_drift),
+        enable_momentum_dump=bool(args.enable_momentum_dump),
+        enable_psf_breathing=bool(args.enable_psf_breathing),
+        motion_split_hz=1.0 / float(spec.exposure_s),
+    )
+
+
+def build_main_rd_services(args: argparse.Namespace, spec: MainRdRunSpec, catalog):
+    """Build the reusable Photsim7 service bundle for one worker."""
+
+    ensure_local_imports()
+    from photsim7.data_registry import DataRegistry
+    from photsim7.simulation_services import build_full_frame_services
+
+    runtime_spec = _runtime_run_spec(args, spec)
+    source_path = args.catalog_dir if spec.star_source == "gaia_main_rd" else None
+    typed_spec = runtime_spec.to_simulation_spec(
+        run_seed=int(args.seed),
+        compute_device=str(args.device),
+        source_path=source_path,
+        registry_data_dir=ET_FOCALPLANE_ROOT / "data",
+        crop_margin_pix=float(args.crop_margin_pix),
+    )
+    if bool(args.no_detector_response):
+        typed_spec = replace(
+            typed_spec,
+            detector_response=replace(
+                typed_spec.detector_response,
+                enable_inter_pixel_response=False,
+                enable_intra_pixel_response=False,
+                enable_pixel_phase_response=False,
+            ),
+        )
+    return build_full_frame_services(
+        typed_spec,
+        frame_exposure=float(runtime_spec.exposure_s) * u.s,
+        catalog=catalog,
+        data_registry=DataRegistry(data_root=PHOTSIM7_DATA_DIR),
+    )
 
 
 def build_star_catalog(

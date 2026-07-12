@@ -720,6 +720,133 @@ def test_prepare_star_cache_only_prepares_cache_without_launching(monkeypatch, t
     assert f"[Star cache] ready {cache_path}" in output
 
 
+def test_prepare_star_cache_delegates_to_photsim7_catalog_service(
+    monkeypatch,
+    tmp_path,
+):
+    from photsim7.catalog_sources import PreparedStarCatalog, StarCatalogCache
+    import photsim7.simulation_services as service_module
+
+    catalog = PreparedStarCatalog(
+        star_data={
+            "x0": np.array([0.0]),
+            "y0": np.array([0.0]),
+            "ra": np.array([10.0]),
+            "dec": np.array([20.0]),
+            "source_id": np.array([1]),
+            "gaia_g_mag": np.array([12.0]),
+        },
+        metadata={"source": {"type": "et_focalplane_query"}},
+    )
+    captured = {}
+
+    def fake_build(spec, *, data_registry):
+        captured["spec"] = spec
+        captured["data_registry"] = data_registry
+        return catalog
+
+    def fake_write(path, value):
+        captured["cache_path"] = Path(path)
+        captured["catalog"] = value
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b"cache")
+
+    monkeypatch.setattr(service_module, "build_catalog_from_spec", fake_build)
+    monkeypatch.setattr(StarCatalogCache, "write", staticmethod(fake_write))
+    monkeypatch.setattr(core, "PHOTSIM7_DATA_DIR", tmp_path / "data")
+    spec = core.MainRdRunSpec(frame_rows=5, frame_cols=7, n_frames=1, observing_duration_s=10.0)
+    args = argparse.Namespace(
+        output_root=tmp_path,
+        mag_limit=17.0,
+        force_star_cache=True,
+        catalog_dir=tmp_path / "gaia",
+        crop_margin_pix=2.0,
+        seed=123,
+    )
+
+    cache_path = core.prepare_star_cache(args, spec)
+
+    assert cache_path == captured["cache_path"]
+    assert captured["catalog"].metadata["et_mainsim"]["compatibility_adapter"] == (
+        "MainRdRunSpec"
+    )
+    assert captured["spec"].catalog.source_type == "et_focalplane_query"
+    assert captured["spec"].catalog.source_path == str(args.catalog_dir)
+    assert captured["spec"].catalog.background_stars_max_mag == 17.0
+    assert captured["spec"].rng.run_seed == 123
+
+
+def test_build_main_rd_services_delegates_runtime_overrides(monkeypatch, tmp_path):
+    from photsim7.catalog_sources import PreparedStarCatalog
+    import photsim7.simulation_services as service_module
+
+    catalog = PreparedStarCatalog(
+        star_data={
+            "x0": np.array([0.0]),
+            "y0": np.array([0.0]),
+            "ra": np.array([10.0]),
+            "dec": np.array([20.0]),
+            "source_id": np.array([1]),
+            "gaia_g_mag": np.array([12.0]),
+            "detector_id": "main_rd",
+            "detector_xpix": np.array([100.0]),
+            "detector_ypix": np.array([200.0]),
+        },
+        metadata={"source": {"type": "et_focalplane_query"}},
+    )
+    sentinel = object()
+    captured = {}
+
+    def fake_build(spec, **kwargs):
+        captured["spec"] = spec
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(service_module, "build_full_frame_services", fake_build)
+    monkeypatch.setattr(core, "PHOTSIM7_DATA_DIR", tmp_path / "data")
+    run_spec = core.MainRdRunSpec(frame_rows=5, frame_cols=7)
+    args = argparse.Namespace(
+        frames=2,
+        mag_limit=17.0,
+        seed=456,
+        device="cpu",
+        catalog_dir=tmp_path / "gaia",
+        crop_margin_pix=3.0,
+        jitter_integrated_psf=False,
+        jitter_psf_models=7,
+        jitter_frames_per_model=9,
+        enable_psd_motion=False,
+        psd_motion_path=tmp_path / "psd.pkl",
+        enable_dva_drift=False,
+        enable_thermal_drift=False,
+        enable_momentum_dump=False,
+        enable_psf_breathing=False,
+        no_detector_response=True,
+    )
+
+    services = core.build_main_rd_services(args, run_spec, catalog)
+
+    typed = captured["spec"]
+    assert services is sentinel
+    assert captured["catalog"] is catalog
+    assert captured["frame_exposure"] == 10 * u.s
+    assert typed.observation.resolved_n_frames == 2
+    assert typed.observation.observing_duration == 20 * u.s
+    assert typed.catalog.source_type == "et_focalplane_query"
+    assert typed.catalog.background_stars_max_mag == 17.0
+    assert typed.rng.run_seed == 456
+    assert typed.psf.compute_device == "cpu"
+    assert typed.psf.use_jitter_integrated_psf is False
+    assert typed.psf.n_jitter_integrated_psf_models == 7
+    assert typed.psf.n_jitter_frames_per_model == 9
+    assert typed.dynamic_effects.psd_motion.enabled is False
+    assert typed.dynamic_effects.dva.enabled is False
+    assert typed.dynamic_effects.thermal_drift.enabled is False
+    assert typed.dynamic_effects.momentum_dump.enabled is False
+    assert typed.dynamic_effects.psf_breathing.enabled is False
+    assert typed.detector_response.enable_inter_pixel_response is False
+
+
 def test_launch_reuses_existing_star_cache_without_querying_catalog(
     monkeypatch,
     tmp_path,
