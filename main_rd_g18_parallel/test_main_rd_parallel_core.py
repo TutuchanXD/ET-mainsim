@@ -437,6 +437,14 @@ def test_parse_common_args_accepts_script_specific_jitter_psf_default():
     assert override_args.jitter_psf_models == 7
 
 
+def test_parse_common_args_uses_data_registry_relative_psd_path():
+    parser = core.parse_common_args("test parser")
+
+    args = parser.parse_args([])
+
+    assert args.psd_motion_path == Path("pds/ET_psd3-2.pkl")
+
+
 def test_sim_config_dict_uses_run_spec_detector_values():
     spec = core.MainRdRunSpec(
         frame_rows=50,
@@ -1136,3 +1144,17 @@ def test_launch_reuses_existing_star_cache_without_querying_catalog(
     assert len(popen_calls) == 1
     assert "--star-cache" in popen_calls[0][0]
     assert str(cache_path) in popen_calls[0][0]
+    with (tmp_path / "run" / "run_config.json").open(encoding="utf-8") as handle:
+        run_config = json.load(handle)
+    assert run_config["compatibility_adapter"] == "MainRdRunSpec"
+    assert run_config["simulation_spec"]["schema_id"] == "photsim7.simulation_spec"
+    assert run_config["simulation_spec"]["schema_version"] == 1
+    assert run_config["simulation_spec"]["observation"]["n_frames"] == 1
+    assert run_config["simulation_spec"]["instrument"]["optical_efficiency"] == {
+        "value": pytest.approx(58.0),
+        "unit": "%",
+    }
+    assert run_config["simulation_spec"]["instrument"]["quantum_efficiency"] == {
+        "value": pytest.approx(80.0),
+        "unit": "%",
+    }

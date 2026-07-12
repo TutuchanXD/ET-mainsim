@@ -315,6 +315,7 @@ class MainRdRunSpec:
                 exposure_duration=exposure,
                 readout_duration=0 * u.s,
                 observing_duration=duration,
+                n_frames=int(self.n_frames),
                 simulation_cadence_mult=1,
             ),
             instrument=replace(
@@ -1010,12 +1011,11 @@ def _runtime_run_spec(args: argparse.Namespace, spec: MainRdRunSpec) -> MainRdRu
     )
 
 
-def build_main_rd_services(args: argparse.Namespace, spec: MainRdRunSpec, catalog):
-    """Build the reusable Photsim7 service bundle for one worker."""
-
-    ensure_local_imports()
-    from photsim7.data_registry import DataRegistry
-    from photsim7.simulation_services import build_full_frame_services
+def build_main_rd_simulation_spec(
+    args: argparse.Namespace,
+    spec: MainRdRunSpec,
+):
+    """Resolve CLI overrides into the canonical package simulation spec."""
 
     runtime_spec = _runtime_run_spec(args, spec)
     source_path = args.catalog_dir if spec.star_source == "gaia_main_rd" else None
@@ -1036,9 +1036,20 @@ def build_main_rd_services(args: argparse.Namespace, spec: MainRdRunSpec, catalo
                 enable_pixel_phase_response=False,
             ),
         )
+    return typed_spec
+
+
+def build_main_rd_services(args: argparse.Namespace, spec: MainRdRunSpec, catalog):
+    """Build the reusable Photsim7 service bundle for one worker."""
+
+    ensure_local_imports()
+    from photsim7.data_registry import DataRegistry
+    from photsim7.simulation_services import build_full_frame_services
+
+    typed_spec = build_main_rd_simulation_spec(args, spec)
     return build_full_frame_services(
         typed_spec,
-        frame_exposure=float(runtime_spec.exposure_s) * u.s,
+        frame_exposure=float(spec.exposure_s) * u.s,
         catalog=catalog,
         data_registry=DataRegistry(data_root=PHOTSIM7_DATA_DIR),
     )
@@ -2202,7 +2213,7 @@ def parse_common_args(
     parser.add_argument(
         "--psd-motion-path",
         type=Path,
-        default=Path("/home/cxgao/ET/photsim6_cache/ET_psd3-2.pkl"),
+        default=Path("pds/ET_psd3-2.pkl"),
     )
     parser.add_argument("--worker-rank", type=int, default=None)
     parser.add_argument("--worker-world-size", type=int, default=None)
@@ -2247,8 +2258,11 @@ def launch_or_run(args: argparse.Namespace, spec: MainRdRunSpec, script_path: Pa
     run_dir = output_root / run_dir_name(spec, args.mag_limit)
     log_dir = run_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    typed_spec = build_main_rd_simulation_spec(args, spec)
     parent_summary = {
         "spec": asdict(spec),
+        "simulation_spec": typed_spec.to_json_dict(),
+        "compatibility_adapter": "MainRdRunSpec",
         "args": vars(args),
         "star_cache": str(cache_path),
         "gpu_ids": gpu_ids,

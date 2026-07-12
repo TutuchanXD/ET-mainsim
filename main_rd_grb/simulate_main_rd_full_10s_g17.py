@@ -23,8 +23,8 @@ if __name__ == "__main__":
         frame_rows=9120,
         frame_cols=8900,
         description=(
-            "Single-cadence 10 s full main_rd production render with "
-            "SingleCadenceFullFrameRenderer, Gaia G<17, and 100 JI-PSF models."
+            "Full main_rd production render through Photsim7 "
+            "run_single_cadence_full_frame, with Gaia G<17 and 100 JI-PSF models."
         ),
         script_path=Path(__file__).resolve(),
         spec_overrides={
@@ -36,6 +36,8 @@ if __name__ == "__main__":
             "n_subpixels": 1,
             "exposure_s": 10.0,
             "observing_duration_s": 1200.0,
+            "optical_efficiency_ratio": 0.58,
+            "quantum_efficiency_ratio": 0.80,
             "scattered_light_e_s_pix": 0.0,
             "scattered_light_step_start_frame": None,
             "scattered_light_step_e_pix_frame": 0.0,
@@ -45,7 +47,8 @@ if __name__ == "__main__":
                 "Default source cut is Gaia G<17; background uses "
                 "22 mag/arcsec^2; subpixel grid is 1x1; default "
                 "--jitter-psf-models is 100. Per-star PSF field IDs are "
-                "selected from each star's main_rd field angle."
+                "selected from each star's main_rd field angle. The active "
+                "cadence path uses the Photsim7 package pipeline and typed spec."
             ),
         },
     )
