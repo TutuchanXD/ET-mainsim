@@ -1,12 +1,17 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 
-ET_ROOT = Path("/home/cxgao/ET")
-PARALLEL_DIR = ET_ROOT / "ET-mainsim" / "main_rd_g18_parallel"
+ET_MAINSIM_ROOT = Path(
+    os.environ.get("ET_MAINSIM_ROOT", str(Path(__file__).resolve().parents[1]))
+).expanduser()
+PARALLEL_DIR = Path(
+    os.environ.get("MAIN_RD_PARALLEL_DIR", str(ET_MAINSIM_ROOT / "main_rd_g18_parallel"))
+).expanduser()
 if str(PARALLEL_DIR) not in sys.path:
     sys.path.insert(0, str(PARALLEL_DIR))
 

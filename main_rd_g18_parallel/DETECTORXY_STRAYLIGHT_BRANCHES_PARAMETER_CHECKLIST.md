@@ -31,13 +31,13 @@ All branches retain:
 Script:
 
 ```text
-simulate_main_rd_500x500_detectorxy_sky23p2_colnoise0_straylight10_last90.py
+simulate_main_rd_500x500_detectorxy_sky23p2_colnoise0_straylight10_last90.py  # legacy filename; configured sky=22, subpix=1
 ```
 
 Run label:
 
 ```text
-main_rd_500x500_detectorxy_310-50-2420_sky23p2_colnoise0_straylight10_last90
+main_rd_500x500_detectorxy_310-50-2420_sky22_colnoise0_subpix1_straylight10_last90
 ```
 
 | Parameter | Value |

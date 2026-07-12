@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import pickle
+import subprocess
 import sys
 from pathlib import Path
 
@@ -15,6 +17,36 @@ if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
 
 import stamp_long_core as core
+
+
+def test_default_environment_paths_expand_user_home(tmp_path):
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(tmp_path),
+            "RESULTS_ROOT": "~/results/stamp_long",
+            "JITTER_SENSITIVITY_OUTPUT_ROOT": "~/results/jitter",
+            "ET_DATA_DIR": "~/data/photsim7",
+        }
+    )
+    script = f"""
+import sys
+sys.path.insert(0, {str(MODULE_DIR)!r})
+import stamp_long_core as core
+assert str(core.DEFAULT_OUTPUT_ROOT) == {str(tmp_path / 'results' / 'stamp_long')!r}
+assert str(core.DEFAULT_JITTER_SENSITIVITY_OUTPUT_ROOT) == {str(tmp_path / 'results' / 'jitter')!r}
+assert str(core.DEFAULT_ET_DATA_DIR) == {str(tmp_path / 'data' / 'photsim7')!r}
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_exposure_parameters_scale_direct_long_exposure_values():

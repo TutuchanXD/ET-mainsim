@@ -30,20 +30,20 @@ DEFAULT_OUTPUT_ROOT = Path(
         "RESULTS_ROOT",
         "/home/cxgao/Results/ET-mainsim/stamp_long",
     )
-)
+).expanduser()
 DEFAULT_JITTER_SENSITIVITY_OUTPUT_ROOT = Path(
     os.environ.get(
         "JITTER_SENSITIVITY_OUTPUT_ROOT",
         str(DEFAULT_OUTPUT_ROOT.parent / "stamp_long_jitter_sensitivity"),
     )
-)
+).expanduser()
 DEFAULT_BASE_EXPOSURE_S = 10.0
 DEFAULT_ET_DATA_DIR = Path(
     os.environ.get(
         "ET_DATA_DIR",
         os.environ.get("PHOTSIM7_DATA_DIR", "/home/cxgao/ET/Photsim7-data"),
     )
-)
+).expanduser()
 
 
 def _default_photsim7_root(et_root: Path) -> Path:

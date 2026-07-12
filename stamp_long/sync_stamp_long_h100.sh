@@ -2,17 +2,21 @@
 # Synchronize local code/data to the H100 cluster before submitting stamp_long jobs.
 #
 # Usage:
-#   ./stamp_long/sync_stamp_long_h100.sh
+#   REMOTE=cluster.example ./stamp_long/sync_stamp_long_h100.sh
+#
+# Required:
+#   REMOTE=cluster.example
 #
 # Optional overrides:
-#   REMOTE=119.78.226.37
 #   REMOTE_ET_ROOT=/cluster/home/cxgao/ET
+#   LOCAL_ET_ROOT=/path/to/ET
 
 set -euo pipefail
 
-REMOTE="${REMOTE:-119.78.226.37}"
+: "${REMOTE:?Set REMOTE to the target SSH host}"
 REMOTE_ET_ROOT="${REMOTE_ET_ROOT:-/cluster/home/cxgao/ET}"
-LOCAL_ET_ROOT="${LOCAL_ET_ROOT:-/home/cxgao/ET}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_ET_ROOT="${LOCAL_ET_ROOT:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}"
 
 RSYNC_COMMON=(
   rsync

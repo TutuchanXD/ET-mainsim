@@ -14,7 +14,8 @@ if __name__ == "__main__":
             "Parallel detector-xy main_rd simulation, 500x500 pixels, sky 22 mag/arcsec^2, "
             "1x1 subpixel grid, 270 frames; "
             "frames 0-179 match the baseline, frames 180-269 add 10 e-/pix/frame "
-            "scattered light."
+            "scattered light. The legacy sky23p2 filename is retained for compatibility; "
+            "the configured sky value is 22 mag/arcsec^2."
         ),
         script_path=Path(__file__).resolve(),
         spec_overrides={
@@ -35,7 +36,8 @@ if __name__ == "__main__":
             "scattered_light_step_start_frame": 180,
             "scattered_light_step_e_pix_frame": 10.0,
             "notes": (
-                "Detector-xy 500x500 baseline with sky background set through the "
+                "Legacy sky23p2 filename retained for compatibility. Detector-xy "
+                "500x500 baseline with sky background set through the "
                 "surface-brightness magnitude path at 22 mag/arcsec^2 and a 1x1 "
                 "subpixel grid. Star PSF field IDs are selected from each star's "
                 "main_rd detector position. Frames 180-269 add 10 e-/pix/frame "

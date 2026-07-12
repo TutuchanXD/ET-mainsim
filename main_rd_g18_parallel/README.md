@@ -59,7 +59,7 @@ integrated into PSF models.
 | `simulate_main_rd_500x500_magdist_g23_colnoise0.py` | `500 x 500` | random positions from `310-50-2420.csv`, `G<=23` | `180` | `21 mag/arcsec^2` | `3 x 3` | `0 ADU` | disabled |
 | `simulate_main_rd_500x500_magdist_g24_sky23p2_colnoise0.py` | `500 x 500` | random positions from `310-50-2420.csv`, `G<=24` | `180` | `23.2 mag/arcsec^2` | `3 x 3` | `0 ADU` | disabled |
 | `simulate_main_rd_500x500_detectorxy_sky23p2_colnoise0.py` | `500 x 500` | detector-xy CSV, `G<=24` | `180` | `23.2 mag/arcsec^2` | `3 x 3` | `0 ADU` | disabled |
-| `simulate_main_rd_500x500_detectorxy_sky23p2_colnoise0_straylight10_last90.py` | `500 x 500` | detector-xy CSV, `G<=24` | `270` | `23.2 mag/arcsec^2` | `3 x 3` | `0 ADU` | frames `180..269`: `10 e-/pix/frame` |
+| `simulate_main_rd_500x500_detectorxy_sky23p2_colnoise0_straylight10_last90.py` (legacy filename) | `500 x 500` | detector-xy CSV, `G<=24` | `270` | `22 mag/arcsec^2` | `1 x 1` | `0 ADU` | frames `180..269`: `10 e-/pix/frame` |
 | `simulate_main_rd_500x500_detectorxy_sky23p2_colnoise0_subpix5_straylight10_last90.py` | `500 x 500` | detector-xy CSV, `G<=24` | `270` | `23.2 mag/arcsec^2` | `5 x 5` | `0 ADU` | frames `180..269`: `10 e-/pix/frame` |
 | `simulate_main_rd_700x700_detectorxy_sky23p2_colnoise0_subpix5_straylight10_last90.py` | `700 x 700` | detector-xy 700 CSV, `G<=24` | `270` | `23.2 mag/arcsec^2` | `5 x 5` | `0 ADU` | frames `180..269`: `10 e-/pix/frame` |
 

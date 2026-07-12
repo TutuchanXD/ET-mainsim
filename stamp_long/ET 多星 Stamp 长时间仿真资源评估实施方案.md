@@ -333,7 +333,7 @@ stamp_long/
 正式运行前同步：
 
 ```bash
-./stamp_long/sync_stamp_long_h100.sh
+REMOTE=<cluster-host> ./stamp_long/sync_stamp_long_h100.sh
 ```
 
 在 H100 上做 Slurm 预检：
