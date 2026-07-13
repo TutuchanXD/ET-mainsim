@@ -52,6 +52,15 @@ There is no hostname-based path fallback. Relative configured paths resolve
 against the invocation working directory; `~`, `$NAME`, and `${NAME}` are
 expanded at the application boundary.
 
+## Catalog Epoch
+
+`catalog.target_epoch_jyear` is a decimal Julian year and defaults to `2000.0`
+(J2000.0). It is independent of `observation.observing_start_date`. Photsim7
+uses it only for linear proper-motion propagation from each source `ref_epoch`;
+this contract does not add parallax or radial-velocity propagation. Changing
+the target epoch changes the catalog request/cache identity and the run's
+scientific identity.
+
 ## Commands
 
 ```bash
