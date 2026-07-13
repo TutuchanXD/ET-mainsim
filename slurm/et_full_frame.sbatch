@@ -5,8 +5,8 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=320G
 #SBATCH --time=1-00:00:00
-#SBATCH --output=/cluster/home/cxgao/sshfs-share/slurm_logs/%x-%j.out
-#SBATCH --error=/cluster/home/cxgao/sshfs-share/slurm_logs/%x-%j.err
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
 
 set -euo pipefail
 

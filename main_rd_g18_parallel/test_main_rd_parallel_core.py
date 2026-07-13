@@ -838,6 +838,43 @@ def test_prepare_star_cache_delegates_to_photsim7_catalog_service(
     ] == pytest.approx(2031.25)
 
 
+def test_prepare_star_cache_validates_existing_cache_request(monkeypatch, tmp_path):
+    import photsim7.simulation_services as service_module
+
+    spec = core.MainRdRunSpec(
+        frame_rows=5,
+        frame_cols=7,
+        n_frames=1,
+        observing_duration_s=10.0,
+    )
+    cache_path = core.star_cache_path(tmp_path, spec, 17.0)
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_bytes(b"stale cache")
+    captured = {}
+
+    def reject_mismatch(typed_spec, *, data_registry):
+        captured["spec"] = typed_spec
+        raise ValueError("catalog cache request mismatch at target_epoch_jyear")
+
+    monkeypatch.setattr(service_module, "build_catalog_from_spec", reject_mismatch)
+    monkeypatch.setattr(core, "PHOTSIM7_DATA_DIR", tmp_path / "data")
+    args = argparse.Namespace(
+        output_root=tmp_path,
+        mag_limit=17.0,
+        force_star_cache=False,
+        catalog_dir=tmp_path / "gaia",
+        crop_margin_pix=2.0,
+        seed=123,
+        target_epoch_jyear=2028.5,
+    )
+
+    with pytest.raises(ValueError, match="request mismatch"):
+        core.prepare_star_cache(args, spec)
+
+    assert captured["spec"].catalog.cache_path == str(cache_path)
+    assert captured["spec"].catalog.target_epoch_jyear == pytest.approx(2028.5)
+
+
 def test_build_main_rd_services_delegates_runtime_overrides(monkeypatch, tmp_path):
     from photsim7.catalog_sources import PreparedStarCatalog
     import photsim7.simulation_services as service_module

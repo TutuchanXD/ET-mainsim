@@ -142,10 +142,11 @@ def _frame_rows(run_dir: Path) -> list[dict[str, Any]]:
             if isinstance(payload.get("et_mainsim"), dict)
             else {}
         )
+        frame_index = _as_int(payload.get("frame_index"))
         rows.append(
             {
                 "run_name": run_dir.name,
-                "frame_index": _as_int(payload.get("frame_index")),
+                "frame_index": frame_index,
                 "rank": _as_int(app_metrics.get("rank"), _as_int(payload.get("rank"))),
                 "n_stars": _as_int(
                     app_metrics.get("n_stars"),
@@ -180,7 +181,7 @@ def _frame_rows(run_dir: Path) -> list[dict[str, Any]]:
                 or str(
                     run_dir
                     / "frames"
-                    / f"frame_{int(payload.get('frame_index', -1)):06d}.npy"
+                    / f"frame_{(-1 if frame_index is None else frame_index):06d}.npy"
                 ),
                 "summary_path": str(summary_path),
             }

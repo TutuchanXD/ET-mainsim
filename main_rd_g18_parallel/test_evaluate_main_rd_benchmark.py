@@ -156,3 +156,17 @@ def test_collect_benchmark_reads_unified_run_manifest_and_package_summary(tmp_pa
     assert summary["render_elapsed_s_mean"] == pytest.approx(12.0)
     assert summary["actual_cosmic_events_sum"] == 5
     assert summary["saturated_pixels_max"] == 7
+
+
+def test_collect_benchmark_tolerates_null_frame_index(tmp_path):
+    run_dir = tmp_path / "partial-run"
+    _write_json(
+        run_dir / "frame_summaries" / "frame_partial.json",
+        {"frame_index": None},
+    )
+
+    report = bench.collect_benchmark(run_dir)
+
+    frame = report["frames"][0]
+    assert frame["frame_index"] is None
+    assert frame["frame_path"].endswith("frames/frame_-00001.npy")
