@@ -1,95 +1,113 @@
 # ET-mainsim
 
-ET-mainsim preserves and maintains the ET transit-telescope main-detector
-simulation scripts that were previously kept in the legacy `Photosim6ft`
-checkout. The scripts generate cropped ET main-detector image simulations for
-transit-telescope detector fields, with selectable effect profiles for noise,
-pointing motion, DVA, thermal drift, and subpixel response terms.
+ET-mainsim is the reference application for end-to-end Earth 2.0 Telescope
+simulations. It owns presets, command-line workflows, output directories,
+resume policy, local worker launch, Slurm templates, and user-facing examples.
+Photsim7 remains authoritative for catalogs, photometry, PSFs, dynamic effects,
+rendering, detector electronics, RNG, and data-product schemas.
 
-Source recovery:
+The maintained workflow available today is one physical ET `main_rd` full
+frame. Stamp and legacy full-effect workflows are tracked in the
+[four-PR maintenance plan](docs/devs/et_mainsim_four_pr_maintenance_plan.md).
 
-- Original repository: <https://github.com/TutuchanXD/Photosim6ft>
-- Recovered source commit: `1007481`
-- Recovered script family: `et_sim_100*.py`
+## Install
 
-The legacy `Photosim6ft` repository can be archived after this repository is in
-place. Runtime code here now defaults to the local Photosim7 checkout instead of
-the removed local `Photosim6ft` directory.
-
-## Contents
-
-| Path | Purpose |
-| --- | --- |
-| `scripts/et_sim_100_det.py` | Main ET transit main-detector simulation driver. |
-| `scripts/et_sim_100_det_v1_noise_psf.py` | Wrapper for the `v1_noise_psf` profile. |
-| `scripts/et_sim_100_det_v2_point_drift_jitter.py` | Wrapper for the `v2_point_drift_jitter` profile. |
-| `scripts/et_sim_100_det_v3_dva.py` | Wrapper for the `v3_dva` profile. |
-| `scripts/et_sim_100_det_v4_thermal.py` | Wrapper for the `v4_thermal` profile. |
-| `scripts/et_sim_100_det_v5_prv_subpixel.py` | Wrapper for the `v5_prv_subpixel` profile. |
-| `config/et_100_det_inputs_1h.xlsx` | Baseline ET main-detector runtime spreadsheet recovered with the scripts. |
-| `main_rd_g18_parallel/` | Current parallel Photsim7-based `main_rd` full-effect simulation scripts, including detector-coordinate 500x500/700x700 sky23.2 scattered-light branches. |
-
-## Runtime Inputs
-
-The scripts expect the Photosim7 source checkout and the Photosim6 data bundle to
-exist locally:
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `PHOTSIM7_ROOT` | Local Photosim7 checkout root | `/home/cxgao/ET/Photosim7` |
-| `ET_DATA_DIR` | Photosim6 data root | `/home/cxgao/ET/Photosim6/data` |
-| `ET_CONFIG_XLSX` | Main-detector configuration spreadsheet | `config/et_100_det_inputs_1h.xlsx` |
-| `ET_EFFECT_PROFILE` | Effect profile selected by `et_sim_100_det.py` | `full` |
-| `ET_PROFILE_TARGET_FRAMES` | Optional frame-count override for quick runs | unset |
-| `ET_RUN_ALL_BATCHES` | Run all configured sky-center batches | script default |
-| `ET_FIELD_CENTER_INDEX` | Select one configured field center | script default |
-| `ET_OUTPUT_RUN_NAME_OVERRIDE` | Override the output run directory name | profile dependent |
-
-Outputs default to `/home/cxgao/ET/FSG_images_sims/<run-name>/...`.
-
-## Effect Profiles
-
-The main driver defines one full profile plus five focused profiles. The wrapper
-scripts set `ET_EFFECT_PROFILE`, reduce the run to 20 target frames where
-appropriate, and set a deterministic output run name.
-
-| Profile | Wrapper | Enabled effects beyond the static image model |
-| --- | --- | --- |
-| `full` | Run `et_sim_100_det.py` directly | Package-default variant settings, pointing drift, DVA, thermal drift, momentum dump, and jitter-integrated PSF. |
-| `v1_noise_psf` | `et_sim_100_det_v1_noise_psf.py` | Background light, scattered light, dark current, readout noise, target star, background stars, and static PSF. Stellar photon noise and gain are disabled in the script baseline. |
-| `v2_point_drift_jitter` | `et_sim_100_det_v2_point_drift_jitter.py` | The v1 baseline plus pointing drift and jitter-integrated PSF. Slow motion is kept as frame-to-frame drift and high-frequency motion is used for JI-PSF blurring. |
-| `v3_dva` | `et_sim_100_det_v3_dva.py` | The v1 baseline plus DVA drift only. |
-| `v4_thermal` | `et_sim_100_det_v4_thermal.py` | The v1 baseline plus the ET/TESS thermal drift model. |
-| `v5_prv_subpixel` | `et_sim_100_det_v5_prv_subpixel.py` | The v1 baseline plus inter-pixel response, intra-pixel response, and pixel-phase response terms. |
-
-## Typical Usage
-
-Run a focused smoke-scale profile:
+Python must match Photsim7: `>=3.12,<3.14`. In the ET workspace, use the
+existing `etbase` environment and install the sibling Photsim7 checkout first:
 
 ```bash
-cd /home/cxgao/ET/ET-mainsim
-python scripts/et_sim_100_det_v1_noise_psf.py
+conda activate etbase
+python -m pip install -e /home/cxgao/ET/Photsim7
+python -m pip install -e /home/cxgao/ET/ET-mainsim
 ```
 
-Run the full profile:
+The package root is lightweight. `import et_mainsim` does not initialize
+Torch, Ray, CUDA, catalogs, PSFs, or other external assets.
+
+## Quick Start
+
+Inspect the shipped, validated presets:
 
 ```bash
-cd /home/cxgao/ET/ET-mainsim
-ET_RUN_ALL_BATCHES=1 python scripts/et_sim_100_det.py
+et-mainsim presets
+et-mainsim show et-full-frame-smoke
+et-mainsim show et-full-frame-production --format json
 ```
 
-Override the Photosim7 checkout or use a different spreadsheet:
+`--dry-run` resolves overrides and prints the canonical plan without creating
+an output directory, querying a catalog, loading a PSF, or initializing CUDA:
 
 ```bash
-PHOTSIM7_ROOT=/home/cxgao/ET/Photosim7 \
-ET_CONFIG_XLSX=/home/cxgao/ET/ET-mainsim/config/et_100_det_inputs_1h.xlsx \
-python scripts/et_sim_100_det_v3_dva.py
+et-mainsim run et-full-frame --preset smoke --dry-run
 ```
 
-## Notes
+Run the one-cadence CPU smoke:
 
-- The driver still imports Photosim internals through the `photsim6` compatibility
-  package name because the current Photosim7 source tree keeps that API surface.
-- The recovered scripts are intentionally kept close to their original
-  experiment form. Future cleanup should prefer small PRs that preserve the
-  numerical behavior of each effect profile.
+```bash
+export ET_DATA_DIR=/home/cxgao/ET/Photsim7-data
+et-mainsim run et-full-frame --preset smoke
+```
+
+The production preset requires the real ET data, Gaia catalog, and focal-plane
+registry:
+
+```bash
+export ET_DATA_DIR=/home/cxgao/ET/Photsim7-data
+export GAIA_CATALOG_DIR=/home/cxgao/gaia_dr3_19mag
+export ET_FOCALPLANE_ROOT=/home/cxgao/ET/et_focalplane
+export RESULTS_ROOT=/home/cxgao/Results/ET-mainsim
+
+et-mainsim run et-full-frame \
+  --preset production \
+  --gpus 0,1 \
+  --workers-per-device 1
+```
+
+The production scientific contract is one `9120 x 8900` physical `main_rd`,
+180 ten-second cadences, Gaia G input converted by the documented G2V
+approximation to ET AB magnitude, one 28 cm telescope, 58% optical efficiency,
+80% QE, and catalog epoch J2000. Override the epoch explicitly when needed:
+
+```bash
+et-mainsim run et-full-frame \
+  --preset production \
+  --target-epoch-jyear 2028.5
+```
+
+## Run Contract
+
+Scientific configuration is canonical Photsim7 `SimulationSpec` JSON.
+Execution policy is ET-mainsim TOML. Machine paths, GPU assignment, resume,
+overwrite, and preview policy do not belong in the scientific preset.
+
+Every run writes `run_manifest.json` with the resolved spec, execution plan,
+catalog request/cache metadata, ET-mainsim and Photsim7 Git provenance, frame
+plan, attempt history, artifacts, completion summary, or failure details.
+Writes are atomic and the parent launcher is the only run-level manifest writer.
+
+Resume is enabled by default. A frame is skipped only when its NPY payload,
+summary, versioned Photsim7 schema, shape, and dtype all pass readback. Use
+`--overwrite` to rerender an identity-matching run. A different scientific spec,
+catalog request, frame plan, or execution identity fails closed.
+
+See [Full-frame workflow](docs/full_frame_workflow.md) for configuration,
+outputs, recovery behavior, and worker details. Acceptance evidence is recorded
+in [Full-frame PR 1 validation](docs/full_frame_validation.md).
+
+## Slurm
+
+[`slurm/et_full_frame.sbatch`](slurm/et_full_frame.sbatch) runs the same CLI on
+the H100 cluster with `etbase-clu`. Set cluster asset paths in the environment
+before submission; the template writes through the SSHFS result mount.
+
+## Compatibility Surface
+
+Historical `scripts/`, `stamp_long/`, `main_rd_grb/`, and
+`main_rd_g18_parallel/` entrypoints remain available during PR 1. The active
+application does not import their physics builders. `MainRdRunSpec` is a
+temporary compatibility adapter and now exposes `target_epoch_jyear`; removal
+and migration are reserved for PR 4.
+
+The existing main-RD benchmark evaluator remains at
+`main_rd_g18_parallel/evaluate_main_rd_benchmark.py` for compatibility and can
+read both historical `run_config.json` outputs and the new unified manifest.

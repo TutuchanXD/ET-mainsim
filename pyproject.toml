@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "et-mainsim"
+version = "0.1.0"
+description = "Reference ET simulation workflows powered by Photsim7"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+authors = [{name = "ET simulation maintainers"}]
+dependencies = [
+  "astropy>=6",
+  "numpy>=1.26",
+  "photsim7>=0.1,<0.2",
+]
+
+[project.scripts]
+et-mainsim = "et_mainsim.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"et_mainsim.presets" = ["*.json", "*.toml", "*.csv"]
+
+[tool.pytest.ini_options]
+testpaths = [
+  "tests",
+  "main_rd_g18_parallel",
+  "main_rd_grb",
+  "stamp_long",
+]
+pythonpath = ["src"]

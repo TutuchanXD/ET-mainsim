@@ -122,6 +122,7 @@ class MainRdRunSpec:
     synthetic_psf_field_angle_deg: float = TARGET_FIELD_ANGLE_DEG
     target_ra_deg: float = TARGET_RA_DEG
     target_dec_deg: float = TARGET_DEC_DEG
+    target_epoch_jyear: float = 2000.0
     target_field_x_deg: float = TARGET_FIELD_X_DEG
     target_field_y_deg: float = TARGET_FIELD_Y_DEG
     target_field_angle_deg: float = TARGET_FIELD_ANGLE_DEG
@@ -195,6 +196,10 @@ class MainRdRunSpec:
             value = float(getattr(self, name))
             if value < 0.0 or value > 1.0:
                 raise ValueError(f"{name} must be in the inclusive range [0, 1]")
+        if not np.isfinite(float(self.target_epoch_jyear)) or float(
+            self.target_epoch_jyear
+        ) < 0.0:
+            raise ValueError("target_epoch_jyear must be a non-negative finite value")
         if self.star_source not in {
             "gaia_main_rd",
             "synthetic_mag_distribution",
@@ -393,6 +398,7 @@ class MainRdRunSpec:
                 query_options=query_options,
                 inject_transits=False,
                 optimal_aperture_algorithm="Kepler",
+                target_epoch_jyear=float(self.target_epoch_jyear),
             ),
             detector_response=DetectorResponseSpec(
                 enable_inter_pixel_response=True,
@@ -942,9 +948,11 @@ def load_star_cache(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
 def prepare_star_cache(args: argparse.Namespace, spec: MainRdRunSpec) -> Path:
     output_root = Path(args.output_root).expanduser()
     cache_path = star_cache_path(output_root, spec, args.mag_limit)
-    if cache_path.exists() and not args.force_star_cache:
-        print(f"[Star cache] reuse {cache_path}")
-        return cache_path
+    cache_exists = cache_path.exists()
+    if cache_exists and args.force_star_cache:
+        cache_path.unlink()
+        cache_path.with_suffix(".summary.json").unlink(missing_ok=True)
+        cache_exists = False
 
     ensure_local_imports()
     from photsim7.catalog_sources import StarCatalogCache
@@ -955,12 +963,16 @@ def prepare_star_cache(args: argparse.Namespace, spec: MainRdRunSpec) -> Path:
     runtime_spec = replace(
         spec,
         mag_limit=float(args.mag_limit),
+        target_epoch_jyear=float(
+            getattr(args, "target_epoch_jyear", spec.target_epoch_jyear)
+        ),
     )
     source_path = args.catalog_dir if spec.star_source == "gaia_main_rd" else None
     typed_spec = runtime_spec.to_simulation_spec(
         run_seed=int(args.seed),
         source_path=source_path,
         registry_data_dir=ET_FOCALPLANE_ROOT / "data",
+        cache_path=cache_path,
         crop_margin_pix=float(args.crop_margin_pix),
     )
     catalog = build_catalog_from_spec(
@@ -968,12 +980,15 @@ def prepare_star_cache(args: argparse.Namespace, spec: MainRdRunSpec) -> Path:
         data_registry=DataRegistry(data_root=PHOTSIM7_DATA_DIR),
     )
     elapsed = time.perf_counter() - start
+    if cache_exists:
+        print(f"[Star cache] validated and reused {cache_path}")
+        return cache_path
     metadata = {
-        "spec": asdict(spec),
+        "spec": asdict(runtime_spec),
         "mag_limit": float(args.mag_limit),
         "query_elapsed_s": float(elapsed),
         "summary": star_summary(dict(catalog.star_data)),
-        "star_source": spec.star_source,
+        "star_source": runtime_spec.star_source,
         "compatibility_adapter": "MainRdRunSpec",
         "simulation_spec": typed_spec.to_json_dict(),
     }
@@ -1002,6 +1017,9 @@ def _runtime_run_spec(args: argparse.Namespace, spec: MainRdRunSpec) -> MainRdRu
     return replace(
         spec,
         mag_limit=float(args.mag_limit),
+        target_epoch_jyear=float(
+            getattr(args, "target_epoch_jyear", spec.target_epoch_jyear)
+        ),
         n_frames=frames,
         observing_duration_s=frames * float(spec.exposure_s),
         use_jitter_integrated_psf=bool(args.jitter_integrated_psf),
@@ -2208,6 +2226,7 @@ def parse_common_args(
     default_frames: int = N_FRAMES,
     default_mag_limit: float = MAG_LIMIT,
     default_jitter_psf_models: int = JITTER_INTEGRATED_PSF_MODELS,
+    default_target_epoch_jyear: float = 2000.0,
 ) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--frames", type=int, default=default_frames)
@@ -2226,6 +2245,12 @@ def parse_common_args(
     parser.add_argument("--output-root", type=Path, default=RESULTS_ROOT)
     parser.add_argument("--catalog-dir", type=Path, default=GAIA_CATALOG_DIR)
     parser.add_argument("--seed", type=int, default=20260516)
+    parser.add_argument(
+        "--target-epoch-jyear",
+        type=float,
+        default=float(default_target_epoch_jyear),
+        help="Catalog propagation epoch as a decimal Julian year (default: J2000).",
+    )
     parser.add_argument("--crop-margin-pix", type=float, default=2.0)
     parser.add_argument("--preview-count", type=int, default=2)
     parser.add_argument("--max-stars", type=int, default=None)
@@ -2366,6 +2391,8 @@ def launch_or_run(args: argparse.Namespace, spec: MainRdRunSpec, script_path: Pa
             str(args.catalog_dir),
             "--seed",
             str(args.seed),
+            "--target-epoch-jyear",
+            str(getattr(args, "target_epoch_jyear", spec.target_epoch_jyear)),
             "--crop-margin-pix",
             str(args.crop_margin_pix),
             "--preview-count",
@@ -2457,6 +2484,7 @@ def run_entrypoint(
         default_frames=int(spec.n_frames),
         default_mag_limit=float(spec.mag_limit),
         default_jitter_psf_models=int(spec.n_jitter_integrated_psf_models),
+        default_target_epoch_jyear=float(spec.target_epoch_jyear),
     )
     args = parser.parse_args()
     launch_or_run(args, spec, script_path)

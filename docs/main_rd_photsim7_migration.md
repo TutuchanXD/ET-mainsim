@@ -2,6 +2,13 @@
 
 ## Scope
 
+The installed `et-mainsim run et-full-frame` workflow is now the maintained
+application entrypoint. It loads canonical `SimulationSpec` JSON, writes the
+unified `run_manifest.json`, and directly uses the package services listed
+below. The historical wrappers remain compatibility inputs until PR 4.
+Current application acceptance evidence is maintained separately in
+[`full_frame_validation.md`](full_frame_validation.md).
+
 The active ET-mainsim main-detector paths now use Photsim7 package services:
 
 - `main_rd_g18_parallel/main_rd_parallel_core.py`
@@ -106,7 +113,7 @@ Completed evidence:
 - worker delegation/output tests that fail if a legacy physics builder runs;
 - active-wrapper capture tests;
 - old and package-timeline truth-export tests;
-- ET-mainsim: `91 passed` in `etbase`;
+- ET-mainsim historical migration baseline: `91 passed` in `etbase`;
 - Photsim7: `485 passed` in `etbase`, excluding only the separately managed
   legacy smoke runner;
 - local real-asset `500 x 500` package worker smoke and schema/truth readback;

@@ -278,6 +278,7 @@ def test_main_rd_run_spec_builds_canonical_simulation_spec(star_source, source_t
         n_subpixels=5,
         scattered_light_e_s_pix=0.75,
         psf_bundle_name="custom/psf",
+        target_epoch_jyear=2028.5,
     )
 
     spec = run_spec.to_simulation_spec(run_seed=42, compute_device="cpu")
@@ -290,6 +291,7 @@ def test_main_rd_run_spec_builds_canonical_simulation_spec(star_source, source_t
     assert spec.instrument.quantum_efficiency.to_value(u.percent) == pytest.approx(80.0)
     assert spec.instrument.telescope_count == 1
     assert spec.catalog.source_type == source_type
+    assert spec.catalog.target_epoch_jyear == pytest.approx(2028.5)
     assert spec.catalog.photon_magnitude_system == "ET"
     assert spec.detector.n_subpixels == 5
     assert spec.readout.readout_noise == 1.5 * u.electron / u.pix
@@ -303,6 +305,14 @@ def test_main_rd_run_spec_builds_canonical_simulation_spec(star_source, source_t
     )
     assert spec.dynamic_effects.psf_breathing.profile == "main_rd_reference"
     assert spec.rng.run_seed == 42
+
+
+def test_common_cli_exposes_catalog_target_epoch() -> None:
+    parser = core.parse_common_args("target epoch")
+
+    args = parser.parse_args(["--target-epoch-jyear", "2031.25"])
+
+    assert args.target_epoch_jyear == pytest.approx(2031.25)
 
 
 def test_main_rd_run_spec_rejects_legacy_throughput_and_duration_conflicts():
@@ -794,7 +804,13 @@ def test_prepare_star_cache_delegates_to_photsim7_catalog_service(
     monkeypatch.setattr(service_module, "build_catalog_from_spec", fake_build)
     monkeypatch.setattr(StarCatalogCache, "write", staticmethod(fake_write))
     monkeypatch.setattr(core, "PHOTSIM7_DATA_DIR", tmp_path / "data")
-    spec = core.MainRdRunSpec(frame_rows=5, frame_cols=7, n_frames=1, observing_duration_s=10.0)
+    spec = core.MainRdRunSpec(
+        frame_rows=5,
+        frame_cols=7,
+        n_frames=1,
+        observing_duration_s=10.0,
+        target_epoch_jyear=2028.5,
+    )
     args = argparse.Namespace(
         output_root=tmp_path,
         mag_limit=17.0,
@@ -802,6 +818,7 @@ def test_prepare_star_cache_delegates_to_photsim7_catalog_service(
         catalog_dir=tmp_path / "gaia",
         crop_margin_pix=2.0,
         seed=123,
+        target_epoch_jyear=2031.25,
     )
 
     cache_path = core.prepare_star_cache(args, spec)
@@ -813,7 +830,49 @@ def test_prepare_star_cache_delegates_to_photsim7_catalog_service(
     assert captured["spec"].catalog.source_type == "et_focalplane_query"
     assert captured["spec"].catalog.source_path == str(args.catalog_dir)
     assert captured["spec"].catalog.background_stars_max_mag == 17.0
+    assert captured["spec"].catalog.target_epoch_jyear == pytest.approx(2031.25)
+    assert captured["spec"].catalog.cache_path == str(cache_path)
     assert captured["spec"].rng.run_seed == 123
+    assert captured["catalog"].metadata["et_mainsim"]["spec"][
+        "target_epoch_jyear"
+    ] == pytest.approx(2031.25)
+
+
+def test_prepare_star_cache_validates_existing_cache_request(monkeypatch, tmp_path):
+    import photsim7.simulation_services as service_module
+
+    spec = core.MainRdRunSpec(
+        frame_rows=5,
+        frame_cols=7,
+        n_frames=1,
+        observing_duration_s=10.0,
+    )
+    cache_path = core.star_cache_path(tmp_path, spec, 17.0)
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_bytes(b"stale cache")
+    captured = {}
+
+    def reject_mismatch(typed_spec, *, data_registry):
+        captured["spec"] = typed_spec
+        raise ValueError("catalog cache request mismatch at target_epoch_jyear")
+
+    monkeypatch.setattr(service_module, "build_catalog_from_spec", reject_mismatch)
+    monkeypatch.setattr(core, "PHOTSIM7_DATA_DIR", tmp_path / "data")
+    args = argparse.Namespace(
+        output_root=tmp_path,
+        mag_limit=17.0,
+        force_star_cache=False,
+        catalog_dir=tmp_path / "gaia",
+        crop_margin_pix=2.0,
+        seed=123,
+        target_epoch_jyear=2028.5,
+    )
+
+    with pytest.raises(ValueError, match="request mismatch"):
+        core.prepare_star_cache(args, spec)
+
+    assert captured["spec"].catalog.cache_path == str(cache_path)
+    assert captured["spec"].catalog.target_epoch_jyear == pytest.approx(2028.5)
 
 
 def test_build_main_rd_services_delegates_runtime_overrides(monkeypatch, tmp_path):

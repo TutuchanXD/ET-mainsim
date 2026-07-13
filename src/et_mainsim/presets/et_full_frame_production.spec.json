@@ -1,0 +1,169 @@
+{
+  "schema_id": "photsim7.simulation_spec",
+  "schema_version": 1,
+  "observation": {
+    "simulation_name": "ET",
+    "observing_start_date": "2024-01-01T00:00:00",
+    "exposure_duration": {"value": 10.0, "unit": "s"},
+    "readout_duration": {"value": 0.0, "unit": "s"},
+    "simulation_cadence_mult": 1,
+    "observing_duration": {"value": 1800.0, "unit": "s"},
+    "n_raw_frames_per_coadd": 1,
+    "n_frames": 180,
+    "frame_start_s": null
+  },
+  "instrument": {
+    "telescope_count": 1,
+    "aperture_diameter": {"value": 28.0, "unit": "cm"},
+    "optical_efficiency": {"value": 58.0, "unit": "%"},
+    "quantum_efficiency": {"value": 80.0, "unit": "%"}
+  },
+  "detector": {
+    "detector_id": "main_rd",
+    "detector_type": "CMOS",
+    "shape": [9120, 8900],
+    "pixel_width": {"value": 10.0, "unit": "um"},
+    "pixel_scale": {"value": 4.83, "unit": "arcsec / pix"},
+    "n_subpixels": 1
+  },
+  "readout": {
+    "enable_adc_digitization": true,
+    "full_well_electrons": {"value": 90680.0, "unit": "electron"},
+    "readout_noise": {"value": 6.0, "unit": "electron / pix"},
+    "gain_electrons_per_adu": {"value": 1.4, "unit": "electron / adu"},
+    "adc_bit_depth": 16,
+    "adc_min_value": 0.0,
+    "adc_round_values": true,
+    "bias_level_adu": {"value": 3500.0, "unit": "adu"},
+    "column_noise_sigma_adu": {"value": 5.0, "unit": "adu"},
+    "save_bias_metadata": true
+  },
+  "sky": {
+    "background_flux": {"value": 40.776081703306524, "unit": "electron / (pix s)"},
+    "sky_background_mode": "surface_brightness",
+    "sky_background_surface_brightness": 22.0,
+    "sky_background_magnitude_system": "ET",
+    "dark_current": {"value": 1.0, "unit": "electron / (pix s)"},
+    "scattered_light": {"value": 0.0, "unit": "electron / (pix s)"},
+    "subtract_nonstellar_mean": false
+  },
+  "catalog": {
+    "source_type": "et_focalplane_query",
+    "source_path": "",
+    "source_id_column": "source_id",
+    "magnitude_column": "g_mean_mag",
+    "x_column": "x0",
+    "y_column": "y0",
+    "input_magnitude_system": "Gaia_G",
+    "photon_magnitude_system": "ET",
+    "magnitude_conversion": "gaia_g_vega_equals_et_ab_g2v_approx",
+    "background_stars_max_mag": 18.0,
+    "target_max_offset": {"value": 0.0, "unit": "pix"},
+    "telescope_fov_max_offset": {"value": 0.0, "unit": "pix"},
+    "target_ra_deg": 304.41406499712303,
+    "target_dec_deg": 51.81987707392268,
+    "target_detector_xpix": 4450.0,
+    "target_detector_ypix": 4560.0,
+    "registry_data_dir": "",
+    "cache_path": "",
+    "query_options": {
+      "apply_offset": false,
+      "mag_lim": 18.0,
+      "detector_id": "main_rd",
+      "crop_to_simulation_frame": true,
+      "crop_margin_pix": 2.0,
+      "et_focalplane_src": "",
+      "reference_field_angle_deg": 8.722300477798274,
+      "reference_field_polar_angle_rad": -2.3455742725230206
+    },
+    "inject_transits": false,
+    "optimal_aperture_algorithm": "Kepler",
+    "target_epoch_jyear": 2000.0
+  },
+  "detector_response": {
+    "enable_inter_pixel_response": true,
+    "inter_prv_rms": {"value": 1.0, "unit": "%"},
+    "inter_prv_nominal": {"value": 100.0, "unit": "%"},
+    "enable_intra_pixel_response": true,
+    "intra_prv_rms": {"value": 1.0, "unit": "%"},
+    "enable_pixel_phase_response": true,
+    "pixel_response_profile_mod": "flux conserved",
+    "pixel_phase_profile_path": "detector/pixel_response_profile_teff5500_feh-0.1_logg4.4_pfc_v240423.npy",
+    "scripted_sensitivity_enabled": false,
+    "whole_pixel_gain_normal_enabled": false,
+    "whole_pixel_gain_sinusoidal_enabled": false,
+    "enable_flat_field_correction": false,
+    "flat_field_uncertainty": {"value": 0.0, "unit": "%"}
+  },
+  "cosmic_rays": {
+    "enabled": true,
+    "event_library_path": "cosmic_ray/dark_test_10um/event_library_10um.npz",
+    "event_library_pixel_size": {"value": 10.0, "unit": "um"},
+    "event_rate": {"value": 5.0, "unit": "1 / (s cm2)"},
+    "seed": 0
+  },
+  "psf": {
+    "bundle_name": "psf/et/241006/D280mm-focus",
+    "mode": "full_frame",
+    "field_id": "nearest",
+    "field_id_policy": "nearest",
+    "use_jitter_integrated_psf": true,
+    "jitter_bank_mode": "single_reference",
+    "n_jitter_integrated_psf_models": 300,
+    "n_jitter_frames_per_model": 600,
+    "compute_device": "cuda",
+    "float_precision": 32,
+    "image_gen_batch_size": 15000,
+    "image_proc_batch_size": 100000,
+    "warp_frame_batch_size": 10,
+    "pad_to_detector_shape": false
+  },
+  "dynamic_effects": {
+    "psd_motion": {
+      "enabled": true,
+      "profile": "et_attitude_xyz",
+      "et_psd_path": "pds/ET_psd3-2.pkl",
+      "tess_psd_path": "",
+      "tess_xy_amplitude_multiplier": 1.0,
+      "split_hz": 0.1,
+      "max_frequency_samples": 20000,
+      "chunk_size": 1024
+    },
+    "dva": {
+      "enabled": true,
+      "model_path": "DVA/et/ET_DVA_effect_models_slim_v231117.pkl",
+      "t0_day": 0.0,
+      "time_policy": "raise"
+    },
+    "thermal_drift": {
+      "enabled": true,
+      "profile": "main_rd_reference",
+      "temperature_profile_path": "thermal/TESS/tess_temperatures_241209.pkl",
+      "motion_table_path": "thermal/ET/et_lens_temperature_to_centroid_motion_df_241209.pkl",
+      "temperature_values_are_et_lens_c": false,
+      "time_policy": "normalized_observation_phase"
+    },
+    "momentum_dump": {
+      "enabled": true,
+      "profile": "legacy_random_walk_within_circle",
+      "cycle": {"value": 3.0, "unit": "d"},
+      "legacy_radius_arcsec": {"value": 0.15, "unit": "arcsec"}
+    },
+    "psf_breathing": {
+      "enabled": true,
+      "profile": "main_rd_reference",
+      "temperature_profile_path": "thermal/TESS/tess_temperatures_241209.pkl",
+      "time_policy": "normalized_observation_phase"
+    },
+    "scripted_motion": {"enabled": false}
+  },
+  "artifacts": {
+    "schema_version": 1,
+    "save_frame_summaries": true,
+    "save_cosmic_events": true,
+    "save_bias_artifacts": true,
+    "save_preview_images": true
+  },
+  "rng": {"run_seed": 20260714},
+  "unmodeled_config": {}
+}

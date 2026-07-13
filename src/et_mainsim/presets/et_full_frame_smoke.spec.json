@@ -1,0 +1,116 @@
+{
+  "schema_id": "photsim7.simulation_spec",
+  "schema_version": 1,
+  "observation": {
+    "simulation_name": "ET",
+    "observing_start_date": "2024-01-01T00:00:00",
+    "exposure_duration": {"value": 10.0, "unit": "s"},
+    "readout_duration": {"value": 0.0, "unit": "s"},
+    "simulation_cadence_mult": 1,
+    "observing_duration": {"value": 10.0, "unit": "s"},
+    "n_raw_frames_per_coadd": 1,
+    "n_frames": 1,
+    "frame_start_s": null
+  },
+  "instrument": {
+    "telescope_count": 1,
+    "aperture_diameter": {"value": 28.0, "unit": "cm"},
+    "optical_efficiency": {"value": 58.0, "unit": "%"},
+    "quantum_efficiency": {"value": 80.0, "unit": "%"}
+  },
+  "detector": {
+    "detector_id": "main_rd",
+    "detector_type": "CMOS",
+    "shape": [64, 64],
+    "pixel_width": {"value": 10.0, "unit": "um"},
+    "pixel_scale": {"value": 4.83, "unit": "arcsec / pix"},
+    "n_subpixels": 1
+  },
+  "readout": {
+    "enable_adc_digitization": true,
+    "full_well_electrons": {"value": 90680.0, "unit": "electron"},
+    "readout_noise": {"value": 6.0, "unit": "electron / pix"},
+    "gain_electrons_per_adu": {"value": 1.4, "unit": "electron / adu"},
+    "adc_bit_depth": 16,
+    "adc_min_value": 0.0,
+    "adc_round_values": true,
+    "bias_level_adu": {"value": 3500.0, "unit": "adu"},
+    "column_noise_sigma_adu": {"value": 5.0, "unit": "adu"},
+    "save_bias_metadata": true
+  },
+  "sky": {
+    "background_flux": {"value": 40.776081703306524, "unit": "electron / (pix s)"},
+    "sky_background_mode": "surface_brightness",
+    "sky_background_surface_brightness": 22.0,
+    "sky_background_magnitude_system": "ET",
+    "dark_current": {"value": 1.0, "unit": "electron / (pix s)"},
+    "scattered_light": {"value": 0.0, "unit": "electron / (pix s)"},
+    "subtract_nonstellar_mean": false
+  },
+  "catalog": {
+    "source_type": "detector_xy_csv",
+    "source_path": "package://et_full_frame_smoke_catalog.csv",
+    "source_id_column": "source_id",
+    "magnitude_column": "gmag",
+    "x_column": "x0",
+    "y_column": "y0",
+    "input_magnitude_system": "Gaia_G",
+    "photon_magnitude_system": "ET",
+    "magnitude_conversion": "gaia_g_vega_equals_et_ab_g2v_approx",
+    "background_stars_max_mag": 18.0,
+    "target_max_offset": {"value": 0.0, "unit": "pix"},
+    "telescope_fov_max_offset": {"value": 0.0, "unit": "pix"},
+    "target_ra_deg": 304.41406499712303,
+    "target_dec_deg": 51.81987707392268,
+    "target_detector_xpix": 4450.0,
+    "target_detector_ypix": 4560.0,
+    "registry_data_dir": "",
+    "cache_path": "",
+    "query_options": {
+      "reference_field_angle_deg": 8.722300477798274,
+      "reference_field_polar_angle_rad": -2.3455742725230206
+    },
+    "inject_transits": false,
+    "optimal_aperture_algorithm": "Kepler",
+    "target_epoch_jyear": 2000.0
+  },
+  "detector_response": {
+    "enable_inter_pixel_response": false,
+    "enable_intra_pixel_response": false,
+    "enable_pixel_phase_response": false,
+    "scripted_sensitivity_enabled": false,
+    "whole_pixel_gain_normal_enabled": false,
+    "whole_pixel_gain_sinusoidal_enabled": false,
+    "enable_flat_field_correction": false
+  },
+  "cosmic_rays": {"enabled": false},
+  "psf": {
+    "bundle_name": "psf/et/241006/D280mm-focus",
+    "mode": "full_frame",
+    "field_id": 0,
+    "field_id_policy": "explicit",
+    "use_jitter_integrated_psf": false,
+    "jitter_bank_mode": "single_reference",
+    "compute_device": "cpu",
+    "float_precision": 32,
+    "warp_frame_batch_size": 10,
+    "pad_to_detector_shape": false
+  },
+  "dynamic_effects": {
+    "psd_motion": {"enabled": false},
+    "dva": {"enabled": false},
+    "thermal_drift": {"enabled": false},
+    "momentum_dump": {"enabled": false},
+    "psf_breathing": {"enabled": false},
+    "scripted_motion": {"enabled": false}
+  },
+  "artifacts": {
+    "schema_version": 1,
+    "save_frame_summaries": true,
+    "save_cosmic_events": true,
+    "save_bias_artifacts": true,
+    "save_preview_images": true
+  },
+  "rng": {"run_seed": 20260714},
+  "unmodeled_config": {}
+}
