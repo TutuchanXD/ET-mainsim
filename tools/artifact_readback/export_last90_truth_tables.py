@@ -1,4 +1,10 @@
 #!/usr/bin/env python
+"""Read-only exporter for historical last90 artifacts.
+
+This tool never resumes or mutates a simulation run. The legacy fallback
+formula is retained only to interpret artifacts that predate canonical
+Photsim7 catalog metadata.
+"""
 from __future__ import annotations
 
 import argparse

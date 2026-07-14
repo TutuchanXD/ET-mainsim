@@ -1,5 +1,9 @@
 # ET-mainsim 四 PR 完整维护计划
 
+> 状态：四个实施阶段已完成。主分支目标结构由 PR 4 收口；删除前脚本树
+> 固定在 annotated tag `legacy-scripts-final`。本文件继续作为设计决策和
+> 验收矩阵记录，不再作为待办清单。
+
 ## 1. 状态与目标
 
 本文档是 ET-mainsim 从实验脚本集合收敛为 Photsim7 参考工作流应用的

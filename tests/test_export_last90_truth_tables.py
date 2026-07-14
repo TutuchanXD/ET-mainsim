@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from astropy import units as u
+
+TOOL_DIR = Path(__file__).resolve().parents[1] / "tools" / "artifact_readback"
+if str(TOOL_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOL_DIR))
 
 import export_last90_truth_tables as exporter
 

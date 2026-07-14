@@ -1,0 +1,31 @@
+name: lightweight-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  package-boundary:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Build package without private integration dependency
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+          python -m pip install --no-deps dist/*.whl
+      - name: Verify lightweight boundary
+        run: |
+          python -c "import et_mainsim; assert et_mainsim.__version__ == '0.1.0'"
+          et-mainsim --help
+          python -m compileall -q src
+
+# Full scientific integration is pinned and run from Photsim7's downstream
+# contract because Photsim7 and its ET assets are not public CI dependencies.

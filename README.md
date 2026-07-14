@@ -1,19 +1,22 @@
 # ET-mainsim
 
-ET-mainsim is the reference application for end-to-end Earth 2.0 Telescope
-simulations. It owns presets, command-line workflows, output directories,
-resume policy, local worker launch, Slurm templates, and user-facing examples.
-Photsim7 remains authoritative for catalogs, photometry, PSFs, dynamic effects,
-rendering, detector electronics, RNG, and data-product schemas.
+ET-mainsim is the reference application for Earth 2.0 Telescope simulations.
+It owns presets, CLI orchestration, manifests, local workers, Slurm templates,
+resume policy, and examples. Photsim7 owns all catalog, photometry, PSF,
+dynamic-effect, detector, RNG, and product-schema behavior.
 
-The maintained workflow available today is one physical ET `main_rd` full
-frame. Stamp and legacy full-effect workflows are tracked in the
-[four-PR maintenance plan](docs/devs/et_mainsim_four_pr_maintenance_plan.md).
+Three end-to-end workflows are maintained:
+
+```text
+et-mainsim run et-full-frame --preset smoke|production
+et-mainsim run et-stamp --preset smoke|production
+et-mainsim run legacy-sim --preset full-effects-smoke|full-effects-production
+```
 
 ## Install
 
-Python must match Photsim7: `>=3.12,<3.14`. In the ET workspace, use the
-existing `etbase` environment and install the sibling Photsim7 checkout first:
+Python must match Photsim7: `>=3.12,<3.14`. In the ET workspace use the
+existing `etbase` environment:
 
 ```bash
 conda activate etbase
@@ -21,93 +24,79 @@ python -m pip install -e /home/cxgao/ET/Photsim7
 python -m pip install -e /home/cxgao/ET/ET-mainsim
 ```
 
-The package root is lightweight. `import et_mainsim` does not initialize
-Torch, Ray, CUDA, catalogs, PSFs, or other external assets.
+The package import is lightweight and does not initialize Torch, Ray, CUDA,
+catalogs, or external assets.
 
 ## Quick Start
 
-Inspect the shipped, validated presets:
-
 ```bash
 et-mainsim presets
-et-mainsim show et-full-frame-smoke
-et-mainsim show et-full-frame-production --format json
-```
-
-`--dry-run` resolves overrides and prints the canonical plan without creating
-an output directory, querying a catalog, loading a PSF, or initializing CUDA:
-
-```bash
+et-mainsim show et-stamp-production --format json
 et-mainsim run et-full-frame --preset smoke --dry-run
 ```
 
-Run the one-cadence CPU smoke:
+Local smoke runs need only the Photsim7 asset root:
 
 ```bash
 export ET_DATA_DIR=/home/cxgao/ET/Photsim7-data
 et-mainsim run et-full-frame --preset smoke
+et-mainsim run et-stamp --preset smoke
+et-mainsim run legacy-sim --preset full-effects-smoke
 ```
 
-The production preset requires the real ET data, Gaia catalog, and focal-plane
-registry:
+Production physical-catalog runs also require:
 
 ```bash
-export ET_DATA_DIR=/home/cxgao/ET/Photsim7-data
 export GAIA_CATALOG_DIR=/home/cxgao/gaia_dr3_19mag
 export ET_FOCALPLANE_ROOT=/home/cxgao/ET/et_focalplane
 export RESULTS_ROOT=/home/cxgao/Results/ET-mainsim
-
-et-mainsim run et-full-frame \
-  --preset production \
-  --gpus 0,1 \
-  --workers-per-device 1
 ```
 
-The production scientific contract is one `9120 x 8900` physical `main_rd`,
-180 ten-second cadences, Gaia G input converted by the documented G2V
-approximation to ET AB magnitude, one 28 cm telescope, 58% optical efficiency,
-80% QE, and catalog epoch J2000. Override the epoch explicitly when needed:
+### Stamp Table Input
+
+Stamp simulation also accepts a query-independent table. Every row is one
+independent target-only scene and therefore does not initialize or query a
+full-frame catalog:
 
 ```bash
-et-mainsim run et-full-frame \
-  --preset production \
-  --target-epoch-jyear 2028.5
+et-mainsim run et-stamp \
+  --preset smoke \
+  --input-table targets.csv
 ```
+
+Required columns are `gaia_g_mag` (Gaia G, Vega) and `psf_id`. Optional
+`source_id`, `detector_xpix`, and `detector_ypix` columns are supported; both
+coordinates must be supplied together. Missing coordinates default to the
+physical detector center. The current documented conversion is
+`et_mag (AB) = gaia_g_mag (Vega)` for G2V-like sources. See the packaged
+`et_stamp_table_example.csv` and [stamp workflow](docs/stamp_workflow.md).
 
 ## Run Contract
 
-Scientific configuration is canonical Photsim7 `SimulationSpec` JSON.
-Execution policy is ET-mainsim TOML. Machine paths, GPU assignment, resume,
-overwrite, and preview policy do not belong in the scientific preset.
+Scientific configuration is a canonical Photsim7 `SimulationSpec`. Execution
+policy and typed `[workload]` configuration are ET-mainsim TOML. Machine paths,
+GPU assignment, Ray resources, resume, overwrite, and benchmark controls do not
+belong in the scientific spec.
 
-Every run writes `run_manifest.json` with the resolved spec, execution plan,
-catalog request/cache metadata, ET-mainsim and Photsim7 Git provenance, frame
-plan, attempt history, artifacts, completion summary, or failure details.
-Writes are atomic and the parent launcher is the only run-level manifest writer.
+Every run writes an atomic `run_manifest.json` containing the resolved spec,
+workload and execution identity, paths, attempt history, provenance, product
+locations, completion summary, or failure. Identity drift fails closed.
 
-Resume is enabled by default. A frame is skipped only when its NPY payload,
-summary, versioned Photsim7 schema, shape, and dtype all pass readback. Use
-`--overwrite` to rerender an identity-matching run. A different scientific spec,
-catalog request, frame plan, or execution identity fails closed.
+- Full frame resumes only validated NPY + summary + schema items.
+- Stamp resumes HDF5 shard items and skips only a fully validated target.
+  Direct-table identity includes the resolved path, byte size, and nanosecond
+  modification time; changing the table requires a new run ID or overwrite.
+- Legacy skips only an entirely complete workload; partial pickle/OA output is
+  rejected and requires `--overwrite` or a new run ID.
+- `--dry-run` creates no output and initializes no catalog, PSF, CUDA, or Ray.
 
-See [Full-frame workflow](docs/full_frame_workflow.md) for configuration,
-outputs, recovery behavior, and worker details. Acceptance evidence is recorded
-in [Full-frame PR 1 validation](docs/full_frame_validation.md).
+## Slurm And Tools
 
-## Slurm
+Maintained H100 templates are under `slurm/`. Full-frame performance tools and
+the 600 W thermal-load reproducer are under `benchmarks/`. Historical last90
+artifacts can be read without rerunning via `tools/artifact_readback/`.
 
-[`slurm/et_full_frame.sbatch`](slurm/et_full_frame.sbatch) runs the same CLI on
-the H100 cluster with `etbase-clu`. Set cluster asset paths in the environment
-before submission; the template writes through the SSHFS result mount.
-
-## Compatibility Surface
-
-Historical `scripts/`, `stamp_long/`, `main_rd_grb/`, and
-`main_rd_g18_parallel/` entrypoints remain available during PR 1. The active
-application does not import their physics builders. `MainRdRunSpec` is a
-temporary compatibility adapter and now exposes `target_epoch_jyear`; removal
-and migration are reserved for PR 4.
-
-The existing main-RD benchmark evaluator remains at
-`main_rd_g18_parallel/evaluate_main_rd_benchmark.py` for compatibility and can
-read both historical `run_config.json` outputs and the new unified manifest.
+The removed script layout is preserved by Git tag `legacy-scripts-final`.
+See [migration](docs/main_rd_photsim7_migration.md) for command and artifact
+mapping. Current details are in [full frame](docs/full_frame_workflow.md),
+[stamp](docs/stamp_workflow.md), and [legacy](docs/legacy_workflow.md).

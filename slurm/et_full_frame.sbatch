@@ -20,6 +20,7 @@ export RESULTS_ROOT="${RESULTS_ROOT:-/cluster/home/cxgao/sshfs-share/et-mainsim}
 : "${GAIA_CATALOG_DIR:?Set GAIA_CATALOG_DIR to the cluster Gaia catalog directory}"
 
 ET_MAINSIM_ROOT="${ET_MAINSIM_ROOT:-/cluster/home/cxgao/ET/ET-mainsim}"
+export PYTHONPATH="${ET_MAINSIM_ROOT}/src:${PYTHONPATH:-}"
 PRESET="${PRESET:-production}"
 RUN_ID="${RUN_ID:-et-full-frame-${SLURM_JOB_ID}}"
 GPU_IDS="${GPU_IDS:-0,1}"
