@@ -430,32 +430,32 @@ def _table_catalog(
     center_x = (cols - 1) / 2.0
     center_y = (rows - 1) / 2.0
     star_data: dict[str, Any] = {
-            "x0": np.asarray([0.0], dtype=np.float64),
-            "y0": np.asarray([0.0], dtype=np.float64),
-            "frame_xpix": np.asarray([center_x], dtype=np.float64),
-            "frame_ypix": np.asarray([center_y], dtype=np.float64),
-            "ra": np.asarray(
-                [
-                    target.ra_deg
-                    if target.ra_deg is not None
-                    else plan.spec.catalog.target_ra_deg or 0.0
-                ]
-            ),
-            "dec": np.asarray(
-                [
-                    target.dec_deg
-                    if target.dec_deg is not None
-                    else plan.spec.catalog.target_dec_deg or 0.0
-                ]
-            ),
-            "source_id": np.asarray([target.source_id], dtype=np.int64),
-            "gaia_g_mag": np.asarray([target.gaia_g_mag], dtype=np.float64),
-            "detector_xpix": np.asarray([target.detector_xpix], dtype=np.float64),
-            "detector_ypix": np.asarray([target.detector_ypix], dtype=np.float64),
-            "detector_xpix_shifted": np.asarray([center_x], dtype=np.float64),
-            "detector_ypix_shifted": np.asarray([center_y], dtype=np.float64),
-            "detector_id": str(plan.spec.detector.detector_id),
-        }
+        "x0": np.asarray([0.0], dtype=np.float64),
+        "y0": np.asarray([0.0], dtype=np.float64),
+        "frame_xpix": np.asarray([center_x], dtype=np.float64),
+        "frame_ypix": np.asarray([center_y], dtype=np.float64),
+        "ra": np.asarray(
+            [
+                target.ra_deg
+                if target.ra_deg is not None
+                else plan.spec.catalog.target_ra_deg or 0.0
+            ]
+        ),
+        "dec": np.asarray(
+            [
+                target.dec_deg
+                if target.dec_deg is not None
+                else plan.spec.catalog.target_dec_deg or 0.0
+            ]
+        ),
+        "source_id": np.asarray([target.source_id], dtype=np.int64),
+        "gaia_g_mag": np.asarray([target.gaia_g_mag], dtype=np.float64),
+        "detector_xpix": np.asarray([target.detector_xpix], dtype=np.float64),
+        "detector_ypix": np.asarray([target.detector_ypix], dtype=np.float64),
+        "detector_xpix_shifted": np.asarray([center_x], dtype=np.float64),
+        "detector_ypix_shifted": np.asarray([center_y], dtype=np.float64),
+        "detector_id": str(plan.spec.detector.detector_id),
+    }
     if target.field_x_deg is not None:
         star_data["field_x_deg"] = np.asarray(
             [target.field_x_deg], dtype=np.float64
