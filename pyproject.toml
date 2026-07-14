@@ -30,8 +30,5 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = [
   "tests",
-  "main_rd_g18_parallel",
-  "main_rd_grb",
-  "stamp_long",
 ]
 pythonpath = ["src"]

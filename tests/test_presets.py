@@ -65,6 +65,60 @@ def test_shipped_full_frame_presets_are_typed_and_complete() -> None:
     assert production.run_config.execution.device == "cuda"
 
 
+def test_shipped_stamp_presets_fix_local_query_and_coadd_contract() -> None:
+    from et_mainsim.config import StampWorkload
+    from et_mainsim.presets import list_presets, load_preset
+
+    assert [item.name for item in list_presets(workflow="et-stamp")] == [
+        "et-stamp-production",
+        "et-stamp-smoke",
+    ]
+
+    smoke = load_preset("et-stamp-smoke")
+    production = load_preset("et-stamp-production")
+
+    assert smoke.simulation_spec.psf.mode == "stamp"
+    assert smoke.simulation_spec.observation.resolved_n_frames == 2
+    assert smoke.simulation_spec.observation.n_raw_frames_per_coadd == 2
+    assert isinstance(smoke.run_config.workload, StampWorkload)
+    assert smoke.run_config.workload.stamp_shape == (15, 15)
+
+    spec = production.simulation_spec
+    assert spec.detector.shape == (9120, 8900)
+    assert spec.detector.n_subpixels == 7
+    assert spec.observation.resolved_n_frames == 360
+    assert spec.observation.n_raw_frames_per_coadd == 30
+    assert spec.catalog.query_options["query_radius_deg"] == pytest.approx(0.07)
+    assert spec.psf.mode == "stamp"
+    assert production.run_config.workload.include_neighbors is True
+
+
+def test_shipped_legacy_presets_are_exact_full_effect_contracts() -> None:
+    from et_mainsim.config import LegacyWorkload
+    from et_mainsim.presets import list_presets, load_preset
+
+    assert [item.name for item in list_presets(workflow="legacy-sim")] == [
+        "legacy-sim-full-effects-production",
+        "legacy-sim-full-effects-smoke",
+    ]
+
+    smoke = load_preset("legacy-sim-full-effects-smoke")
+    production = load_preset("legacy-sim-full-effects-production")
+
+    assert smoke.simulation_spec.detector.shape == (9, 9)
+    assert smoke.simulation_spec.psf.n_jitter_integrated_psf_models == 1
+    assert isinstance(smoke.run_config.workload, LegacyWorkload)
+    assert smoke.run_config.execution.backend == "local-ray"
+
+    spec = production.simulation_spec
+    assert spec.detector.shape == (101, 101)
+    assert spec.observation.resolved_n_frames == 360
+    assert spec.psf.n_jitter_integrated_psf_models == 300
+    assert spec.psf.n_jitter_frames_per_model == 600
+    assert production.run_config.workload.stars_per_run == 100
+    assert production.run_config.workload.store_images is False
+
+
 def test_unknown_preset_is_rejected() -> None:
     from et_mainsim.presets import load_preset
 

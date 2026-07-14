@@ -12,6 +12,8 @@ def test_cli_lists_and_shows_presets(capsys) -> None:
     listed = capsys.readouterr().out
     assert "et-full-frame-smoke" in listed
     assert "et-full-frame-production" in listed
+    assert "et-stamp-production" in listed
+    assert "legacy-sim-full-effects-production" in listed
 
     assert main(["show", "et-full-frame-smoke", "--format", "json"]) == 0
     shown = json.loads(capsys.readouterr().out)
@@ -80,3 +82,64 @@ def test_cli_reports_preflight_errors_without_traceback(tmp_path, capsys) -> Non
     error = capsys.readouterr().err
     assert "Photsim7 data root does not exist" in error
     assert "Traceback" not in error
+
+
+def test_cli_stamp_table_dry_run_is_read_only_and_query_independent(
+    tmp_path, capsys
+) -> None:
+    from et_mainsim.cli import main
+
+    table = tmp_path / "targets.csv"
+    table.write_text("gaia_g_mag,psf_id\n12.0,0\n", encoding="utf-8")
+    output_root = tmp_path / "must-not-exist"
+
+    code = main(
+        [
+            "run",
+            "et-stamp",
+            "--preset",
+            "smoke",
+            "--input-table",
+            str(table),
+            "--output-root",
+            str(output_root),
+            "--dry-run",
+        ]
+    )
+
+    assert code == 0
+    assert not output_root.exists()
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["workflow"] == "et-stamp"
+    assert plan["workload"]["input_mode"] == "table"
+    assert plan["workload"]["include_neighbors"] is False
+    assert plan["simulation_spec"]["catalog"]["source_type"] == "prepared"
+    assert plan["input_table"] == str(table)
+
+
+def test_cli_legacy_dry_run_exposes_full_effect_workload(tmp_path, capsys) -> None:
+    from et_mainsim.cli import main
+
+    output_root = tmp_path / "must-not-exist"
+    code = main(
+        [
+            "run",
+            "legacy-sim",
+            "--preset",
+            "full-effects-smoke",
+            "--output-root",
+            str(output_root),
+            "--stars-per-run",
+            "3",
+            "--dry-run",
+        ]
+    )
+
+    assert code == 0
+    assert not output_root.exists()
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["workflow"] == "legacy-sim"
+    assert plan["workload"]["stars_per_run"] == 3
+    effects = plan["effect_contract"]["effects"]
+    assert sum(item["enabled"] for item in effects) == 23
+    assert sum(not item["enabled"] for item in effects) == 4

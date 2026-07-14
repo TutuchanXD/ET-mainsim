@@ -373,3 +373,84 @@ def test_run_records_worker_failure_in_manifest(tmp_path) -> None:
         "message": "service construction failed",
     }
     assert manifest["attempts"][-1]["status"] == "failed"
+
+
+def test_full_frame_plan_accepts_explicit_external_catalog_cache(tmp_path) -> None:
+    from et_mainsim.config import RunPaths
+    from et_mainsim.presets import load_preset
+    from et_mainsim.workflows.full_frame import build_run_plan
+
+    loaded = load_preset("et-full-frame-smoke")
+    external_cache = tmp_path / "shared" / "stars.npz"
+    config = replace(
+        loaded.run_config,
+        paths=RunPaths(
+            output_root=str(tmp_path / "results"),
+            data_root=str(tmp_path / "data"),
+            catalog_cache=str(external_cache),
+        ),
+    )
+
+    plan = build_run_plan(
+        preset_name=loaded.descriptor.name,
+        run_config=config,
+        spec=loaded.simulation_spec,
+        repo_root=tmp_path,
+    )
+
+    assert plan.catalog_cache == external_cache
+    assert plan.spec.catalog.cache_path == str(external_cache)
+
+
+def test_full_frame_preflight_allows_validatable_cache_without_query_assets(
+    tmp_path,
+) -> None:
+    from et_mainsim.config import RunPaths
+    from et_mainsim.presets import load_preset
+    from et_mainsim.workflows.full_frame import build_run_plan, preflight
+
+    loaded = load_preset("et-full-frame-production")
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    cache = tmp_path / "cache" / "stars.npz"
+    cache.parent.mkdir()
+    cache.touch()
+    registry = tmp_path / "focalplane" / "data"
+    registry.mkdir(parents=True)
+    config = replace(
+        loaded.run_config,
+        paths=RunPaths(
+            output_root=str(tmp_path / "output"),
+            data_root=str(data_root),
+            focalplane_registry=str(registry),
+            catalog_cache=str(cache),
+        ),
+    )
+    plan = build_run_plan(
+        preset_name=loaded.descriptor.name,
+        run_config=config,
+        spec=loaded.simulation_spec,
+        repo_root=tmp_path,
+    )
+
+    preflight(plan)
+
+    forced = replace(
+        plan,
+        run_config=replace(
+            plan.run_config,
+            execution=replace(plan.run_config.execution, force_catalog_cache=True),
+        ),
+    )
+    with pytest.raises(FileNotFoundError, match="catalog directory"):
+        preflight(forced)
+
+    missing_registry = replace(
+        plan,
+        spec=replace(
+            plan.spec,
+            catalog=replace(plan.spec.catalog, registry_data_dir=""),
+        ),
+    )
+    with pytest.raises(FileNotFoundError, match="focal-plane data"):
+        preflight(missing_registry)

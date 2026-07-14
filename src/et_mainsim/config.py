@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 import tomllib
@@ -10,8 +11,13 @@ from typing import Any, Mapping, Sequence
 
 EXECUTION_SCHEMA_ID = "et_mainsim.execution_config"
 EXECUTION_SCHEMA_VERSION = 1
-_BACKENDS = frozenset({"in-process", "local-subprocess"})
+_BACKENDS = frozenset({"in-process", "local-subprocess", "local-ray"})
 _DEVICES = frozenset({"cpu", "cuda"})
+_WORKFLOW_KINDS = {
+    "et-full-frame": "full-frame",
+    "et-stamp": "stamp",
+    "legacy-sim": "legacy",
+}
 _ENV_PATTERN = re.compile(
     r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
 )
@@ -23,9 +29,16 @@ class RunPaths:
     data_root: str = ""
     catalog_path: str = ""
     focalplane_registry: str = ""
+    catalog_cache: str = ""
 
     def __post_init__(self) -> None:
-        for name in ("output_root", "data_root", "catalog_path", "focalplane_registry"):
+        for name in (
+            "output_root",
+            "data_root",
+            "catalog_path",
+            "focalplane_registry",
+            "catalog_cache",
+        ):
             value = getattr(self, name)
             if not isinstance(value, str):
                 raise ValueError(f"paths.{name} must be a string")
@@ -37,6 +50,7 @@ class ResolvedRunPaths:
     data_root: Path | None
     catalog_path: Path | None
     focalplane_registry: Path | None
+    catalog_cache: Path | None = None
 
     def to_dict(self) -> dict[str, str | None]:
         return {
@@ -49,6 +63,9 @@ class ResolvedRunPaths:
                 None
                 if self.focalplane_registry is None
                 else str(self.focalplane_registry)
+            ),
+            "catalog_cache": (
+                None if self.catalog_cache is None else str(self.catalog_cache)
             ),
         }
 
@@ -68,6 +85,9 @@ class ExecutionConfig:
     progress: bool = False
     save_cosmic_mask: bool = False
     save_stellar_mean: bool = False
+    ray_actor_count: int = 1
+    ray_num_cpus: int = 1
+    ray_num_gpus: int = 0
 
     def __post_init__(self) -> None:
         backend = str(self.backend).strip().lower()
@@ -95,6 +115,20 @@ class ExecutionConfig:
             )
         if backend == "in-process" and int(self.workers_per_device) != 1:
             raise ValueError("in-process execution requires workers_per_device=1")
+        if int(self.ray_actor_count) <= 0:
+            raise ValueError("ray_actor_count must be positive")
+        ray_num_cpus = float(self.ray_num_cpus)
+        ray_num_gpus = float(self.ray_num_gpus)
+        if not math.isfinite(ray_num_cpus) or ray_num_cpus <= 0.0:
+            raise ValueError("ray_num_cpus must be finite and positive")
+        if not math.isfinite(ray_num_gpus) or ray_num_gpus < 0.0:
+            raise ValueError("ray_num_gpus must be finite and non-negative")
+        if not ray_num_cpus.is_integer():
+            raise ValueError("ray_num_cpus must be an integer")
+        if not ray_num_gpus.is_integer():
+            raise ValueError("ray_num_gpus must be an integer")
+        if backend == "local-ray" and int(self.workers_per_device) != 1:
+            raise ValueError("local-ray execution requires workers_per_device=1")
 
         indices = None
         if self.frame_indices is not None:
@@ -120,6 +154,9 @@ class ExecutionConfig:
         object.__setattr__(self, "progress", bool(self.progress))
         object.__setattr__(self, "save_cosmic_mask", bool(self.save_cosmic_mask))
         object.__setattr__(self, "save_stellar_mean", bool(self.save_stellar_mean))
+        object.__setattr__(self, "ray_actor_count", int(self.ray_actor_count))
+        object.__setattr__(self, "ray_num_cpus", int(ray_num_cpus))
+        object.__setattr__(self, "ray_num_gpus", int(ray_num_gpus))
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -139,6 +176,122 @@ class WorkerAssignment:
 
 
 @dataclass(frozen=True)
+class FullFrameWorkload:
+    kind: str = "full-frame"
+
+    def __post_init__(self) -> None:
+        if str(self.kind).strip().lower() != "full-frame":
+            raise ValueError("full-frame workload kind must be 'full-frame'")
+        object.__setattr__(self, "kind", "full-frame")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class StampWorkload:
+    kind: str = "stamp"
+    input_mode: str = "catalog"
+    input_table: str = ""
+    target_source_ids: tuple[int, ...] = field(default_factory=tuple)
+    target_limit: int = 0
+    stamp_rows: int = 15
+    stamp_cols: int = 15
+    include_neighbors: bool = True
+    save_raw: bool = True
+    save_coadd: bool = True
+    save_electron_components: bool = False
+
+    def __post_init__(self) -> None:
+        kind = str(self.kind).strip().lower()
+        input_mode = str(self.input_mode).strip().lower()
+        input_table = str(self.input_table).strip()
+        if kind != "stamp":
+            raise ValueError("stamp workload kind must be 'stamp'")
+        if input_mode not in {"catalog", "table"}:
+            raise ValueError("stamp input_mode must be 'catalog' or 'table'")
+        if input_mode == "table" and not input_table:
+            raise ValueError("stamp table input_mode requires input_table")
+        if input_mode == "table" and bool(self.include_neighbors):
+            raise ValueError(
+                "stamp table input_mode requires include_neighbors=false"
+            )
+        if input_mode == "catalog" and input_table:
+            raise ValueError("stamp catalog input_mode cannot set input_table")
+        rows = int(self.stamp_rows)
+        cols = int(self.stamp_cols)
+        target_limit = int(self.target_limit)
+        if rows <= 0 or cols <= 0:
+            raise ValueError("stamp_rows and stamp_cols must be positive")
+        if target_limit < 0:
+            raise ValueError("target_limit must be non-negative")
+        if not bool(self.save_raw) and not bool(self.save_coadd):
+            raise ValueError("stamp workload must save raw, coadd, or both")
+        target_ids = tuple(dict.fromkeys(int(value) for value in self.target_source_ids))
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "input_mode", input_mode)
+        object.__setattr__(self, "input_table", input_table)
+        object.__setattr__(self, "target_source_ids", target_ids)
+        object.__setattr__(self, "target_limit", target_limit)
+        object.__setattr__(self, "stamp_rows", rows)
+        object.__setattr__(self, "stamp_cols", cols)
+        object.__setattr__(self, "include_neighbors", bool(self.include_neighbors))
+        object.__setattr__(self, "save_raw", bool(self.save_raw))
+        object.__setattr__(self, "save_coadd", bool(self.save_coadd))
+        object.__setattr__(
+            self,
+            "save_electron_components",
+            bool(self.save_electron_components),
+        )
+
+    @property
+    def stamp_shape(self) -> tuple[int, int]:
+        return self.stamp_rows, self.stamp_cols
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["target_source_ids"] = list(self.target_source_ids)
+        return payload
+
+
+@dataclass(frozen=True)
+class LegacyWorkload:
+    kind: str = "legacy"
+    run_count: int = 1
+    stars_per_run: int = 1
+    store_images: bool = False
+    et_mag_min: float = 7.0
+    et_mag_max: float = 17.0
+
+    def __post_init__(self) -> None:
+        kind = str(self.kind).strip().lower()
+        run_count = int(self.run_count)
+        stars_per_run = int(self.stars_per_run)
+        et_mag_min = float(self.et_mag_min)
+        et_mag_max = float(self.et_mag_max)
+        if kind != "legacy":
+            raise ValueError("legacy workload kind must be 'legacy'")
+        if run_count <= 0 or stars_per_run <= 0:
+            raise ValueError("run_count and stars_per_run must be positive")
+        if not all(math.isfinite(value) for value in (et_mag_min, et_mag_max)):
+            raise ValueError("legacy ET magnitude bounds must be finite")
+        if et_mag_min > et_mag_max:
+            raise ValueError("et_mag_min must not exceed et_mag_max")
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "run_count", run_count)
+        object.__setattr__(self, "stars_per_run", stars_per_run)
+        object.__setattr__(self, "store_images", bool(self.store_images))
+        object.__setattr__(self, "et_mag_min", et_mag_min)
+        object.__setattr__(self, "et_mag_max", et_mag_max)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+WorkloadConfig = FullFrameWorkload | StampWorkload | LegacyWorkload
+
+
+@dataclass(frozen=True)
 class RunConfig:
     schema_id: str
     schema_version: int
@@ -146,6 +299,7 @@ class RunConfig:
     run_id: str
     paths: RunPaths = field(default_factory=RunPaths)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    workload: WorkloadConfig = field(default_factory=FullFrameWorkload)
     source: str = "<memory>"
 
     def __post_init__(self) -> None:
@@ -159,6 +313,23 @@ class RunConfig:
             raise ValueError("workflow must be non-empty")
         if not str(self.run_id).strip():
             raise ValueError("run_id must be non-empty")
+        workflow = str(self.workflow).strip()
+        expected_kind = _WORKFLOW_KINDS.get(workflow)
+        if expected_kind is None:
+            raise ValueError(
+                f"workflow must be one of {sorted(_WORKFLOW_KINDS)}"
+            )
+        if self.workload.kind != expected_kind:
+            raise ValueError(
+                f"workload kind {self.workload.kind!r} does not match workflow "
+                f"{workflow!r}"
+            )
+        backend = self.execution.backend
+        if workflow == "legacy-sim" and backend != "local-ray":
+            raise ValueError("legacy-sim requires the local-ray backend")
+        if workflow != "legacy-sim" and backend == "local-ray":
+            raise ValueError("local-ray backend is reserved for legacy-sim")
+        object.__setattr__(self, "workflow", workflow)
 
     @classmethod
     def from_toml(cls, text: str | bytes, *, source: str = "<memory>") -> "RunConfig":
@@ -179,13 +350,24 @@ class RunConfig:
             "run_id",
             "paths",
             "execution",
+            "workload",
         }
         unknown = sorted(set(payload) - allowed)
         if unknown:
             raise ValueError(f"Unknown run config fields: {', '.join(unknown)}")
 
+        workflow = str(payload.get("workflow", "")).strip()
+        if not workflow:
+            raise ValueError("workflow must be non-empty")
+        expected_kind = _WORKFLOW_KINDS.get(workflow)
+        if expected_kind is None:
+            raise ValueError(
+                f"workflow must be one of {sorted(_WORKFLOW_KINDS)}"
+            )
+
         path_payload = dict(payload.get("paths", {}))
         execution_payload = dict(payload.get("execution", {}))
+        workload_payload = dict(payload.get("workload", {}))
         path_unknown = sorted(set(path_payload) - set(RunPaths.__dataclass_fields__))
         execution_unknown = sorted(
             set(execution_payload) - set(ExecutionConfig.__dataclass_fields__)
@@ -196,13 +378,31 @@ class RunConfig:
             raise ValueError(
                 f"Unknown execution fields: {', '.join(execution_unknown)}"
             )
+        kind = str(workload_payload.get("kind", expected_kind or "")).strip().lower()
+        workload_types = {
+            "full-frame": FullFrameWorkload,
+            "stamp": StampWorkload,
+            "legacy": LegacyWorkload,
+        }
+        workload_type = workload_types.get(kind)
+        if workload_type is None:
+            raise ValueError(f"Unknown workload kind {kind!r}")
+        workload_unknown = sorted(
+            set(workload_payload) - set(workload_type.__dataclass_fields__)
+        )
+        if workload_unknown:
+            raise ValueError(
+                f"Unknown workload fields: {', '.join(workload_unknown)}"
+            )
+        workload_payload.setdefault("kind", kind)
         return cls(
             schema_id=str(payload.get("schema_id", "")),
             schema_version=int(payload.get("schema_version", 0)),
-            workflow=str(payload.get("workflow", "")),
+            workflow=workflow,
             run_id=str(payload.get("run_id", "")),
             paths=RunPaths(**path_payload),
             execution=ExecutionConfig(**execution_payload),
+            workload=workload_type(**workload_payload),
             source=source,
         )
 
@@ -238,11 +438,17 @@ class RunConfig:
             env=values,
             cwd=base,
         )
+        catalog_cache = _optional_path(
+            self.paths.catalog_cache or values.get("ET_CATALOG_CACHE", ""),
+            env=values,
+            cwd=base,
+        )
         return ResolvedRunPaths(
             output_root=output_root,
             data_root=data_root,
             catalog_path=catalog_path,
             focalplane_registry=focalplane_registry,
+            catalog_cache=catalog_cache,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -253,6 +459,7 @@ class RunConfig:
             "run_id": self.run_id,
             "paths": asdict(self.paths),
             "execution": self.execution.to_dict(),
+            "workload": self.workload.to_dict(),
             "source": self.source,
         }
 
@@ -312,6 +519,8 @@ def parse_frame_indices(
 
 
 def worker_assignments(execution: ExecutionConfig) -> tuple[WorkerAssignment, ...]:
+    if execution.backend == "local-ray":
+        raise ValueError("local-ray execution is managed by the legacy workflow")
     if execution.backend == "in-process":
         return (
             WorkerAssignment(
@@ -345,9 +554,13 @@ __all__ = [
     "EXECUTION_SCHEMA_ID",
     "EXECUTION_SCHEMA_VERSION",
     "ExecutionConfig",
+    "FullFrameWorkload",
+    "LegacyWorkload",
     "ResolvedRunPaths",
     "RunConfig",
     "RunPaths",
+    "StampWorkload",
+    "WorkloadConfig",
     "WorkerAssignment",
     "parse_frame_indices",
     "worker_assignments",
