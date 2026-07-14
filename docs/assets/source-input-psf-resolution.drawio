@@ -1,0 +1,99 @@
+<mxfile host="Electron" modified="2026-07-15T00:00:00.000Z" agent="Codex" version="24.7.17">
+  <diagram id="source-psf-resolution" name="Source input and PSF resolution">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1700" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="title" value="变量源输入、坐标映射与 PSF 选择（建议的第一版合同）" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=24;fontStyle=1;fontColor=#1F2937;" vertex="1" parent="1">
+          <mxGeometry x="70" y="35" width="1350" height="45" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="input" value="&lt;b&gt;每个源的输入&lt;/b&gt;&lt;br&gt;Gaia G（Vega）基准星等&lt;br&gt;relative_flux[0 … N−1]（N = raw 帧数）&lt;br&gt;位置模式：RA/Dec 或显式 PSF ID" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;fillColor=#E8F0FE;strokeColor=#5B8DEF;strokeWidth=2;fontSize=15;fontColor=#172554;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="70" y="120" width="310" height="145" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="decision" value="提供了完整的&lt;br&gt;RA + Dec？" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFF4D6;strokeColor=#D9A21B;strokeWidth=2;fontSize=16;fontStyle=1;fontColor=#713F12;" vertex="1" parent="1">
+          <mxGeometry x="470" y="130" width="180" height="125" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="sky_validate" value="&lt;b&gt;天球坐标模式&lt;/b&gt;&lt;br&gt;校验 RA/Dec 成对、有限&lt;br&gt;加载指定 et_focalplane registry / pointing" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;fillColor=#E7F7EF;strokeColor=#3A9D68;strokeWidth=2;fontSize=14;fontColor=#14532D;spacing=9;" vertex="1" parent="1">
+          <mxGeometry x="750" y="95" width="320" height="115" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="explicit" value="&lt;b&gt;显式 PSF 模式&lt;/b&gt;&lt;br&gt;必须提供 PSF ID 并验证 bundle 中存在&lt;br&gt;另需 detector/stamp 放置坐标；未给时使用已声明的中心默认值" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;fillColor=#F3E8FF;strokeColor=#9561C9;strokeWidth=2;fontSize=14;fontColor=#581C87;spacing=9;" vertex="1" parent="1">
+          <mxGeometry x="750" y="275" width="340" height="130" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="focal" value="&lt;b&gt;et_coord.sky_to_focal&lt;/b&gt;&lt;br&gt;输出 detector_id、xpix/ypix、field_x_deg、field_y_deg" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;fillColor=#E7F7EF;strokeColor=#3A9D68;strokeWidth=2;fontSize=14;fontColor=#14532D;spacing=9;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="95" width="330" height="115" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="out_of_fov" value="status ≠ ok / 不在视场内&lt;br&gt;&lt;b&gt;立即报错，不外推到最近探测器&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;fillColor=#FDECEC;strokeColor=#D9534F;strokeWidth=2;fontSize=14;fontColor=#7F1D1D;spacing=9;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="275" width="330" height="85" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="radius" value="视场半径&lt;br&gt;&lt;b&gt;field_angle_deg = hypot(field_x_deg, field_y_deg)&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;fillColor=#DFF4F6;strokeColor=#2A9D8F;strokeWidth=2;fontSize=14;fontColor=#134E4A;spacing=9;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="430" width="330" height="90" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="nearest" value="&lt;b&gt;Photsim7 nearest policy&lt;/b&gt;&lt;br&gt;选择 |源视场半径 − PSF 采样角| 最小的 field ID&lt;br&gt;平局时选择较小 ID" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;fillColor=#DFF4F6;strokeColor=#2A9D8F;strokeWidth=2;fontSize=14;fontColor=#134E4A;spacing=9;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="585" width="330" height="115" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="resolved" value="&lt;b&gt;已解析源&lt;/b&gt;&lt;br&gt;source_id + detector/stamp 位置 + 确定 PSF ID&lt;br&gt;记录 registry、bundle、所选角度及距离" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;fillColor=#E8F0FE;strokeColor=#5B8DEF;strokeWidth=2;fontSize=15;fontColor=#172554;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="720" y="585" width="350" height="115" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="frame_flux" value="&lt;b&gt;raw 帧 i 的期望电子数&lt;/b&gt;&lt;br&gt;Gaia G（Vega）基准电子数 × relative_flux[i]&lt;br&gt;长度不等于 N：渲染前报错" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;fillColor=#FFF4D6;strokeColor=#D9A21B;strokeWidth=2;fontSize=15;fontColor=#713F12;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="310" y="585" width="330" height="115" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="detector_chain" value="单源 PSF 渲染 → 邻星求和 → stellar Poisson → 背景/探测器链 → raw → coadd" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;fillColor=#EAF7E5;strokeColor=#67A84B;strokeWidth=2;fontSize=16;fontStyle=1;fontColor=#365314;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="430" y="805" width="760" height="80" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e_input_decision" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#64748B;strokeWidth=2;" edge="1" parent="1" source="input" target="decision">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_yes" value="是" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#3A9D68;strokeWidth=2;fontSize=14;fontStyle=1;" edge="1" parent="1" source="decision" target="sky_validate">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_no" value="否" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#9561C9;strokeWidth=2;fontSize=14;fontStyle=1;" edge="1" parent="1" source="decision" target="explicit">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_validate_focal" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#3A9D68;strokeWidth=2;" edge="1" parent="1" source="sky_validate" target="focal">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_focal_fail" value="失败" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#D9534F;strokeWidth=2;fontSize=13;" edge="1" parent="1" source="focal" target="out_of_fov">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_focal_radius" value="status = ok" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2A9D8F;strokeWidth=2;fontSize=13;" edge="1" parent="1" source="focal" target="radius">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="1125" y="235"/><mxPoint x="1125" y="475"/></Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_radius_nearest" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2A9D8F;strokeWidth=2;" edge="1" parent="1" source="radius" target="nearest">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_nearest_resolved" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2A9D8F;strokeWidth=2;" edge="1" parent="1" source="nearest" target="resolved">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_explicit_resolved" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#9561C9;strokeWidth=2;" edge="1" parent="1" source="explicit" target="resolved">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_input_flux" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#D9A21B;strokeWidth=2;" edge="1" parent="1" source="input" target="frame_flux">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="225" y="642"/></Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_flux_chain" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#67A84B;strokeWidth=2;" edge="1" parent="1" source="frame_flux" target="detector_chain">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_resolved_chain" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#67A84B;strokeWidth=2;" edge="1" parent="1" source="resolved" target="detector_chain">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

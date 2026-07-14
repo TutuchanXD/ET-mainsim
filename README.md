@@ -69,12 +69,30 @@ et-mainsim run et-stamp \
   --input-table targets.csv
 ```
 
-Required columns are `gaia_g_mag` (Gaia G, Vega) and `psf_id`. Optional
-`source_id`, `detector_xpix`, and `detector_ypix` columns are supported; both
-coordinates must be supplied together. Missing coordinates default to the
-physical detector center. The current documented conversion is
-`et_mag (AB) = gaia_g_mag (Vega)` for G2V-like sources. See the packaged
-`et_stamp_table_example.csv` and [stamp workflow](docs/stamp_workflow.md).
+`gaia_g_mag` (Gaia G, Vega) is required. Location is mutually exclusive:
+provide ICRS/J2000 `ra_deg` plus `dec_deg` for focal-plane mapping and nearest
+radial PSF selection, or omit sky coordinates and provide an explicit
+`psf_id`. In explicit-PSF mode, optional `detector_xpix` plus
+`detector_ypix` default together to the physical detector center. The current
+documented conversion is `et_mag (AB) = gaia_g_mag (Vega)` for G2V-like
+sources.
+
+Frame-aligned intrinsic variability is an optional second long-format table:
+
+```bash
+et-mainsim run et-stamp \
+  --preset production \
+  --input-table targets.ecsv \
+  --variability-table variability.ecsv
+```
+
+Targets link to curves with optional `curve_id`; each variability curve must
+contain exactly one finite, non-negative `relative_flux` for every raw
+`frame_index`. Input time columns are not interpreted. See the packaged
+`et_stamp_variability_target_example.csv` plus
+`et_stamp_variability_example.csv`, [stamp workflow](docs/stamp_workflow.md),
+and the [Chinese science-team input
+contract](docs/source_variability_inputs_zh.md).
 
 ## Run Contract
 
@@ -89,8 +107,9 @@ locations, completion summary, or failure. Identity drift fails closed.
 
 - Full frame resumes only validated NPY + summary + schema items.
 - Stamp resumes HDF5 shard items and skips only a fully validated target.
-  Direct-table identity includes the resolved path, byte size, and nanosecond
-  modification time; changing the table requires a new run ID or overwrite.
+  Direct-table identity includes the resolved path, byte size, and SHA-256;
+  variability truth is also content-validated before a target is skipped.
+  Changing an input requires a new run ID or overwrite.
 - Legacy skips only an entirely complete workload; partial pickle/OA output is
   rejected and requires `--overwrite` or a new run ID.
 - `--dry-run` creates no output and initializes no catalog, PSF, CUDA, or Ray.

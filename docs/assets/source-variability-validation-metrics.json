@@ -1,0 +1,46 @@
+{
+  "acceptance": {
+    "final_paired_pearson_r_ge_0_95": true,
+    "no_nan": true,
+    "no_saturation": true,
+    "stellar_mean_ratio_error_le_1e-4": true
+  },
+  "aperture_radius_pix": 4.0,
+  "background_annulus_pix": [
+    5.5,
+    7.0
+  ],
+  "curve_id": "sn_gaia_g_short_validation",
+  "final_paired_intercept": 0.02038891815633277,
+  "final_paired_pearson_r": 0.9963334016813487,
+  "final_paired_rmse": 0.0289174733296599,
+  "final_paired_slope": 1.0196724630019594,
+  "frame_count": 22,
+  "has_nan": false,
+  "has_saturation": false,
+  "ignored_input_time_columns": [
+    "time",
+    "observer_time"
+  ],
+  "injected_nan_pixel_count": 0,
+  "injected_run_dir": "/cluster/home/cxgao/sshfs-share/et_mainsim/source_variability_validation/cluster_cpu_20260715/injected/source-variability-sn-validation",
+  "injected_saturated_pixel_count": 0,
+  "invalid_metric_frame_count": 0,
+  "magnitude_semantics": "Gaia_G_Vega",
+  "magnitude_semantics_note": "truncated_gaia_g_ab_treated_as_gaia_g_vega_engineering_proxy",
+  "schema_id": "et_mainsim.source_variability_validation_metrics",
+  "schema_version": 1,
+  "source_band": "gaia_g_3260_9290",
+  "source_id": 900000000000001,
+  "source_path": "/cluster/home/cxgao/sshfs-share/et_mainsim/source_variability_validation/input/z0p03_Ia_GaiaG_simulated_photometry.csv",
+  "source_sha256": "fb11b6454c7df58bab15f154091b2b6871c78d91d085adda5dbc73ca1431e2b4",
+  "source_zpsys": "ab",
+  "static_fractional_rms": 0.1279797147939756,
+  "static_nan_pixel_count": 0,
+  "static_reference_final_flux": 1791.25,
+  "static_run_dir": "/cluster/home/cxgao/sshfs-share/et_mainsim/source_variability_validation/cluster_cpu_20260715/static/source-variability-sn-validation",
+  "static_saturated_pixel_count": 0,
+  "stellar_mean_ratio_max_abs_error": 5.976430839105262e-08,
+  "time_alignment": "simulation_raw_frame_index",
+  "valid_metric_frame_count": 22
+}
