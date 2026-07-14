@@ -35,6 +35,9 @@ args=(
 if [[ -n "${INPUT_TABLE:-}" ]]; then
   args+=(--input-table "${INPUT_TABLE}")
 fi
+if [[ -n "${VARIABILITY_TABLE:-}" ]]; then
+  args+=(--variability-table "${VARIABILITY_TABLE}")
+fi
 if [[ -n "${FRAMES:-}" ]]; then
   args+=(--frames "${FRAMES}")
 fi

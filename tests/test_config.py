@@ -174,6 +174,7 @@ run_id = "table-stamps"
 kind = "stamp"
 input_mode = "table"
 input_table = "targets.csv"
+variability_table = "curves.ecsv"
 stamp_rows = 15
 stamp_cols = 17
 include_neighbors = false
@@ -189,6 +190,7 @@ device = "cpu"
     assert isinstance(config.workload, StampWorkload)
     assert config.workload.input_mode == "table"
     assert config.workload.input_table == "targets.csv"
+    assert config.workload.variability_table == "curves.ecsv"
     assert config.workload.stamp_shape == (15, 17)
     assert config.to_dict()["workload"]["kind"] == "stamp"
 
@@ -203,6 +205,10 @@ device = "cpu"
         (
             'kind = "stamp"\ninput_mode = "table"\ninput_table = "x.csv"\ninclude_neighbors = true',
             "include_neighbors",
+        ),
+        (
+            'kind = "stamp"\ninput_mode = "catalog"\nvariability_table = "curves.csv"',
+            "variability_table",
         ),
         ('kind = "legacy"', "match workflow"),
     ],

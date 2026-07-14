@@ -13,6 +13,7 @@ focalplane_registry = ""
 kind = "stamp"
 input_mode = "catalog"
 input_table = ""
+variability_table = ""
 target_source_ids = [1]
 target_limit = 1
 stamp_rows = 15

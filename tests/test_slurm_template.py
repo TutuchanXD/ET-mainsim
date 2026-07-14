@@ -22,6 +22,8 @@ def test_stamp_and_legacy_slurm_templates_use_maintained_cli() -> None:
     assert "--preset \"${PRESET:-production}\"" in stamp
     assert 'if [[ -n "${INPUT_TABLE:-}" ]]' in stamp
     assert 'args+=(--input-table "${INPUT_TABLE}")' in stamp
+    assert 'if [[ -n "${VARIABILITY_TABLE:-}" ]]' in stamp
+    assert 'args+=(--variability-table "${VARIABILITY_TABLE}")' in stamp
     assert '-z "${ET_CATALOG_CACHE:-}"' in stamp
     assert "python -m et_mainsim run legacy-sim" in legacy
     assert "--preset \"${PRESET:-full-effects-production}\"" in legacy

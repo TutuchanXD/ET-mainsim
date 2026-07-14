@@ -90,7 +90,14 @@ def test_cli_stamp_table_dry_run_is_read_only_and_query_independent(
     from et_mainsim.cli import main
 
     table = tmp_path / "targets.csv"
-    table.write_text("gaia_g_mag,psf_id\n12.0,0\n", encoding="utf-8")
+    table.write_text(
+        "gaia_g_mag,psf_id,curve_id\n12.0,0,sn\n", encoding="utf-8"
+    )
+    curves = tmp_path / "curves.csv"
+    curves.write_text(
+        "curve_id,frame_index,relative_flux\nsn,0,1\nsn,1,2\n",
+        encoding="utf-8",
+    )
     output_root = tmp_path / "must-not-exist"
 
     code = main(
@@ -101,6 +108,8 @@ def test_cli_stamp_table_dry_run_is_read_only_and_query_independent(
             "smoke",
             "--input-table",
             str(table),
+            "--variability-table",
+            str(curves),
             "--output-root",
             str(output_root),
             "--dry-run",
@@ -115,6 +124,7 @@ def test_cli_stamp_table_dry_run_is_read_only_and_query_independent(
     assert plan["workload"]["include_neighbors"] is False
     assert plan["simulation_spec"]["catalog"]["source_type"] == "prepared"
     assert plan["input_table"] == str(table)
+    assert plan["variability_table"] == str(curves)
 
 
 def test_cli_legacy_dry_run_exposes_full_effect_workload(tmp_path, capsys) -> None:

@@ -108,6 +108,7 @@ def _parser() -> argparse.ArgumentParser:
     stamp.add_argument("--save-cosmic-mask", action="store_true")
     stamp.add_argument("--save-stellar-mean", action="store_true")
     stamp.add_argument("--input-table")
+    stamp.add_argument("--variability-table")
     stamp.add_argument("--target-source-id", type=int, action="append")
     stamp.add_argument("--target-limit", type=int)
     stamp.add_argument("--stamp-rows", type=int)
@@ -313,6 +314,8 @@ def _stamp_config_from_args(args, loaded) -> RunConfig:
             target_limit=0,
             include_neighbors=False,
         )
+    if args.variability_table is not None:
+        updates["variability_table"] = str(args.variability_table)
     if args.target_source_id is not None:
         updates["target_source_ids"] = tuple(args.target_source_id)
     if args.target_limit is not None:
