@@ -331,6 +331,11 @@ def preflight(plan: StampRunPlan) -> None:
                 f"stamp target table does not exist: {plan.input_table_path}"
             )
         return
+    if (
+        plan.catalog_cache.is_file()
+        and not plan.run_config.execution.force_catalog_cache
+    ):
+        return
     catalog = plan.spec.catalog
     if catalog.source_type == "et_focalplane_query":
         if not catalog.source_path or not Path(catalog.source_path).is_dir():

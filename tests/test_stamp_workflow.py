@@ -61,6 +61,45 @@ def test_table_stamp_plan_does_not_require_full_frame_catalog_assets(tmp_path) -
     assert not plan.run_dir.exists()
 
 
+def test_catalog_stamp_preflight_allows_cache_without_query_assets(tmp_path) -> None:
+    from et_mainsim.config import RunPaths
+    from et_mainsim.presets import load_preset
+    from et_mainsim.workflows.stamp import build_run_plan, preflight
+
+    loaded = load_preset("et-stamp-production")
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    cache = tmp_path / "cache" / "stars.npz"
+    cache.parent.mkdir()
+    cache.touch()
+    config = replace(
+        loaded.run_config,
+        paths=RunPaths(
+            output_root=str(tmp_path / "output"),
+            data_root=str(data_root),
+            catalog_cache=str(cache),
+        ),
+    )
+    plan = build_run_plan(
+        preset_name=loaded.descriptor.name,
+        run_config=config,
+        spec=loaded.simulation_spec,
+        repo_root=tmp_path,
+    )
+
+    preflight(plan)
+
+    forced = replace(
+        plan,
+        run_config=replace(
+            plan.run_config,
+            execution=replace(plan.run_config.execution, force_catalog_cache=True),
+        ),
+    )
+    with pytest.raises(FileNotFoundError, match="catalog directory"):
+        preflight(forced)
+
+
 def test_table_stamp_inputs_are_independent_catalogs_without_query(tmp_path) -> None:
     from photsim7.catalog_sources import PreparedStarCatalog
     from et_mainsim.workflows.stamp import prepare_stamp_inputs

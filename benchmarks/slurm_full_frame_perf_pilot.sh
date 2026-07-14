@@ -21,7 +21,7 @@ export ET_DATA_DIR="${ET_DATA_DIR:-/cluster/home/cxgao/ET/Photsim7-data}"
 export ET_FOCALPLANE_ROOT="${ET_FOCALPLANE_ROOT:-/cluster/home/cxgao/ET/et_focalplane}"
 : "${GAIA_CATALOG_DIR:?Set GAIA_CATALOG_DIR}"
 
-CACHE_ROOT="${CACHE_ROOT:-/cluster/home/cxgao/sshfs-share/main_rd_perf_8900x9120}"
+CACHE_ROOT="${CACHE_ROOT:-/cluster/home/cxgao/sshfs-share/slurm_validation/et-mainsim-final-canonical-caches}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/cluster/home/cxgao/sshfs-share/benchmarks/et_ff_perf_${SLURM_JOB_ID}}"
 FRAMES="${FRAMES:-1}"
 mkdir -p "${OUTPUT_ROOT}"
@@ -29,7 +29,7 @@ cd "${ET_MAINSIM_ROOT}"
 
 for MAG in 16 16.5 17 17.5 18; do
   TAG=${MAG//./p}
-  CACHE="${CACHE_ROOT}/main_rd_8900x9120_g_lt_${TAG}/cache/stars_main_rd_8900x9120_g_lt_${TAG}.npz"
+  CACHE="${CACHE_ROOT}/g_lt_${TAG}/stars.npz"
   test -f "${CACHE}"
   for GPU in 0 1 2; do
     CUDA_VISIBLE_DEVICES="${GPU}" python -m benchmarks.run_full_frame_thermal_load \

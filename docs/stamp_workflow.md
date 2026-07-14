@@ -15,7 +15,8 @@ first and preserves absolute detector coordinates.
 ## Input Modes
 
 Catalog mode builds one local scene and may include PSF-support-overlapping
-neighbors. It needs Gaia and ET focal-plane paths.
+neighbors. Cache generation needs Gaia and ET focal-plane paths; a subsequent
+run may use an existing canonical cache without either source directory.
 
 Table mode accepts CSV or ECSV. Required aliases normalize to `gaia_g_mag` and
 `psf_id`; optional aliases normalize to `source_id`, `detector_xpix`, and

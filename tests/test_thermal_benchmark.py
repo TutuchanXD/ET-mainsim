@@ -30,3 +30,23 @@ def test_thermal_benchmark_changes_only_explicit_load_dimensions() -> None:
     assert spec.dynamic_effects == base.dynamic_effects
     assert spec.detector_response == base.detector_response
     assert spec.readout == base.readout
+
+
+def test_thermal_benchmark_can_prepare_a_canonical_catalog_only(tmp_path) -> None:
+    from benchmarks.run_full_frame_thermal_load import _parser
+
+    args = _parser().parse_args(
+        [
+            "--output-root",
+            str(tmp_path / "output"),
+            "--run-id",
+            "catalog-g17",
+            "--catalog-cache",
+            str(tmp_path / "stars.npz"),
+            "--seed",
+            "7",
+            "--prepare-catalog-only",
+        ]
+    )
+
+    assert args.prepare_catalog_only is True

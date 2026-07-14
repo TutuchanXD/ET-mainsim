@@ -44,13 +44,17 @@ et-mainsim run et-stamp --preset smoke
 et-mainsim run legacy-sim --preset full-effects-smoke
 ```
 
-Production physical-catalog runs also require:
+Production physical-catalog cache generation also requires:
 
 ```bash
 export GAIA_CATALOG_DIR=/home/cxgao/gaia_dr3_19mag
 export ET_FOCALPLANE_ROOT=/home/cxgao/ET/et_focalplane
 export RESULTS_ROOT=/home/cxgao/Results/ET-mainsim
 ```
+
+Once a canonical cache exists, full-frame and catalog-stamp rendering can run
+without the Gaia and focal-plane source directories. Cache request metadata is
+still validated against the resolved scientific spec.
 
 ### Stamp Table Input
 

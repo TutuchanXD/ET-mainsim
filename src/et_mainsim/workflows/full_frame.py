@@ -613,6 +613,11 @@ def preflight(plan: FullFrameRunPlan) -> None:
         raise FileNotFoundError(
             f"Photsim7 data root does not exist: {plan.paths.data_root}"
         )
+    if (
+        plan.catalog_cache.is_file()
+        and not plan.run_config.execution.force_catalog_cache
+    ):
+        return
     catalog = plan.spec.catalog
     if catalog.source_type == "et_focalplane_query":
         if not catalog.source_path or not Path(catalog.source_path).is_dir():

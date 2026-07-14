@@ -21,7 +21,7 @@ export ET_DATA_DIR="${ET_DATA_DIR:-/cluster/home/cxgao/ET/Photsim7-data}"
 export ET_FOCALPLANE_ROOT="${ET_FOCALPLANE_ROOT:-/cluster/home/cxgao/ET/et_focalplane}"
 : "${GAIA_CATALOG_DIR:?Set GAIA_CATALOG_DIR}"
 
-CATALOG_CACHE="${CATALOG_CACHE:-/cluster/home/cxgao/sshfs-share/GRB/full_sim/main_rd_full_8900x9120_g17_sky22_subpix1_jipsf100_120x10s/cache/stars_main_rd_full_8900x9120_g17_sky22_subpix1_jipsf100_120x10s.npz}"
+CATALOG_CACHE="${CATALOG_CACHE:-/cluster/home/cxgao/sshfs-share/slurm_validation/et-mainsim-final-canonical-caches/g_lt_17/stars.npz}"
 OUT="${OUT:-/cluster/home/cxgao/sshfs-share/benchmarks/photsim_600w_thermal_benchmark_${SLURM_JOB_ID}}"
 test -f "${CATALOG_CACHE}"
 mkdir -p "${OUT}" /cluster/home/cxgao/sshfs-share/slurm_logs

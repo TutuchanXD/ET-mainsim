@@ -61,6 +61,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--jitter-models", type=int, default=100)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--gpu", default="0")
+    parser.add_argument(
+        "--prepare-catalog-only",
+        action="store_true",
+        help="Build and validate the canonical cache without rendering a frame.",
+    )
     return parser
 
 
@@ -110,7 +115,10 @@ def main() -> None:
         spec=spec,
         repo_root=repo_root,
     )
-    manifest = run_full_frame(plan)
+    manifest = run_full_frame(
+        plan,
+        prepare_catalog_only=args.prepare_catalog_only,
+    )
     print(plan.run_dir)
     print(manifest["completion"])
 
