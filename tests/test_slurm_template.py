@@ -30,3 +30,16 @@ def test_stamp_and_legacy_slurm_templates_use_maintained_cli() -> None:
     assert 'args+=(--frames "${FRAMES}")' in legacy
     assert 'args+=(--stars-per-run "${STARS_PER_RUN}")' in legacy
     assert "main_rd_g18_parallel" not in stamp + legacy
+
+
+def test_h100_validation_distinguishes_physical_and_visible_gpu_ids() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "slurm"
+        / "validate_source_variability.sbatch"
+    ).read_text(encoding="utf-8")
+
+    assert 'visible_gpu="${CUDA_VISIBLE_DEVICES%%,*}"' in script
+    assert 'physical_gpu="${SLURM_JOB_GPUS%%,*}"' in script
+    assert '--id="${physical_gpu}"' in script
+    assert '--gpus "${visible_gpu}"' in script

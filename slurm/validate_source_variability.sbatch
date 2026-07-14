@@ -25,9 +25,10 @@ do
   fi
 done
 
-assigned_gpu="${CUDA_VISIBLE_DEVICES%%,*}"
-if [[ -z "${assigned_gpu}" ]]; then
-  echo "Slurm did not assign a visible GPU" >&2
+visible_gpu="${CUDA_VISIBLE_DEVICES%%,*}"
+physical_gpu="${SLURM_JOB_GPUS%%,*}"
+if [[ -z "${visible_gpu}" || -z "${physical_gpu}" ]]; then
+  echo "Slurm did not expose both visible and physical GPU IDs" >&2
   exit 69
 fi
 
@@ -38,16 +39,16 @@ poll_seconds="${GPU_IDLE_POLL_SECONDS:-30}"
 timeout_seconds="${GPU_IDLE_TIMEOUT_SECONDS:-21600}"
 wait_started="${SECONDS}"
 while nvidia-smi \
-  --id="${assigned_gpu}" \
+  --id="${physical_gpu}" \
   --query-compute-apps=pid \
   --format=csv,noheader,nounits 2>/dev/null \
   | awk 'NF { found=1 } END { exit !found }'
 do
   if (( SECONDS - wait_started >= timeout_seconds )); then
-    echo "Assigned GPU ${assigned_gpu} stayed busy for ${timeout_seconds}s" >&2
+    echo "Assigned GPU ${physical_gpu} stayed busy for ${timeout_seconds}s" >&2
     exit 75
   fi
-  echo "Assigned GPU ${assigned_gpu} is busy; waiting ${poll_seconds}s"
+  echo "Assigned GPU ${physical_gpu} is busy; waiting ${poll_seconds}s"
   sleep "${poll_seconds}"
 done
 
@@ -73,7 +74,7 @@ cd "${ET_MAINSIM_WORKTREE}"
   --seed "${seed}" \
   --backend local-subprocess \
   --device cuda \
-  --gpus "${assigned_gpu}" \
+  --gpus "${visible_gpu}" \
   --workers-per-device 1
 
 echo "Validation products: ${job_output_root}/validation_products"
