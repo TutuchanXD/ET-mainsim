@@ -53,8 +53,9 @@ export RESULTS_ROOT=/home/cxgao/Results/ET-mainsim
 ```
 
 Once a canonical cache exists, full-frame and catalog-stamp rendering can run
-without the Gaia and focal-plane source directories. Cache request metadata is
-still validated against the resolved scientific spec.
+without the Gaia shard directory. The ET focal-plane registry remains a
+rendering dependency, and generation-time path identities must still match the
+resolved spec because cache request metadata is validated.
 
 ### Stamp Table Input
 

@@ -613,17 +613,12 @@ def preflight(plan: FullFrameRunPlan) -> None:
         raise FileNotFoundError(
             f"Photsim7 data root does not exist: {plan.paths.data_root}"
         )
-    if (
+    cache_available = (
         plan.catalog_cache.is_file()
         and not plan.run_config.execution.force_catalog_cache
-    ):
-        return
+    )
     catalog = plan.spec.catalog
     if catalog.source_type == "et_focalplane_query":
-        if not catalog.source_path or not Path(catalog.source_path).is_dir():
-            raise FileNotFoundError(
-                "GAIA_CATALOG_DIR or paths.catalog_path must reference a catalog directory"
-            )
         if (
             not catalog.registry_data_dir
             or not Path(catalog.registry_data_dir).is_dir()
@@ -631,11 +626,19 @@ def preflight(plan: FullFrameRunPlan) -> None:
             raise FileNotFoundError(
                 "ET_FOCALPLANE_ROOT or paths.focalplane_registry must reference focal-plane data"
             )
+        if cache_available:
+            return
+        if not catalog.source_path or not Path(catalog.source_path).is_dir():
+            raise FileNotFoundError(
+                "GAIA_CATALOG_DIR or paths.catalog_path must reference a catalog directory"
+            )
         focalplane_src = Path(catalog.query_options["et_focalplane_src"])
         if not focalplane_src.is_dir():
             raise FileNotFoundError(
                 f"ET focal-plane source does not exist: {focalplane_src}"
             )
+    elif cache_available:
+        return
     elif catalog.source_type != "prepared" and not Path(catalog.source_path).is_file():
         raise FileNotFoundError(f"Catalog source does not exist: {catalog.source_path}")
 

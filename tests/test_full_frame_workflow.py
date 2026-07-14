@@ -415,11 +415,14 @@ def test_full_frame_preflight_allows_validatable_cache_without_query_assets(
     cache = tmp_path / "cache" / "stars.npz"
     cache.parent.mkdir()
     cache.touch()
+    registry = tmp_path / "focalplane" / "data"
+    registry.mkdir(parents=True)
     config = replace(
         loaded.run_config,
         paths=RunPaths(
             output_root=str(tmp_path / "output"),
             data_root=str(data_root),
+            focalplane_registry=str(registry),
             catalog_cache=str(cache),
         ),
     )
@@ -441,3 +444,13 @@ def test_full_frame_preflight_allows_validatable_cache_without_query_assets(
     )
     with pytest.raises(FileNotFoundError, match="catalog directory"):
         preflight(forced)
+
+    missing_registry = replace(
+        plan,
+        spec=replace(
+            plan.spec,
+            catalog=replace(plan.spec.catalog, registry_data_dir=""),
+        ),
+    )
+    with pytest.raises(FileNotFoundError, match="focal-plane data"):
+        preflight(missing_registry)
