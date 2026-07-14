@@ -105,6 +105,7 @@ class RunManifestStore:
         execution: Mapping[str, Any],
         frame_plan: Mapping[str, Any],
         provenance: Mapping[str, Any],
+        workload: Mapping[str, Any] | None = None,
         artifacts: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if self.path.exists():
@@ -126,6 +127,7 @@ class RunManifestStore:
             },
             "simulation_spec": deepcopy(dict(simulation_spec)),
             "execution": deepcopy(dict(execution)),
+            "workload": deepcopy(dict(workload or {})),
             "frame_plan": deepcopy(dict(frame_plan)),
             "provenance": deepcopy(dict(provenance)),
             "catalog": None,
@@ -144,6 +146,7 @@ class RunManifestStore:
         run_id: str,
         simulation_spec: Mapping[str, Any],
         execution: Mapping[str, Any],
+        workload: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = self.load()
         if payload["workflow"] != workflow or payload["run_id"] != run_id:
@@ -152,6 +155,8 @@ class RunManifestStore:
             raise ManifestIdentityError("Existing run scientific spec conflicts")
         if _execution_identity(payload["execution"]) != _execution_identity(execution):
             raise ManifestIdentityError("Existing run execution identity conflicts")
+        if payload.get("workload", {}) != dict(workload or {}):
+            raise ManifestIdentityError("Existing run workload identity conflicts")
         return payload
 
     def transition(self, status: str, **updates: Any) -> dict[str, Any]:

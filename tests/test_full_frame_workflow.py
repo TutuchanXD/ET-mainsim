@@ -373,3 +373,30 @@ def test_run_records_worker_failure_in_manifest(tmp_path) -> None:
         "message": "service construction failed",
     }
     assert manifest["attempts"][-1]["status"] == "failed"
+
+
+def test_full_frame_plan_accepts_explicit_external_catalog_cache(tmp_path) -> None:
+    from et_mainsim.config import RunPaths
+    from et_mainsim.presets import load_preset
+    from et_mainsim.workflows.full_frame import build_run_plan
+
+    loaded = load_preset("et-full-frame-smoke")
+    external_cache = tmp_path / "shared" / "stars.npz"
+    config = replace(
+        loaded.run_config,
+        paths=RunPaths(
+            output_root=str(tmp_path / "results"),
+            data_root=str(tmp_path / "data"),
+            catalog_cache=str(external_cache),
+        ),
+    )
+
+    plan = build_run_plan(
+        preset_name=loaded.descriptor.name,
+        run_config=config,
+        spec=loaded.simulation_spec,
+        repo_root=tmp_path,
+    )
+
+    assert plan.catalog_cache == external_cache
+    assert plan.spec.catalog.cache_path == str(external_cache)

@@ -137,3 +137,114 @@ def test_frame_selection_and_worker_assignments_are_stable() -> None:
 
     with pytest.raises(ValueError, match="outside"):
         parse_frame_indices("4", total_frames=4)
+
+
+def test_stamp_workload_is_typed_and_table_mode_is_query_independent() -> None:
+    from et_mainsim.config import RunConfig, StampWorkload
+
+    text = """
+schema_id = "et_mainsim.execution_config"
+schema_version = 1
+workflow = "et-stamp"
+run_id = "table-stamps"
+
+[workload]
+kind = "stamp"
+input_mode = "table"
+input_table = "targets.csv"
+stamp_rows = 15
+stamp_cols = 17
+include_neighbors = false
+save_raw = true
+save_coadd = true
+
+[execution]
+backend = "in-process"
+device = "cpu"
+"""
+    config = RunConfig.from_toml(text)
+
+    assert isinstance(config.workload, StampWorkload)
+    assert config.workload.input_mode == "table"
+    assert config.workload.input_table == "targets.csv"
+    assert config.workload.stamp_shape == (15, 17)
+    assert config.to_dict()["workload"]["kind"] == "stamp"
+
+
+@pytest.mark.parametrize(
+    ("workload", "message"),
+    [
+        (
+            'kind = "stamp"\ninput_mode = "table"\ninclude_neighbors = false',
+            "input_table",
+        ),
+        (
+            'kind = "stamp"\ninput_mode = "table"\ninput_table = "x.csv"\ninclude_neighbors = true',
+            "include_neighbors",
+        ),
+        ('kind = "legacy"', "match workflow"),
+    ],
+)
+def test_stamp_workload_rejects_ambiguous_contracts(workload, message) -> None:
+    from et_mainsim.config import RunConfig
+
+    text = f"""
+schema_id = "et_mainsim.execution_config"
+schema_version = 1
+workflow = "et-stamp"
+run_id = "bad"
+
+[workload]
+{workload}
+
+[execution]
+backend = "in-process"
+device = "cpu"
+"""
+    with pytest.raises(ValueError, match=message):
+        RunConfig.from_toml(text)
+
+
+def test_legacy_workload_uses_explicit_local_ray_resources() -> None:
+    from et_mainsim.config import LegacyWorkload, RunConfig
+
+    text = """
+schema_id = "et_mainsim.execution_config"
+schema_version = 1
+workflow = "legacy-sim"
+run_id = "legacy"
+
+[workload]
+kind = "legacy"
+run_count = 2
+stars_per_run = 100
+store_images = false
+et_mag_min = 7.0
+et_mag_max = 17.0
+
+[execution]
+backend = "local-ray"
+device = "cuda"
+gpu_ids = ["0"]
+ray_actor_count = 1
+ray_num_cpus = 1
+ray_num_gpus = 1
+"""
+    config = RunConfig.from_toml(text)
+
+    assert isinstance(config.workload, LegacyWorkload)
+    assert config.workload.run_count == 2
+    assert config.workload.stars_per_run == 100
+    assert config.execution.ray_actor_count == 1
+    assert config.execution.ray_num_gpus == 1
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [("ray_num_cpus", 1.5), ("ray_num_gpus", 0.5)],
+)
+def test_local_ray_resources_reject_fractional_values(field_name, value) -> None:
+    from et_mainsim.config import ExecutionConfig
+
+    with pytest.raises(ValueError, match=f"{field_name} must be an integer"):
+        ExecutionConfig(backend="local-ray", **{field_name: value})

@@ -149,3 +149,28 @@ def test_resume_and_overwrite_controls_do_not_change_run_identity(tmp_path) -> N
     )
 
     assert matched["run_id"] == "smoke"
+
+
+def test_manifest_identity_includes_typed_workload(tmp_path) -> None:
+    from et_mainsim.manifest import ManifestIdentityError, RunManifestStore
+
+    store = RunManifestStore(tmp_path / "manifest.json")
+    store.create(
+        workflow="et-stamp",
+        preset="et-stamp-smoke",
+        run_id="stamp",
+        simulation_spec={"science": 1},
+        execution={"device": "cpu"},
+        workload={"kind": "stamp", "stamp_rows": 15},
+        frame_plan={"requested": [0]},
+        provenance={},
+    )
+
+    with pytest.raises(ManifestIdentityError, match="workload"):
+        store.ensure_identity(
+            workflow="et-stamp",
+            run_id="stamp",
+            simulation_spec={"science": 1},
+            execution={"device": "cpu"},
+            workload={"kind": "stamp", "stamp_rows": 17},
+        )

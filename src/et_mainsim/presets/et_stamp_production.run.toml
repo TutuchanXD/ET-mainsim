@@ -1,0 +1,36 @@
+schema_id = "et_mainsim.execution_config"
+schema_version = 1
+workflow = "et-stamp"
+run_id = "et-stamp-production"
+
+[paths]
+output_root = ""
+data_root = ""
+catalog_path = ""
+focalplane_registry = ""
+
+[workload]
+kind = "stamp"
+input_mode = "catalog"
+input_table = ""
+target_source_ids = []
+target_limit = 1
+stamp_rows = 15
+stamp_cols = 15
+include_neighbors = true
+save_raw = true
+save_coadd = true
+save_electron_components = false
+
+[execution]
+backend = "local-subprocess"
+device = "cuda"
+gpu_ids = ["0"]
+workers_per_device = 1
+resume = true
+overwrite = false
+force_catalog_cache = false
+preview_count = 0
+progress = false
+save_cosmic_mask = false
+save_stellar_mean = false

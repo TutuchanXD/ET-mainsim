@@ -123,6 +123,7 @@ class FullFrameRunPlan:
             "catalog_cache": str(self.catalog_cache),
             "paths": self.paths.to_dict(),
             "execution": self.run_config.execution.to_dict(),
+            "workload": self.run_config.workload.to_dict(),
             "frame_plan": {
                 "requested": list(self.frame_indices),
                 "count": len(self.frame_indices),
@@ -576,7 +577,7 @@ def build_run_plan(
 ) -> FullFrameRunPlan:
     paths = run_config.resolve_paths(env=env, cwd=cwd)
     run_dir = paths.output_root / run_config.run_id
-    catalog_cache = run_dir / "cache" / "stars.npz"
+    catalog_cache = paths.catalog_cache or run_dir / "cache" / "stars.npz"
     resolved_spec = resolve_simulation_spec(
         spec,
         paths=paths,
@@ -760,6 +761,7 @@ def run_full_frame(
             run_id=plan.run_config.run_id,
             simulation_spec=spec_payload,
             execution=execution_payload,
+            workload=plan.run_config.workload.to_dict(),
         )
     else:
         from photsim7.frame_products import (
@@ -773,6 +775,7 @@ def run_full_frame(
             run_id=plan.run_config.run_id,
             simulation_spec=spec_payload,
             execution=execution_payload,
+            workload=plan.run_config.workload.to_dict(),
             frame_plan={
                 "requested": list(plan.frame_indices),
                 "count": len(plan.frame_indices),

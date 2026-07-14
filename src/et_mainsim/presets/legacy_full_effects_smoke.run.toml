@@ -1,0 +1,29 @@
+schema_id = "et_mainsim.execution_config"
+schema_version = 1
+workflow = "legacy-sim"
+run_id = "legacy-full-effects-smoke"
+
+[paths]
+output_root = ""
+data_root = ""
+catalog_path = ""
+focalplane_registry = ""
+
+[workload]
+kind = "legacy"
+run_count = 1
+stars_per_run = 1
+store_images = false
+et_mag_min = 12.0
+et_mag_max = 12.0
+
+[execution]
+backend = "local-ray"
+device = "cpu"
+gpu_ids = []
+workers_per_device = 1
+resume = true
+overwrite = false
+ray_actor_count = 1
+ray_num_cpus = 1
+ray_num_gpus = 0
