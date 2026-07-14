@@ -356,6 +356,15 @@ class RunConfig:
         if unknown:
             raise ValueError(f"Unknown run config fields: {', '.join(unknown)}")
 
+        workflow = str(payload.get("workflow", "")).strip()
+        if not workflow:
+            raise ValueError("workflow must be non-empty")
+        expected_kind = _WORKFLOW_KINDS.get(workflow)
+        if expected_kind is None:
+            raise ValueError(
+                f"workflow must be one of {sorted(_WORKFLOW_KINDS)}"
+            )
+
         path_payload = dict(payload.get("paths", {}))
         execution_payload = dict(payload.get("execution", {}))
         workload_payload = dict(payload.get("workload", {}))
@@ -369,8 +378,6 @@ class RunConfig:
             raise ValueError(
                 f"Unknown execution fields: {', '.join(execution_unknown)}"
             )
-        workflow = str(payload.get("workflow", ""))
-        expected_kind = _WORKFLOW_KINDS.get(workflow)
         kind = str(workload_payload.get("kind", expected_kind or "")).strip().lower()
         workload_types = {
             "full-frame": FullFrameWorkload,

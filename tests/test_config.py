@@ -117,6 +117,28 @@ def test_in_process_backend_is_cpu_only() -> None:
         RunConfig.from_toml(text)
 
 
+@pytest.mark.parametrize(
+    ("workflow", "message"),
+    [(None, "workflow must be non-empty"), ("unknown", "workflow must be one of")],
+)
+def test_run_config_validates_workflow_before_workload(
+    workflow: str | None,
+    message: str,
+) -> None:
+    from et_mainsim.config import RunConfig
+
+    payload = {
+        "schema_id": "et_mainsim.execution_config",
+        "schema_version": 1,
+        "run_id": "invalid-workflow",
+    }
+    if workflow is not None:
+        payload["workflow"] = workflow
+
+    with pytest.raises(ValueError, match=message):
+        RunConfig.from_mapping(payload)
+
+
 def test_frame_selection_and_worker_assignments_are_stable() -> None:
     from et_mainsim.config import (
         RunConfig,
