@@ -16,8 +16,8 @@ conda activate "${CONDA_ENV:-etbase-clu}"
 export ET_DATA_DIR="${ET_DATA_DIR:-/cluster/home/cxgao/ET/Photsim7-data}"
 export ET_FOCALPLANE_ROOT="${ET_FOCALPLANE_ROOT:-/cluster/home/cxgao/ET/et_focalplane}"
 export RESULTS_ROOT="${RESULTS_ROOT:-/cluster/home/cxgao/sshfs-share/et-mainsim}"
-if [[ -z "${INPUT_TABLE:-}" ]]; then
-  : "${GAIA_CATALOG_DIR:?Set GAIA_CATALOG_DIR for catalog input mode}"
+if [[ -z "${INPUT_TABLE:-}" && -z "${ET_CATALOG_CACHE:-}" ]]; then
+  : "${GAIA_CATALOG_DIR:?Set GAIA_CATALOG_DIR, ET_CATALOG_CACHE, or INPUT_TABLE}"
 fi
 ET_MAINSIM_ROOT="${ET_MAINSIM_ROOT:-/cluster/home/cxgao/ET/ET-mainsim}"
 export PYTHONPATH="${ET_MAINSIM_ROOT}/src:${PYTHONPATH:-}"

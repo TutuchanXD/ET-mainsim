@@ -10,6 +10,7 @@ def test_full_frame_slurm_logs_are_account_portable() -> None:
     assert "#SBATCH --error=%x-%j.err" in script
     assert "/cluster/home/cxgao/sshfs-share/slurm_logs" not in script
     assert 'export PYTHONPATH="${ET_MAINSIM_ROOT}/src:' in script
+    assert 'if [[ -z "${ET_CATALOG_CACHE:-}" ]]' in script
 
 
 def test_stamp_and_legacy_slurm_templates_use_maintained_cli() -> None:
@@ -21,6 +22,7 @@ def test_stamp_and_legacy_slurm_templates_use_maintained_cli() -> None:
     assert "--preset \"${PRESET:-production}\"" in stamp
     assert 'if [[ -n "${INPUT_TABLE:-}" ]]' in stamp
     assert 'args+=(--input-table "${INPUT_TABLE}")' in stamp
+    assert '-z "${ET_CATALOG_CACHE:-}"' in stamp
     assert "python -m et_mainsim run legacy-sim" in legacy
     assert "--preset \"${PRESET:-full-effects-production}\"" in legacy
     assert 'args+=(--frames "${FRAMES}")' in legacy
