@@ -202,12 +202,15 @@ class StampWorkload:
     save_raw: bool = True
     save_coadd: bool = True
     save_electron_components: bool = False
+    artifact_profile: str = "detailed"
+    write_batch_size: int = 32
 
     def __post_init__(self) -> None:
         kind = str(self.kind).strip().lower()
         input_mode = str(self.input_mode).strip().lower()
         input_table = str(self.input_table).strip()
         variability_table = str(self.variability_table).strip()
+        artifact_profile = str(self.artifact_profile).strip().lower()
         if kind != "stamp":
             raise ValueError("stamp workload kind must be 'stamp'")
         if input_mode not in {"catalog", "table"}:
@@ -224,13 +227,20 @@ class StampWorkload:
             raise ValueError(
                 "stamp variability_table is supported only for table input_mode"
             )
+        if artifact_profile not in {"detailed", "compact"}:
+            raise ValueError(
+                "stamp artifact_profile must be 'detailed' or 'compact'"
+            )
         rows = int(self.stamp_rows)
         cols = int(self.stamp_cols)
         target_limit = int(self.target_limit)
+        write_batch_size = int(self.write_batch_size)
         if rows <= 0 or cols <= 0:
             raise ValueError("stamp_rows and stamp_cols must be positive")
         if target_limit < 0:
             raise ValueError("target_limit must be non-negative")
+        if write_batch_size <= 0:
+            raise ValueError("write_batch_size must be positive")
         if not bool(self.save_raw) and not bool(self.save_coadd):
             raise ValueError("stamp workload must save raw, coadd, or both")
         target_ids = tuple(dict.fromkeys(int(value) for value in self.target_source_ids))
@@ -250,6 +260,8 @@ class StampWorkload:
             "save_electron_components",
             bool(self.save_electron_components),
         )
+        object.__setattr__(self, "artifact_profile", artifact_profile)
+        object.__setattr__(self, "write_batch_size", write_batch_size)
 
     @property
     def stamp_shape(self) -> tuple[int, int]:

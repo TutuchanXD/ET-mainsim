@@ -112,6 +112,10 @@ def test_cli_stamp_table_dry_run_is_read_only_and_query_independent(
             str(curves),
             "--output-root",
             str(output_root),
+            "--artifact-profile",
+            "compact",
+            "--write-batch-size",
+            "64",
             "--dry-run",
         ]
     )
@@ -122,6 +126,8 @@ def test_cli_stamp_table_dry_run_is_read_only_and_query_independent(
     assert plan["workflow"] == "et-stamp"
     assert plan["workload"]["input_mode"] == "table"
     assert plan["workload"]["include_neighbors"] is False
+    assert plan["workload"]["artifact_profile"] == "compact"
+    assert plan["workload"]["write_batch_size"] == 64
     assert plan["simulation_spec"]["catalog"]["source_type"] == "prepared"
     assert plan["input_table"] == str(table)
     assert plan["variability_table"] == str(curves)

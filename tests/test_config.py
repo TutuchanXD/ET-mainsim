@@ -180,6 +180,8 @@ stamp_cols = 17
 include_neighbors = false
 save_raw = true
 save_coadd = true
+artifact_profile = "compact"
+write_batch_size = 64
 
 [execution]
 backend = "in-process"
@@ -192,6 +194,8 @@ device = "cpu"
     assert config.workload.input_table == "targets.csv"
     assert config.workload.variability_table == "curves.ecsv"
     assert config.workload.stamp_shape == (15, 17)
+    assert config.workload.artifact_profile == "compact"
+    assert config.workload.write_batch_size == 64
     assert config.to_dict()["workload"]["kind"] == "stamp"
 
 
@@ -209,6 +213,14 @@ device = "cpu"
         (
             'kind = "stamp"\ninput_mode = "catalog"\nvariability_table = "curves.csv"',
             "variability_table",
+        ),
+        (
+            'kind = "stamp"\nartifact_profile = "brief"',
+            "artifact_profile",
+        ),
+        (
+            'kind = "stamp"\nwrite_batch_size = 0',
+            "write_batch_size",
         ),
         ('kind = "legacy"', "match workflow"),
     ],

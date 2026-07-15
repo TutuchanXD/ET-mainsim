@@ -885,6 +885,20 @@ def _source_variability_truth_path(plan: StampRunPlan, target_id: int) -> Path:
     return _target_dir(plan, target_id) / "source_variability_truth.ecsv"
 
 
+def _artifact_policy(plan: StampRunPlan) -> dict[str, Any]:
+    detailed = plan.workload.artifact_profile == "detailed"
+    return {
+        "profile": plan.workload.artifact_profile,
+        "raw_schema_sidecars": bool(plan.workload.save_raw and detailed),
+        "coadd_schema_sidecars": bool(plan.workload.save_coadd and detailed),
+        "electron_component_sidecars": bool(
+            plan.workload.save_electron_components
+        ),
+        "write_batch_size": plan.workload.write_batch_size,
+        "write_api": "write_stamps",
+    }
+
+
 def _read_target_artifacts(
     plan: StampRunPlan,
     target_id: int,
@@ -996,17 +1010,18 @@ def target_is_complete(plan: StampRunPlan, target_id: int, *, api: Any) -> bool:
                 api=api,
             )
         )
-        checks.append(
-            all(
-                (
-                    target_dir
-                    / "schemas"
-                    / "raw"
-                    / f"frame_{frame_id:06d}.json"
-                ).is_file()
-                for frame_id in raw_ids
+        if plan.workload.artifact_profile == "detailed":
+            checks.append(
+                all(
+                    (
+                        target_dir
+                        / "schemas"
+                        / "raw"
+                        / f"frame_{frame_id:06d}.json"
+                    ).is_file()
+                    for frame_id in raw_ids
+                )
             )
-        )
     if plan.workload.save_coadd:
         checks.append(
             _shard_complete(
@@ -1016,17 +1031,18 @@ def target_is_complete(plan: StampRunPlan, target_id: int, *, api: Any) -> bool:
                 api=api,
             )
         )
-        checks.append(
-            all(
-                (
-                    target_dir
-                    / "schemas"
-                    / "coadd"
-                    / f"coadd_{coadd_id:06d}.json"
-                ).is_file()
-                for coadd_id in coadd_ids
+        if plan.workload.artifact_profile == "detailed":
+            checks.append(
+                all(
+                    (
+                        target_dir
+                        / "schemas"
+                        / "coadd"
+                        / f"coadd_{coadd_id:06d}.json"
+                    ).is_file()
+                    for coadd_id in coadd_ids
+                )
             )
-        )
     checks.append(_read_target_artifacts(plan, target_id) is not None)
     return bool(checks) and all(checks)
 
@@ -1081,86 +1097,135 @@ def _truth_value_for_target(
     return converted
 
 
-def _variability_truth_row(
-    products: Any,
-    *,
-    target_id: int,
-    curve_id: str | None,
-) -> dict[str, Any]:
-    truth = getattr(products, "truth", None)
-    payload = None if truth is None else getattr(truth, "payload", None)
-    if not isinstance(payload, Mapping):
-        raise RuntimeError("stamp products must expose the numeric truth payload")
-    return {
-        "frame_index": int(products.frame_index),
-        "source_id": int(target_id),
-        "curve_id": "" if curve_id is None else str(curve_id),
-        "relative_flux": float(
+class _SourceVariabilityTruthAccumulator:
+    __slots__ = (
+        "raw_frame_count",
+        "target_id",
+        "curve_id",
+        "relative_flux",
+        "baseline_photon_count_electron",
+        "effective_photon_count_electron",
+        "psf_field_id",
+        "_seen",
+    )
+
+    def __init__(
+        self,
+        *,
+        raw_frame_count: int,
+        target_id: int,
+        curve_id: str | None,
+    ) -> None:
+        raw_frame_count = int(raw_frame_count)
+        if raw_frame_count <= 0:
+            raise ValueError("raw_frame_count must be positive")
+        self.raw_frame_count = raw_frame_count
+        self.target_id = int(target_id)
+        self.curve_id = "" if curve_id is None else str(curve_id)
+        self.relative_flux = np.empty(raw_frame_count, dtype=np.float64)
+        self.baseline_photon_count_electron = np.empty(
+            raw_frame_count,
+            dtype=np.float64,
+        )
+        self.effective_photon_count_electron = np.empty(
+            raw_frame_count,
+            dtype=np.float64,
+        )
+        self.psf_field_id = np.empty(raw_frame_count, dtype=np.int64)
+        self._seen = np.zeros(raw_frame_count, dtype=bool)
+
+    def add(self, products: Any) -> None:
+        frame_index = int(products.frame_index)
+        if not 0 <= frame_index < self.raw_frame_count:
+            raise RuntimeError(
+                f"raw frame {frame_index} is outside 0..{self.raw_frame_count - 1}"
+            )
+        if self._seen[frame_index]:
+            raise RuntimeError(f"duplicate raw frame {frame_index} in truth output")
+        truth = getattr(products, "truth", None)
+        payload = None if truth is None else getattr(truth, "payload", None)
+        if not isinstance(payload, Mapping):
+            raise RuntimeError(
+                "stamp products must expose the numeric truth payload"
+            )
+        self.relative_flux[frame_index] = float(
             _truth_value_for_target(
                 payload,
                 "source_relative_flux_factor",
-                target_id=target_id,
+                target_id=self.target_id,
             )
-        ),
-        "baseline_photon_count_electron": float(
+        )
+        self.baseline_photon_count_electron[frame_index] = float(
             _truth_value_for_target(
                 payload,
                 "source_baseline_photon_count_electron",
-                target_id=target_id,
+                target_id=self.target_id,
             )
-        ),
-        "effective_photon_count_electron": float(
+        )
+        self.effective_photon_count_electron[frame_index] = float(
             _truth_value_for_target(
                 payload,
                 "source_effective_photon_count_electron",
-                target_id=target_id,
+                target_id=self.target_id,
             )
-        ),
-        "psf_field_id": int(
+        )
+        self.psf_field_id[frame_index] = int(
             _truth_value_for_target(
                 payload,
                 "source_psf_field_index",
-                target_id=target_id,
+                target_id=self.target_id,
             )
-        ),
-    }
+        )
+        self._seen[frame_index] = True
+
+    def to_table(
+        self,
+        *,
+        source_input_truth: Mapping[str, Any],
+    ) -> Table:
+        missing = np.flatnonzero(~self._seen)
+        if missing.size:
+            preview = missing[:10].tolist()
+            raise RuntimeError(
+                "source variability truth is missing raw frames: "
+                f"{preview}{'...' if missing.size > len(preview) else ''}"
+            )
+        return Table(
+            {
+                "frame_index": np.arange(self.raw_frame_count, dtype=np.int64),
+                "source_id": np.full(
+                    self.raw_frame_count,
+                    self.target_id,
+                    dtype=np.int64,
+                ),
+                "curve_id": np.full(self.raw_frame_count, self.curve_id),
+                "relative_flux": self.relative_flux,
+                "baseline_photon_count_electron": (
+                    self.baseline_photon_count_electron
+                ),
+                "effective_photon_count_electron": (
+                    self.effective_photon_count_electron
+                ),
+                "psf_field_id": self.psf_field_id,
+            },
+            meta={
+                "schema_id": "et_mainsim.source_variability_truth",
+                "schema_version": 1,
+                "target_source_id": self.target_id,
+                "time_alignment": "simulation_raw_frame_index",
+                "source_input_truth": dict(source_input_truth),
+            },
+            copy=False,
+        )
 
 
 def _write_source_variability_truth(
     path: Path,
     *,
-    rows: list[Mapping[str, Any]],
-    target_id: int,
+    accumulator: _SourceVariabilityTruthAccumulator,
     source_input_truth: Mapping[str, Any],
 ) -> dict[str, Any]:
-    ordered = sorted(rows, key=lambda row: int(row["frame_index"]))
-    frame_indices = tuple(int(row["frame_index"]) for row in ordered)
-    if frame_indices != tuple(range(len(ordered))):
-        raise RuntimeError(
-            "source variability truth rows must contain every raw frame exactly once"
-        )
-    table = Table(
-        {
-            "frame_index": [int(row["frame_index"]) for row in ordered],
-            "source_id": [int(row["source_id"]) for row in ordered],
-            "curve_id": [str(row["curve_id"]) for row in ordered],
-            "relative_flux": [float(row["relative_flux"]) for row in ordered],
-            "baseline_photon_count_electron": [
-                float(row["baseline_photon_count_electron"]) for row in ordered
-            ],
-            "effective_photon_count_electron": [
-                float(row["effective_photon_count_electron"]) for row in ordered
-            ],
-            "psf_field_id": [int(row["psf_field_id"]) for row in ordered],
-        },
-        meta={
-            "schema_id": "et_mainsim.source_variability_truth",
-            "schema_version": 1,
-            "target_source_id": int(target_id),
-            "time_alignment": "simulation_raw_frame_index",
-            "source_input_truth": dict(source_input_truth),
-        },
-    )
+    table = accumulator.to_table(source_input_truth=source_input_truth)
     path.parent.mkdir(parents=True, exist_ok=True)
     table.write(path, format="ascii.ecsv", overwrite=True)
     return file_identity(path)
@@ -1191,6 +1256,50 @@ def _target_spec(
             field_id_policy=None,
         ),
     )
+
+
+class _StampWriteBuffer:
+    __slots__ = ("writer", "batch_size", "_items")
+
+    def __init__(self, writer: Any, *, batch_size: int) -> None:
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.writer = writer
+        self.batch_size = batch_size
+        self._items: list[tuple[int, int, np.ndarray, int]] = []
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._items)
+
+    def add(
+        self,
+        *,
+        star_id: int,
+        frame_id: int,
+        stamp: np.ndarray,
+        seed: int,
+    ) -> None:
+        self._items.append((star_id, frame_id, stamp, seed))
+        if len(self._items) >= self.batch_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._items:
+            return
+        write_stamps = getattr(self.writer, "write_stamps", None)
+        if callable(write_stamps):
+            write_stamps(tuple(self._items))
+        else:
+            for star_id, frame_id, stamp, seed in self._items:
+                self.writer.write_stamp(
+                    star_id,
+                    frame_id,
+                    stamp,
+                    seed=seed,
+                )
+        self._items.clear()
 
 
 def _open_writer(
@@ -1232,6 +1341,7 @@ def _open_writer(
             "target_source_id": target_id,
             "input_mode": plan.workload.input_mode,
             "source_input_truth": dict(source_input_truth),
+            "artifact_policy": _artifact_policy(plan),
         },
         product_schema=product_schema,
         resume=plan.run_config.execution.resume,
@@ -1279,9 +1389,15 @@ def _render_target(
     raw_ids, coadd_ids = _expected_ids(plan)
     raw_writer = None
     coadd_writer = None
+    raw_write_buffer = None
+    coadd_write_buffer = None
     raw_path = target_dir / "raw.h5"
     coadd_path = target_dir / "coadd.h5"
-    truth_rows: list[dict[str, Any]] = []
+    truth_accumulator = _SourceVariabilityTruthAccumulator(
+        raw_frame_count=len(raw_ids),
+        target_id=target_id,
+        curve_id=(None if target is None else target.curve_id),
+    )
     try:
         for coadd_index in coadd_ids:
             result = api.run_stamp_coadd(
@@ -1316,6 +1432,11 @@ def _render_target(
                     product_schema=first_raw.to_schema_dict(),
                     source_input_truth=source_input_truth,
                 )
+                if raw_writer is not None:
+                    raw_write_buffer = _StampWriteBuffer(
+                        raw_writer,
+                        batch_size=plan.workload.write_batch_size,
+                    )
             if (
                 plan.workload.save_coadd
                 and coadd_writer is None
@@ -1334,18 +1455,20 @@ def _render_target(
                     product_schema=None,
                     source_input_truth=source_input_truth,
                 )
+                if coadd_writer is not None:
+                    coadd_write_buffer = _StampWriteBuffer(
+                        coadd_writer,
+                        batch_size=plan.workload.write_batch_size,
+                    )
 
             for raw_result in result.raw_results:
                 products = raw_result.stamp_products
                 frame_id = int(products.frame_index)
-                truth_rows.append(
-                    _variability_truth_row(
-                        products,
-                        target_id=target_id,
-                        curve_id=(None if target is None else target.curve_id),
-                    )
-                )
-                if plan.workload.save_raw:
+                truth_accumulator.add(products)
+                if (
+                    plan.workload.save_raw
+                    and plan.workload.artifact_profile == "detailed"
+                ):
                     schema = products.to_schema_dict()
                     schema["source_input_truth"] = dict(source_input_truth)
                     api.write_stamp_product_schema(
@@ -1358,10 +1481,10 @@ def _render_target(
                 if raw_writer is not None and raw_writer.item_status(
                     target_id, frame_id
                 ) != api.ItemStatus.COMPLETE:
-                    raw_writer.write_stamp(
-                        target_id,
-                        frame_id,
-                        _to_numpy(products.final_stamp.array),
+                    raw_write_buffer.add(
+                        star_id=target_id,
+                        frame_id=frame_id,
+                        stamp=_to_numpy(products.final_stamp.array),
                         seed=spec.rng.run_seed,
                     )
                 if plan.workload.save_electron_components:
@@ -1371,7 +1494,10 @@ def _render_target(
                         / f"frame_{frame_id:06d}.npz",
                         products,
                     )
-            if plan.workload.save_coadd:
+            if (
+                plan.workload.save_coadd
+                and plan.workload.artifact_profile == "detailed"
+            ):
                 coadd_schema = coadd_products.to_schema_dict()
                 coadd_schema["source_input_truth"] = dict(source_input_truth)
                 api.write_stamp_product_schema(
@@ -1384,22 +1510,23 @@ def _render_target(
             if coadd_writer is not None and coadd_writer.item_status(
                 target_id, coadd_index
             ) != api.ItemStatus.COMPLETE:
-                coadd_writer.write_stamp(
-                    target_id,
-                    coadd_index,
-                    coadd_array,
+                coadd_write_buffer.add(
+                    star_id=target_id,
+                    frame_id=coadd_index,
+                    stamp=coadd_array,
                     seed=spec.rng.run_seed,
                 )
         if raw_writer is not None:
+            raw_write_buffer.flush()
             raw_writer.finalize()
             raw_writer = None
         if coadd_writer is not None:
+            coadd_write_buffer.flush()
             coadd_writer.finalize()
             coadd_writer = None
         truth_identity = _write_source_variability_truth(
             _source_variability_truth_path(plan, target_id),
-            rows=truth_rows,
-            target_id=target_id,
+            accumulator=truth_accumulator,
             source_input_truth=source_input_truth,
         )
         selected_field_ids = np.asarray(
@@ -1420,6 +1547,7 @@ def _render_target(
             "target_source_id": target_id,
             "source_input_truth": dict(source_input_truth),
             "source_variability_truth_identity": truth_identity,
+            "artifact_policy": _artifact_policy(plan),
             "runtime_psf": {
                 "selected_field_ids": selected_field_ids.tolist(),
                 "provenance": dict(services.psf_result.provenance),
@@ -1625,6 +1753,33 @@ def _workload_identity(plan: StampRunPlan) -> dict[str, Any]:
     return payload
 
 
+def _upgrade_stamp_artifact_manifest(
+    store: RunManifestStore,
+    *,
+    workload: Mapping[str, Any],
+    artifact_policy: Mapping[str, Any],
+) -> None:
+    payload = store.load()
+    stored_workload = dict(payload.get("workload", {}))
+    normalized_workload = dict(stored_workload)
+    normalized_workload.setdefault("artifact_profile", "detailed")
+    normalized_workload.setdefault("write_batch_size", 32)
+    if normalized_workload != dict(workload):
+        return
+    artifacts = dict(payload.get("artifacts", {}))
+    changed = stored_workload != normalized_workload
+    if "artifact_policy" not in artifacts:
+        artifacts["artifact_policy"] = dict(artifact_policy)
+        changed = True
+    if not changed:
+        return
+    payload["workload"] = normalized_workload
+    payload["artifacts"] = artifacts
+    from et_mainsim.manifest import _atomic_write_json
+
+    _atomic_write_json(store.path, payload)
+
+
 def run_stamp(
     plan: StampRunPlan,
     *,
@@ -1650,6 +1805,11 @@ def run_stamp(
     workload_payload = _workload_identity(plan)
     spec_payload = plan.spec.to_json_dict()
     if store.path.exists():
+        _upgrade_stamp_artifact_manifest(
+            store,
+            workload=workload_payload,
+            artifact_policy=_artifact_policy(plan),
+        )
         store.ensure_identity(
             workflow="et-stamp",
             run_id=plan.run_config.run_id,
@@ -1672,9 +1832,14 @@ def run_stamp(
                 "stamp_root": str(plan.run_dir / "stamps"),
                 "raw_shard_name": "raw.h5",
                 "coadd_shard_name": "coadd.h5",
-                "schema_root_name": "schemas",
+                "schema_root_name": (
+                    "schemas"
+                    if plan.workload.artifact_profile == "detailed"
+                    else None
+                ),
                 "source_variability_truth_name": "source_variability_truth.ecsv",
                 "target_artifact_manifest_name": "target_artifacts.json",
+                "artifact_policy": _artifact_policy(plan),
             },
         )
     try:

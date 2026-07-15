@@ -125,6 +125,11 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
     )
     stamp.add_argument("--save-electron-components", action="store_true")
+    stamp.add_argument(
+        "--artifact-profile",
+        choices=("detailed", "compact"),
+    )
+    stamp.add_argument("--write-batch-size", type=int)
     stamp.add_argument("--dry-run", action="store_true")
 
     legacy = run_subparsers.add_parser(
@@ -332,6 +337,10 @@ def _stamp_config_from_args(args, loaded) -> RunConfig:
         updates["save_coadd"] = args.save_coadd
     if args.save_electron_components:
         updates["save_electron_components"] = True
+    if args.artifact_profile is not None:
+        updates["artifact_profile"] = args.artifact_profile
+    if args.write_batch_size is not None:
+        updates["write_batch_size"] = args.write_batch_size
     if updates:
         workload = replace(workload, **updates)
     return replace(config, workload=workload)

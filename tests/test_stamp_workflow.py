@@ -499,12 +499,22 @@ def test_stamp_run_writes_readable_raw_coadd_truth_and_resumes(tmp_path) -> None
     assert coadd_schema["coadd"]["raw_frame_indices"] == [0, 1]
     assert first["status"] == "completed"
 
+    manifest_path = plan.run_dir / "run_manifest.json"
+    legacy_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    legacy_manifest["workload"].pop("artifact_profile")
+    legacy_manifest["workload"].pop("write_batch_size")
+    legacy_manifest["artifacts"].pop("artifact_policy")
+    manifest_path.write_text(json.dumps(legacy_manifest), encoding="utf-8")
+
     second = run_stamp(plan)
 
     assert second["status"] == "completed"
     assert second["completion"]["rendered_targets"] == 0
     assert second["completion"]["skipped_targets"] == 1
     assert len(second["attempts"]) == 2
+    assert second["workload"]["artifact_profile"] == "detailed"
+    assert second["workload"]["write_batch_size"] == 32
+    assert second["artifacts"]["artifact_policy"]["profile"] == "detailed"
 
     for run_id, save_raw, save_coadd, absent_name in (
         ("raw-only", True, False, "coadd"),
@@ -657,6 +667,161 @@ def test_variable_table_run_persists_numeric_truth_provenance_and_digest(
         json.dumps(target_artifact_payload), encoding="utf-8"
     )
     assert not target_is_complete(plan, 10, api=_science_api())
+
+
+def test_truth_accumulator_uses_fixed_column_arrays_and_orders_frames() -> None:
+    from et_mainsim.workflows.stamp import _SourceVariabilityTruthAccumulator
+
+    def products(frame_index, relative_flux):
+        baseline = 100.0
+        return SimpleNamespace(
+            frame_index=frame_index,
+            truth=SimpleNamespace(
+                payload={
+                    "source_id": np.array([10], dtype=np.int64),
+                    "source_relative_flux_factor": np.array([relative_flux]),
+                    "source_baseline_photon_count_electron": np.array([baseline]),
+                    "source_effective_photon_count_electron": np.array(
+                        [baseline * relative_flux]
+                    ),
+                    "source_psf_field_index": np.array([4], dtype=np.int64),
+                }
+            ),
+        )
+
+    accumulator = _SourceVariabilityTruthAccumulator(
+        raw_frame_count=3,
+        target_id=10,
+        curve_id="sn",
+    )
+    assert isinstance(accumulator.relative_flux, np.ndarray)
+    assert isinstance(accumulator.baseline_photon_count_electron, np.ndarray)
+    assert isinstance(accumulator.effective_photon_count_electron, np.ndarray)
+    assert isinstance(accumulator.psf_field_id, np.ndarray)
+    assert not hasattr(accumulator, "rows")
+
+    accumulator.add(products(2, 0.8))
+    accumulator.add(products(0, 0.5))
+    accumulator.add(products(1, 1.0))
+    table = accumulator.to_table(source_input_truth={"mode": "test"})
+
+    np.testing.assert_array_equal(table["frame_index"], [0, 1, 2])
+    np.testing.assert_array_equal(table["source_id"], [10, 10, 10])
+    np.testing.assert_array_equal(table["curve_id"], ["sn", "sn", "sn"])
+    np.testing.assert_allclose(table["relative_flux"], [0.5, 1.0, 0.8])
+    np.testing.assert_allclose(
+        table["effective_photon_count_electron"],
+        table["baseline_photon_count_electron"] * table["relative_flux"],
+    )
+    assert table.meta["source_input_truth"] == {"mode": "test"}
+    with pytest.raises(RuntimeError, match="duplicate raw frame"):
+        accumulator.add(products(1, 1.0))
+
+    incomplete = _SourceVariabilityTruthAccumulator(
+        raw_frame_count=2,
+        target_id=10,
+        curve_id=None,
+    )
+    incomplete.add(products(0, 1.0))
+    with pytest.raises(RuntimeError, match="missing raw frames"):
+        incomplete.to_table(source_input_truth={})
+
+
+def test_stamp_write_buffer_flushes_at_configured_batch_size() -> None:
+    from et_mainsim.workflows.stamp import _StampWriteBuffer
+
+    class Writer:
+        def __init__(self):
+            self.batches = []
+
+        def write_stamps(self, stamps):
+            self.batches.append(tuple(stamps))
+
+        def write_stamp(self, *_args, **_kwargs):
+            raise AssertionError("batch-capable writer must not use write_stamp")
+
+    writer = Writer()
+    buffer = _StampWriteBuffer(writer, batch_size=2)
+    for frame_id in range(5):
+        buffer.add(
+            star_id=10,
+            frame_id=frame_id,
+            stamp=np.full((2, 2), frame_id, dtype=np.uint16),
+            seed=41 + frame_id,
+        )
+
+    assert [len(batch) for batch in writer.batches] == [2, 2]
+    assert buffer.pending_count == 1
+    buffer.flush()
+    assert [len(batch) for batch in writer.batches] == [2, 2, 1]
+    assert buffer.pending_count == 0
+
+
+def test_compact_artifact_profile_omits_schema_sidecars_and_resumes(
+    tmp_path,
+) -> None:
+    from et_mainsim.workflows.stamp import (
+        _science_api,
+        run_stamp,
+        target_is_complete,
+    )
+
+    plan = _variable_table_plan(
+        tmp_path,
+        target_body=(
+            "source_id,gaia_g_mag,psf_id,curve_id\n10,12.0,0,sn\n"
+        ),
+    )
+    bundle_name = _write_test_psf_bundle(plan.paths.data_root)
+    plan = replace(
+        plan,
+        run_config=replace(
+            plan.run_config,
+            workload=replace(
+                plan.workload,
+                artifact_profile="compact",
+                write_batch_size=4,
+            ),
+        ),
+        spec=replace(
+            plan.spec,
+            detector=replace(plan.spec.detector, n_subpixels=3),
+            psf=replace(plan.spec.psf, bundle_name=bundle_name),
+        ),
+    )
+
+    first = run_stamp(plan)
+
+    target_dir = plan.run_dir / "stamps" / "target_10"
+    assert (target_dir / "raw.h5").is_file()
+    assert (target_dir / "coadd.h5").is_file()
+    assert not (target_dir / "schemas").exists()
+    truth = Table.read(
+        target_dir / "source_variability_truth.ecsv",
+        format="ascii.ecsv",
+    )
+    np.testing.assert_allclose(truth["relative_flux"], [0.5, 2.0])
+    expected_policy = {
+        "profile": "compact",
+        "raw_schema_sidecars": False,
+        "coadd_schema_sidecars": False,
+        "electron_component_sidecars": False,
+        "write_batch_size": 4,
+        "write_api": "write_stamps",
+    }
+    assert first["workload"]["artifact_profile"] == "compact"
+    assert first["workload"]["write_batch_size"] == 4
+    assert first["artifacts"]["artifact_policy"] == expected_policy
+    target_artifacts = json.loads(
+        (target_dir / "target_artifacts.json").read_text(encoding="utf-8")
+    )
+    assert target_artifacts["artifact_policy"] == expected_policy
+    assert target_is_complete(plan, 10, api=_science_api())
+
+    second = run_stamp(plan)
+
+    assert second["completion"]["rendered_targets"] == 0
+    assert second["completion"]["skipped_targets"] == 1
 
 
 def test_variable_table_local_subprocess_worker_preserves_input_contract(
