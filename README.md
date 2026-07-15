@@ -92,7 +92,9 @@ contain exactly one finite, non-negative `relative_flux` for every raw
 `et_stamp_variability_target_example.csv` plus
 `et_stamp_variability_example.csv`, [stamp workflow](docs/stamp_workflow.md),
 and the [Chinese science-team input
-contract](docs/source_variability_inputs_zh.md).
+contract](docs/source_variability_inputs_zh.md). The
+[30-day SN/Galaxy/Aster stamp quicklook](docs/source_variability_stamp_quicklook_30d_zh.md)
+documents the end-to-end validation, QA metrics, and review artifacts.
 
 ## Run Contract
 

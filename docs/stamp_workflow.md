@@ -55,7 +55,9 @@ scene summation and stellar Poisson sampling. A coadd therefore simulates every
 variable raw cadence first and sums detector-domain products afterward. See
 the [Chinese science-team input contract](source_variability_inputs_zh.md) for
 schemas, examples, physical semantics, and the assessment of current team
-data.
+data. The [30-day SN/Galaxy/Aster quicklook](source_variability_stamp_quicklook_30d_zh.md)
+records the long-run sharding setup, strict coverage checks, and injected-only
+versus paired-response interpretation.
 
 ## Products
 
