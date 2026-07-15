@@ -209,6 +209,35 @@ def test_table_stamp_inputs_are_independent_catalogs_without_query(tmp_path) -> 
     assert prepared.psf_ids == {0: 0, 1: 1}
 
 
+def test_explicit_psf_table_does_not_identity_unused_focalplane_registry(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.workflows.stamp as stamp_workflow
+
+    plan = _table_plan(tmp_path)
+    plan.paths.data_root.mkdir()
+    registry = tmp_path / "focalplane" / "data"
+    plan = replace(
+        plan,
+        paths=replace(plan.paths, focalplane_registry=registry),
+    )
+    monkeypatch.setattr(
+        stamp_workflow,
+        "_psf_bundle_asset_identity",
+        lambda _plan: {"sha256": "test-psf-bundle"},
+    )
+
+    prepared = stamp_workflow.prepare_stamp_inputs(
+        plan,
+        science_api=_fake_table_api(),
+    )
+    workload_identity = stamp_workflow._workload_identity(plan)
+
+    assert "focalplane_registry" not in prepared.input_identities
+    assert "focalplane_registry_identity" not in workload_identity
+
+
 def test_table_stamp_inputs_bind_variable_and_static_targets_with_hashes(
     tmp_path,
 ) -> None:

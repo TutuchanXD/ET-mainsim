@@ -25,7 +25,6 @@ from et_mainsim.provenance import collect_provenance
 from et_mainsim.stamp_inputs import (
     StampTarget,
     file_identity,
-    focalplane_registry_identity,
     load_stamp_target_table,
     load_stamp_variability_table,
 )
@@ -744,12 +743,9 @@ def _prepare_table_inputs(
         input_identities["variability_table"] = variability.provenance[
             "file_identity"
         ]
-    if plan.paths.focalplane_registry is not None:
-        input_identities["focalplane_registry"] = loaded.provenance.get(
-            "focalplane_registry_identity"
-        ) or focalplane_registry_identity(
-            plan.paths.focalplane_registry
-        )
+    registry_identity = loaded.provenance.get("focalplane_registry_identity")
+    if registry_identity is not None:
+        input_identities["focalplane_registry"] = registry_identity
     if bundle.provenance.get("file_identity") is not None:
         input_identities["psf_bundle"] = bundle.provenance["file_identity"]
     _validate_input_identities(input_identities, expected_identities)
@@ -1614,10 +1610,17 @@ def _workload_identity(plan: StampRunPlan) -> dict[str, Any]:
         payload["variability_table_identity"] = file_identity(
             plan.variability_table_path
         )
-    if plan.paths.focalplane_registry is not None:
-        payload["focalplane_registry_identity"] = focalplane_registry_identity(
-            plan.paths.focalplane_registry
-        )
+    target_table = load_stamp_target_table(
+        plan.input_table_path,
+        detector_shape=tuple(plan.spec.detector.shape),
+        detector_id=str(plan.spec.detector.detector_id),
+        focalplane_registry=plan.paths.focalplane_registry,
+    )
+    registry_identity = target_table.provenance.get(
+        "focalplane_registry_identity"
+    )
+    if registry_identity is not None:
+        payload["focalplane_registry_identity"] = registry_identity
     payload["psf_bundle_identity"] = _psf_bundle_asset_identity(plan)
     return payload
 
