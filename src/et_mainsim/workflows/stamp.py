@@ -375,10 +375,10 @@ def _coadd_shard_relative_path(workload: StampWorkload) -> str:
     )
 
 
-def _frame_plan(
+def _coadd_shard_geometry(
     spec: Any,
     workload: StampWorkload | None = None,
-) -> dict[str, Any]:
+) -> tuple[int, int, int, int, int, int]:
     global_raw_count = int(spec.observation.resolved_n_frames)
     per_coadd = int(spec.observation.n_raw_frames_per_coadd)
     if global_raw_count % per_coadd:
@@ -386,12 +386,37 @@ def _frame_plan(
     global_coadd_count = global_raw_count // per_coadd
     shard_index = 0 if workload is None else workload.coadd_shard_index
     shard_count = 1 if workload is None else workload.coadd_shard_count
-    coadd_indices = tuple(range(shard_index, global_coadd_count, shard_count))
-    if not coadd_indices:
+    if shard_index >= global_coadd_count:
         raise ValueError(
             f"coadd shard {shard_index}/{shard_count} selects no global coadds "
             f"from {global_coadd_count}"
         )
+    selected_coadd_count = (
+        (global_coadd_count - 1 - shard_index) // shard_count + 1
+    )
+    return (
+        global_raw_count,
+        global_coadd_count,
+        per_coadd,
+        shard_index,
+        shard_count,
+        selected_coadd_count,
+    )
+
+
+def _frame_plan(
+    spec: Any,
+    workload: StampWorkload | None = None,
+) -> dict[str, Any]:
+    (
+        global_raw_count,
+        global_coadd_count,
+        per_coadd,
+        shard_index,
+        shard_count,
+        selected_coadd_count,
+    ) = _coadd_shard_geometry(spec, workload)
+    coadd_indices = tuple(range(shard_index, global_coadd_count, shard_count))
     raw_frame_indices = tuple(
         frame_index
         for coadd_index in coadd_indices
@@ -408,7 +433,7 @@ def _frame_plan(
         "coadd_shard_count": shard_count,
         "raw_frame_count": len(raw_frame_indices),
         "raw_frame_indices": list(raw_frame_indices),
-        "coadd_count": len(coadd_indices),
+        "coadd_count": selected_coadd_count,
         "coadd_indices": list(coadd_indices),
     }
 
@@ -941,22 +966,36 @@ def _artifact_policy(plan: StampRunPlan) -> dict[str, Any]:
             plan.workload.save_electron_components
         ),
         "write_batch_size": plan.workload.write_batch_size,
-        "write_api": "write_stamps",
+        "write_strategy": "batch_preferred_with_single_write_fallback",
     }
 
 
 def _coadd_shard_provenance(plan: StampRunPlan) -> dict[str, Any]:
-    frame_plan = _frame_plan(plan.spec, plan.workload)
+    (
+        global_raw_count,
+        global_coadd_count,
+        per_coadd,
+        shard_index,
+        shard_count,
+        selected_coadd_count,
+    ) = _coadd_shard_geometry(plan.spec, plan.workload)
     return {
         "logical_run_id": plan.run_config.run_id,
         "output_relative_path": _coadd_shard_relative_path(plan.workload),
-        "global_raw_frame_count": frame_plan["global_raw_frame_count"],
-        "global_coadd_count": frame_plan["global_coadd_count"],
-        "n_raw_frames_per_coadd": frame_plan["n_raw_frames_per_coadd"],
-        "coadd_shard_index": frame_plan["coadd_shard_index"],
-        "coadd_shard_count": frame_plan["coadd_shard_count"],
-        "selected_global_raw_frame_indices": frame_plan["raw_frame_indices"],
-        "selected_global_coadd_indices": frame_plan["coadd_indices"],
+        "global_raw_frame_count": global_raw_count,
+        "global_coadd_count": global_coadd_count,
+        "n_raw_frames_per_coadd": per_coadd,
+        "coadd_shard_index": shard_index,
+        "coadd_shard_count": shard_count,
+        "selected_raw_frame_count": selected_coadd_count * per_coadd,
+        "selected_coadd_count": selected_coadd_count,
+        "selection_rule": {
+            "kind": "strided_global_coadds",
+            "start": shard_index,
+            "stop_exclusive": global_coadd_count,
+            "step": shard_count,
+            "raw_frame_mapping": "contiguous_blocks_by_coadd_index",
+        },
     }
 
 

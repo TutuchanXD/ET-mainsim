@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import json
 import pickle
 
+import h5py
 import numpy as np
 import pytest
 from astropy import units as u
@@ -126,6 +127,56 @@ def test_table_stamp_plan_does_not_require_full_frame_catalog_assets(tmp_path) -
     assert plan.spec.catalog.source_type == "prepared"
     assert plan.to_dict(dry_run=True)["workload"]["input_mode"] == "table"
     assert not plan.run_dir.exists()
+
+
+def test_coadd_shard_provenance_is_constant_size_for_30_day_plan(
+    tmp_path,
+) -> None:
+    from et_mainsim.workflows.stamp import _coadd_shard_provenance
+
+    plan = _table_plan(tmp_path)
+    plan = replace(
+        plan,
+        spec=SimpleNamespace(
+            observation=SimpleNamespace(
+                resolved_n_frames=259_200,
+                n_raw_frames_per_coadd=6,
+            )
+        ),
+    )
+
+    provenance = _coadd_shard_provenance(plan)
+    encoded = json.dumps(
+        provenance,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    assert len(encoded) < 2 * 1024
+    assert "selected_global_raw_frame_indices" not in provenance
+    assert "selected_global_coadd_indices" not in provenance
+    assert provenance["selected_raw_frame_count"] == 259_200
+    assert provenance["selected_coadd_count"] == 43_200
+    assert provenance["selection_rule"] == {
+        "kind": "strided_global_coadds",
+        "start": 0,
+        "stop_exclusive": 43_200,
+        "step": 1,
+        "raw_frame_mapping": "contiguous_blocks_by_coadd_index",
+    }
+
+
+def test_artifact_policy_describes_batch_write_with_runtime_fallback(
+    tmp_path,
+) -> None:
+    from et_mainsim.workflows.stamp import _artifact_policy
+
+    policy = _artifact_policy(_table_plan(tmp_path))
+
+    assert policy["write_strategy"] == (
+        "batch_preferred_with_single_write_fallback"
+    )
+    assert "write_api" not in policy
 
 
 def test_catalog_stamp_preflight_allows_cache_without_query_assets(tmp_path) -> None:
@@ -852,7 +903,7 @@ def test_compact_artifact_profile_omits_schema_sidecars_and_resumes(
         "coadd_schema_sidecars": False,
         "electron_component_sidecars": False,
         "write_batch_size": 4,
-        "write_api": "write_stamps",
+        "write_strategy": "batch_preferred_with_single_write_fallback",
     }
     assert first["workload"]["artifact_profile"] == "compact"
     assert first["workload"]["write_batch_size"] == 4
@@ -877,6 +928,7 @@ def test_coadd_shard_renders_global_indices_with_full_timespan_services(
         build_run_plan,
         run_stamp,
     )
+    from et_mainsim.stamp_inputs import file_identity
     from photsim7.artifacts import StampShardReader
 
     base_plan = _variable_table_plan(
@@ -970,8 +1022,15 @@ def test_coadd_shard_renders_global_indices_with_full_timespan_services(
         "n_raw_frames_per_coadd": 2,
         "coadd_shard_index": 1,
         "coadd_shard_count": 2,
-        "selected_global_raw_frame_indices": [2, 3, 6, 7],
-        "selected_global_coadd_indices": [1, 3],
+        "selected_raw_frame_count": 4,
+        "selected_coadd_count": 2,
+        "selection_rule": {
+            "kind": "strided_global_coadds",
+            "start": 1,
+            "stop_exclusive": 5,
+            "step": 2,
+            "raw_frame_mapping": "contiguous_blocks_by_coadd_index",
+        },
     }
     assert manifest["artifacts"]["coadd_shard"] == shard_provenance
 
@@ -1007,10 +1066,74 @@ def test_coadd_shard_renders_global_indices_with_full_timespan_services(
     )
     assert target_artifacts["coadd_shard"] == shard_provenance
 
+    legacy_shard_provenance = {
+        key: value
+        for key, value in shard_provenance.items()
+        if key
+        not in {
+            "selected_raw_frame_count",
+            "selected_coadd_count",
+            "selection_rule",
+        }
+    }
+    legacy_shard_provenance.update(
+        {
+            "selected_global_raw_frame_indices": [2, 3, 6, 7],
+            "selected_global_coadd_indices": [1, 3],
+        }
+    )
+    for shard_name in ("raw.h5", "coadd.h5"):
+        with h5py.File(target_dir / shard_name, "r+") as handle:
+            encoded_provenance = handle["provenance"][()]
+            if isinstance(encoded_provenance, bytes):
+                encoded_provenance = encoded_provenance.decode("utf-8")
+            stored_provenance = json.loads(encoded_provenance)
+            stored_provenance["coadd_shard"] = legacy_shard_provenance
+            handle["provenance"][()] = json.dumps(
+                stored_provenance,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+    truth.meta["coadd_shard"] = legacy_shard_provenance
+    truth.write(
+        target_dir / "source_variability_truth.ecsv",
+        format="ascii.ecsv",
+        overwrite=True,
+    )
+    for schema_path in (
+        target_dir / "schemas" / "raw" / "frame_000002.json",
+        target_dir / "schemas" / "coadd" / "coadd_000001.json",
+    ):
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        schema["coadd_shard"] = legacy_shard_provenance
+        schema_path.write_text(json.dumps(schema), encoding="utf-8")
+    target_artifacts["coadd_shard"] = legacy_shard_provenance
+    target_artifacts["source_variability_truth_identity"] = file_identity(
+        target_dir / "source_variability_truth.ecsv"
+    )
+    (target_dir / "target_artifacts.json").write_text(
+        json.dumps(target_artifacts),
+        encoding="utf-8",
+    )
+    manifest_path = plan.run_dir / "run_manifest.json"
+    legacy_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    legacy_manifest["artifacts"]["coadd_shard"] = legacy_shard_provenance
+    legacy_manifest["provenance"]["coadd_shard"] = legacy_shard_provenance
+    manifest_path.write_text(json.dumps(legacy_manifest), encoding="utf-8")
+
+    with StampShardReader(target_dir / "raw.h5") as legacy_raw_reader:
+        assert legacy_raw_reader.frame_ids == (2, 3, 6, 7)
+        assert (
+            legacy_raw_reader.spec.provenance["coadd_shard"]
+            == legacy_shard_provenance
+        )
+
     second = run_stamp(plan, science_api=api)
 
     assert second["completion"]["rendered_targets"] == 0
     assert second["completion"]["skipped_targets"] == 1
+    assert second["artifacts"]["coadd_shard"] == legacy_shard_provenance
     assert rendered_coadd_indices == [1, 3]
 
 
