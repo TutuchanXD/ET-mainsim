@@ -182,6 +182,8 @@ save_raw = true
 save_coadd = true
 artifact_profile = "compact"
 write_batch_size = 64
+coadd_shard_index = 1
+coadd_shard_count = 3
 
 [execution]
 backend = "in-process"
@@ -196,6 +198,8 @@ device = "cpu"
     assert config.workload.stamp_shape == (15, 17)
     assert config.workload.artifact_profile == "compact"
     assert config.workload.write_batch_size == 64
+    assert config.workload.coadd_shard_index == 1
+    assert config.workload.coadd_shard_count == 3
     assert config.to_dict()["workload"]["kind"] == "stamp"
 
 
@@ -222,6 +226,18 @@ device = "cpu"
             'kind = "stamp"\nwrite_batch_size = 0',
             "write_batch_size",
         ),
+        (
+            'kind = "stamp"\ncoadd_shard_count = 0',
+            "coadd_shard_count",
+        ),
+        (
+            'kind = "stamp"\ncoadd_shard_index = -1\ncoadd_shard_count = 2',
+            "coadd_shard_index",
+        ),
+        (
+            'kind = "stamp"\ncoadd_shard_index = 2\ncoadd_shard_count = 2',
+            "coadd_shard_index",
+        ),
         ('kind = "legacy"', "match workflow"),
     ],
 )
@@ -242,6 +258,29 @@ backend = "in-process"
 device = "cpu"
 """
     with pytest.raises(ValueError, match=message):
+        RunConfig.from_toml(text)
+
+
+def test_coadd_sharding_rejects_multiple_stamp_workers() -> None:
+    from et_mainsim.config import RunConfig
+
+    text = """
+schema_id = "et_mainsim.execution_config"
+schema_version = 1
+workflow = "et-stamp"
+run_id = "sharded"
+
+[workload]
+kind = "stamp"
+coadd_shard_index = 0
+coadd_shard_count = 2
+
+[execution]
+backend = "local-subprocess"
+device = "cpu"
+workers_per_device = 2
+"""
+    with pytest.raises(ValueError, match="coadd sharding.*single worker"):
         RunConfig.from_toml(text)
 
 

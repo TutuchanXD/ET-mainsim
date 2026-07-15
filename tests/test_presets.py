@@ -84,6 +84,8 @@ def test_shipped_stamp_presets_fix_local_query_and_coadd_contract() -> None:
     assert smoke.run_config.workload.stamp_shape == (15, 15)
     assert smoke.run_config.workload.artifact_profile == "detailed"
     assert smoke.run_config.workload.write_batch_size == 32
+    assert smoke.run_config.workload.coadd_shard_index == 0
+    assert smoke.run_config.workload.coadd_shard_count == 1
 
     spec = production.simulation_spec
     assert spec.detector.shape == (9120, 8900)
@@ -95,6 +97,8 @@ def test_shipped_stamp_presets_fix_local_query_and_coadd_contract() -> None:
     assert production.run_config.workload.include_neighbors is True
     assert production.run_config.workload.artifact_profile == "detailed"
     assert production.run_config.workload.write_batch_size == 32
+    assert production.run_config.workload.coadd_shard_index == 0
+    assert production.run_config.workload.coadd_shard_count == 1
 
 
 def test_shipped_legacy_presets_are_exact_full_effect_contracts() -> None:

@@ -116,6 +116,12 @@ def test_cli_stamp_table_dry_run_is_read_only_and_query_independent(
             "compact",
             "--write-batch-size",
             "64",
+            "--frames",
+            "4",
+            "--coadd-shard-index",
+            "1",
+            "--coadd-shard-count",
+            "2",
             "--dry-run",
         ]
     )
@@ -128,6 +134,14 @@ def test_cli_stamp_table_dry_run_is_read_only_and_query_independent(
     assert plan["workload"]["include_neighbors"] is False
     assert plan["workload"]["artifact_profile"] == "compact"
     assert plan["workload"]["write_batch_size"] == 64
+    assert plan["workload"]["coadd_shard_index"] == 1
+    assert plan["workload"]["coadd_shard_count"] == 2
+    assert plan["frame_plan"]["global_coadd_count"] == 2
+    assert plan["frame_plan"]["coadd_indices"] == [1]
+    assert plan["frame_plan"]["raw_frame_indices"] == [2, 3]
+    assert plan["run_dir"].endswith(
+        "/et-stamp-smoke/coadd_shard_0001_of_0002"
+    )
     assert plan["simulation_spec"]["catalog"]["source_type"] == "prepared"
     assert plan["input_table"] == str(table)
     assert plan["variability_table"] == str(curves)

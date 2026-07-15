@@ -204,6 +204,8 @@ class StampWorkload:
     save_electron_components: bool = False
     artifact_profile: str = "detailed"
     write_batch_size: int = 32
+    coadd_shard_index: int = 0
+    coadd_shard_count: int = 1
 
     def __post_init__(self) -> None:
         kind = str(self.kind).strip().lower()
@@ -235,12 +237,21 @@ class StampWorkload:
         cols = int(self.stamp_cols)
         target_limit = int(self.target_limit)
         write_batch_size = int(self.write_batch_size)
+        coadd_shard_index = int(self.coadd_shard_index)
+        coadd_shard_count = int(self.coadd_shard_count)
         if rows <= 0 or cols <= 0:
             raise ValueError("stamp_rows and stamp_cols must be positive")
         if target_limit < 0:
             raise ValueError("target_limit must be non-negative")
         if write_batch_size <= 0:
             raise ValueError("write_batch_size must be positive")
+        if coadd_shard_count <= 0:
+            raise ValueError("coadd_shard_count must be positive")
+        if not 0 <= coadd_shard_index < coadd_shard_count:
+            raise ValueError(
+                "coadd_shard_index must be non-negative and smaller than "
+                "coadd_shard_count"
+            )
         if not bool(self.save_raw) and not bool(self.save_coadd):
             raise ValueError("stamp workload must save raw, coadd, or both")
         target_ids = tuple(dict.fromkeys(int(value) for value in self.target_source_ids))
@@ -262,6 +273,8 @@ class StampWorkload:
         )
         object.__setattr__(self, "artifact_profile", artifact_profile)
         object.__setattr__(self, "write_batch_size", write_batch_size)
+        object.__setattr__(self, "coadd_shard_index", coadd_shard_index)
+        object.__setattr__(self, "coadd_shard_count", coadd_shard_count)
 
     @property
     def stamp_shape(self) -> tuple[int, int]:
@@ -348,6 +361,20 @@ class RunConfig:
             raise ValueError("legacy-sim requires the local-ray backend")
         if workflow != "legacy-sim" and backend == "local-ray":
             raise ValueError("local-ray backend is reserved for legacy-sim")
+        if (
+            isinstance(self.workload, StampWorkload)
+            and self.workload.coadd_shard_count > 1
+            and backend == "local-subprocess"
+        ):
+            worker_count = (
+                len(self.execution.gpu_ids) * self.execution.workers_per_device
+                if self.execution.device == "cuda"
+                else self.execution.workers_per_device
+            )
+            if worker_count != 1:
+                raise ValueError(
+                    "stamp coadd sharding currently requires a single worker"
+                )
         object.__setattr__(self, "workflow", workflow)
 
     @classmethod

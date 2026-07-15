@@ -68,7 +68,7 @@ class StampRunPlan:
             "paths": self.paths.to_dict(),
             "execution": self.run_config.execution.to_dict(),
             "workload": self.workload.to_dict(),
-            "frame_plan": _frame_plan(self.spec),
+            "frame_plan": _frame_plan(self.spec, self.workload),
             "simulation_spec": self.spec.to_json_dict(),
         }
 
@@ -100,6 +100,10 @@ class StampWorkerRequest:
         world_size = int(self.world_size)
         if rank < 0 or world_size <= 0 or rank >= world_size:
             raise ValueError("rank must be smaller than positive world_size")
+        if self.plan.workload.coadd_shard_count > 1 and world_size != 1:
+            raise ValueError(
+                "stamp coadd sharding currently requires a single worker"
+            )
         input_identities = dict(self.input_identities)
         if self.plan.workload.input_mode == "table" and not input_identities:
             raise ValueError(
@@ -315,8 +319,15 @@ def build_run_plan(
 
     base = Path.cwd() if cwd is None else Path(cwd)
     paths = run_config.resolve_paths(env=env, cwd=base)
-    run_dir = paths.output_root / run_config.run_id
-    catalog_cache = paths.catalog_cache or run_dir / "cache" / "stars.npz"
+    logical_run_dir = paths.output_root / run_config.run_id
+    workload = run_config.workload
+    shard_relative_path = _coadd_shard_relative_path(workload)
+    run_dir = (
+        logical_run_dir
+        if shard_relative_path == "."
+        else logical_run_dir / shard_relative_path
+    )
+    catalog_cache = paths.catalog_cache or logical_run_dir / "cache" / "stars.npz"
     resolved_spec = resolve_simulation_spec(
         spec,
         paths=paths,
@@ -341,6 +352,7 @@ def build_run_plan(
                 run_config.workload.variability_table,
                 cwd=base,
             )
+    _frame_plan(resolved_spec, workload)
     return StampRunPlan(
         preset_name=preset_name,
         run_config=run_config,
@@ -354,21 +366,55 @@ def build_run_plan(
     )
 
 
-def _frame_plan(spec: Any) -> dict[str, Any]:
-    raw_count = int(spec.observation.resolved_n_frames)
+def _coadd_shard_relative_path(workload: StampWorkload) -> str:
+    if workload.coadd_shard_count == 1:
+        return "."
+    return (
+        f"coadd_shard_{workload.coadd_shard_index:04d}_of_"
+        f"{workload.coadd_shard_count:04d}"
+    )
+
+
+def _frame_plan(
+    spec: Any,
+    workload: StampWorkload | None = None,
+) -> dict[str, Any]:
+    global_raw_count = int(spec.observation.resolved_n_frames)
     per_coadd = int(spec.observation.n_raw_frames_per_coadd)
-    if raw_count % per_coadd:
+    if global_raw_count % per_coadd:
         raise ValueError("stamp raw frame count must be divisible by coadd size")
+    global_coadd_count = global_raw_count // per_coadd
+    shard_index = 0 if workload is None else workload.coadd_shard_index
+    shard_count = 1 if workload is None else workload.coadd_shard_count
+    coadd_indices = tuple(range(shard_index, global_coadd_count, shard_count))
+    if not coadd_indices:
+        raise ValueError(
+            f"coadd shard {shard_index}/{shard_count} selects no global coadds "
+            f"from {global_coadd_count}"
+        )
+    raw_frame_indices = tuple(
+        frame_index
+        for coadd_index in coadd_indices
+        for frame_index in range(
+            coadd_index * per_coadd,
+            (coadd_index + 1) * per_coadd,
+        )
+    )
     return {
-        "raw_frame_count": raw_count,
-        "raw_frame_indices": list(range(raw_count)),
+        "global_raw_frame_count": global_raw_count,
+        "global_coadd_count": global_coadd_count,
         "n_raw_frames_per_coadd": per_coadd,
-        "coadd_count": raw_count // per_coadd,
-        "coadd_indices": list(range(raw_count // per_coadd)),
+        "coadd_shard_index": shard_index,
+        "coadd_shard_count": shard_count,
+        "raw_frame_count": len(raw_frame_indices),
+        "raw_frame_indices": list(raw_frame_indices),
+        "coadd_count": len(coadd_indices),
+        "coadd_indices": list(coadd_indices),
     }
 
 
 def preflight(plan: StampRunPlan) -> None:
+    _frame_plan(plan.spec, plan.workload)
     if plan.paths.data_root is None:
         raise ValueError("ET_DATA_DIR or paths.data_root is required to run")
     if not plan.paths.data_root.is_dir():
@@ -899,6 +945,21 @@ def _artifact_policy(plan: StampRunPlan) -> dict[str, Any]:
     }
 
 
+def _coadd_shard_provenance(plan: StampRunPlan) -> dict[str, Any]:
+    frame_plan = _frame_plan(plan.spec, plan.workload)
+    return {
+        "logical_run_id": plan.run_config.run_id,
+        "output_relative_path": _coadd_shard_relative_path(plan.workload),
+        "global_raw_frame_count": frame_plan["global_raw_frame_count"],
+        "global_coadd_count": frame_plan["global_coadd_count"],
+        "n_raw_frames_per_coadd": frame_plan["n_raw_frames_per_coadd"],
+        "coadd_shard_index": frame_plan["coadd_shard_index"],
+        "coadd_shard_count": frame_plan["coadd_shard_count"],
+        "selected_global_raw_frame_indices": frame_plan["raw_frame_indices"],
+        "selected_global_coadd_indices": frame_plan["coadd_indices"],
+    }
+
+
 def _read_target_artifacts(
     plan: StampRunPlan,
     target_id: int,
@@ -922,7 +983,8 @@ def _read_target_artifacts(
         if file_identity(truth_path) != dict(expected):
             return None
         table = Table.read(truth_path, format="ascii.ecsv")
-        if len(table) != int(plan.spec.observation.resolved_n_frames):
+        raw_ids, _ = _expected_ids(plan)
+        if len(table) != len(raw_ids):
             return None
         required_columns = {
             "frame_index",
@@ -935,9 +997,7 @@ def _read_target_artifacts(
         }
         if not required_columns.issubset(table.colnames):
             return None
-        if tuple(int(value) for value in table["frame_index"]) != tuple(
-            range(int(plan.spec.observation.resolved_n_frames))
-        ):
+        if tuple(int(value) for value in table["frame_index"]) != raw_ids:
             return None
         if any(int(value) != int(target_id) for value in table["source_id"]):
             return None
@@ -970,7 +1030,7 @@ def _read_target_artifacts(
 
 
 def _expected_ids(plan: StampRunPlan) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    frame_plan = _frame_plan(plan.spec)
+    frame_plan = _frame_plan(plan.spec, plan.workload)
     return (
         tuple(frame_plan["raw_frame_indices"]),
         tuple(frame_plan["coadd_indices"]),
@@ -1100,8 +1160,10 @@ def _truth_value_for_target(
 class _SourceVariabilityTruthAccumulator:
     __slots__ = (
         "raw_frame_count",
+        "frame_indices",
         "target_id",
         "curve_id",
+        "coadd_shard",
         "relative_flux",
         "baseline_photon_count_electron",
         "effective_photon_count_electron",
@@ -1112,35 +1174,64 @@ class _SourceVariabilityTruthAccumulator:
     def __init__(
         self,
         *,
-        raw_frame_count: int,
+        raw_frame_count: int | None = None,
+        frame_indices: tuple[int, ...] | None = None,
         target_id: int,
         curve_id: str | None,
+        coadd_shard: Mapping[str, Any] | None = None,
     ) -> None:
-        raw_frame_count = int(raw_frame_count)
-        if raw_frame_count <= 0:
-            raise ValueError("raw_frame_count must be positive")
-        self.raw_frame_count = raw_frame_count
+        if frame_indices is None:
+            if raw_frame_count is None:
+                raise ValueError("raw_frame_count or frame_indices is required")
+            count = int(raw_frame_count)
+            if count <= 0:
+                raise ValueError("raw_frame_count must be positive")
+            indices = np.arange(count, dtype=np.int64)
+        else:
+            if raw_frame_count is not None:
+                raise ValueError(
+                    "raw_frame_count and frame_indices are mutually exclusive"
+                )
+            indices = np.asarray(
+                tuple(int(value) for value in frame_indices),
+                dtype=np.int64,
+            )
+            if indices.size == 0:
+                raise ValueError("frame_indices must not be empty")
+            if np.any(indices < 0) or np.any(np.diff(indices) <= 0):
+                raise ValueError(
+                    "frame_indices must be sorted unique non-negative integers"
+                )
+        self.raw_frame_count = int(indices.size)
+        self.frame_indices = indices
         self.target_id = int(target_id)
         self.curve_id = "" if curve_id is None else str(curve_id)
-        self.relative_flux = np.empty(raw_frame_count, dtype=np.float64)
+        self.coadd_shard = (
+            None if coadd_shard is None else dict(coadd_shard)
+        )
+        self.relative_flux = np.empty(self.raw_frame_count, dtype=np.float64)
         self.baseline_photon_count_electron = np.empty(
-            raw_frame_count,
+            self.raw_frame_count,
             dtype=np.float64,
         )
         self.effective_photon_count_electron = np.empty(
-            raw_frame_count,
+            self.raw_frame_count,
             dtype=np.float64,
         )
-        self.psf_field_id = np.empty(raw_frame_count, dtype=np.int64)
-        self._seen = np.zeros(raw_frame_count, dtype=bool)
+        self.psf_field_id = np.empty(self.raw_frame_count, dtype=np.int64)
+        self._seen = np.zeros(self.raw_frame_count, dtype=bool)
 
     def add(self, products: Any) -> None:
         frame_index = int(products.frame_index)
-        if not 0 <= frame_index < self.raw_frame_count:
+        offset = int(np.searchsorted(self.frame_indices, frame_index))
+        if (
+            offset >= self.raw_frame_count
+            or int(self.frame_indices[offset]) != frame_index
+        ):
             raise RuntimeError(
-                f"raw frame {frame_index} is outside 0..{self.raw_frame_count - 1}"
+                f"raw frame {frame_index} is not selected for this coadd shard"
             )
-        if self._seen[frame_index]:
+        if self._seen[offset]:
             raise RuntimeError(f"duplicate raw frame {frame_index} in truth output")
         truth = getattr(products, "truth", None)
         payload = None if truth is None else getattr(truth, "payload", None)
@@ -1148,35 +1239,35 @@ class _SourceVariabilityTruthAccumulator:
             raise RuntimeError(
                 "stamp products must expose the numeric truth payload"
             )
-        self.relative_flux[frame_index] = float(
+        self.relative_flux[offset] = float(
             _truth_value_for_target(
                 payload,
                 "source_relative_flux_factor",
                 target_id=self.target_id,
             )
         )
-        self.baseline_photon_count_electron[frame_index] = float(
+        self.baseline_photon_count_electron[offset] = float(
             _truth_value_for_target(
                 payload,
                 "source_baseline_photon_count_electron",
                 target_id=self.target_id,
             )
         )
-        self.effective_photon_count_electron[frame_index] = float(
+        self.effective_photon_count_electron[offset] = float(
             _truth_value_for_target(
                 payload,
                 "source_effective_photon_count_electron",
                 target_id=self.target_id,
             )
         )
-        self.psf_field_id[frame_index] = int(
+        self.psf_field_id[offset] = int(
             _truth_value_for_target(
                 payload,
                 "source_psf_field_index",
                 target_id=self.target_id,
             )
         )
-        self._seen[frame_index] = True
+        self._seen[offset] = True
 
     def to_table(
         self,
@@ -1185,14 +1276,23 @@ class _SourceVariabilityTruthAccumulator:
     ) -> Table:
         missing = np.flatnonzero(~self._seen)
         if missing.size:
-            preview = missing[:10].tolist()
+            preview = self.frame_indices[missing[:10]].tolist()
             raise RuntimeError(
                 "source variability truth is missing raw frames: "
                 f"{preview}{'...' if missing.size > len(preview) else ''}"
             )
+        meta = {
+            "schema_id": "et_mainsim.source_variability_truth",
+            "schema_version": 1,
+            "target_source_id": self.target_id,
+            "time_alignment": "simulation_raw_frame_index",
+            "source_input_truth": dict(source_input_truth),
+        }
+        if self.coadd_shard is not None:
+            meta["coadd_shard"] = dict(self.coadd_shard)
         return Table(
             {
-                "frame_index": np.arange(self.raw_frame_count, dtype=np.int64),
+                "frame_index": self.frame_indices,
                 "source_id": np.full(
                     self.raw_frame_count,
                     self.target_id,
@@ -1208,13 +1308,7 @@ class _SourceVariabilityTruthAccumulator:
                 ),
                 "psf_field_id": self.psf_field_id,
             },
-            meta={
-                "schema_id": "et_mainsim.source_variability_truth",
-                "schema_version": 1,
-                "target_source_id": self.target_id,
-                "time_alignment": "simulation_raw_frame_index",
-                "source_input_truth": dict(source_input_truth),
-            },
+            meta=meta,
             copy=False,
         )
 
@@ -1315,6 +1409,7 @@ def _open_writer(
     domain: str,
     product_schema: Mapping[str, Any] | None,
     source_input_truth: Mapping[str, Any],
+    coadd_shard: Mapping[str, Any],
 ) -> Any | None:
     if path.is_file():
         if _shard_complete(
@@ -1342,6 +1437,7 @@ def _open_writer(
             "input_mode": plan.workload.input_mode,
             "source_input_truth": dict(source_input_truth),
             "artifact_policy": _artifact_policy(plan),
+            "coadd_shard": dict(coadd_shard),
         },
         product_schema=product_schema,
         resume=plan.run_config.execution.resume,
@@ -1387,6 +1483,7 @@ def _render_target(
         data_registry=registry,
     )
     raw_ids, coadd_ids = _expected_ids(plan)
+    coadd_shard = _coadd_shard_provenance(plan)
     raw_writer = None
     coadd_writer = None
     raw_write_buffer = None
@@ -1394,9 +1491,10 @@ def _render_target(
     raw_path = target_dir / "raw.h5"
     coadd_path = target_dir / "coadd.h5"
     truth_accumulator = _SourceVariabilityTruthAccumulator(
-        raw_frame_count=len(raw_ids),
+        frame_indices=raw_ids,
         target_id=target_id,
         curve_id=(None if target is None else target.curve_id),
+        coadd_shard=coadd_shard,
     )
     try:
         for coadd_index in coadd_ids:
@@ -1431,6 +1529,7 @@ def _render_target(
                     domain=first_raw.final_stamp.domain,
                     product_schema=first_raw.to_schema_dict(),
                     source_input_truth=source_input_truth,
+                    coadd_shard=coadd_shard,
                 )
                 if raw_writer is not None:
                     raw_write_buffer = _StampWriteBuffer(
@@ -1454,6 +1553,7 @@ def _render_target(
                     domain=coadd_products.coadd_stamp.domain,
                     product_schema=None,
                     source_input_truth=source_input_truth,
+                    coadd_shard=coadd_shard,
                 )
                 if coadd_writer is not None:
                     coadd_write_buffer = _StampWriteBuffer(
@@ -1471,6 +1571,7 @@ def _render_target(
                 ):
                     schema = products.to_schema_dict()
                     schema["source_input_truth"] = dict(source_input_truth)
+                    schema["coadd_shard"] = dict(coadd_shard)
                     api.write_stamp_product_schema(
                         target_dir
                         / "schemas"
@@ -1500,6 +1601,7 @@ def _render_target(
             ):
                 coadd_schema = coadd_products.to_schema_dict()
                 coadd_schema["source_input_truth"] = dict(source_input_truth)
+                coadd_schema["coadd_shard"] = dict(coadd_shard)
                 api.write_stamp_product_schema(
                     target_dir
                     / "schemas"
@@ -1548,6 +1650,7 @@ def _render_target(
             "source_input_truth": dict(source_input_truth),
             "source_variability_truth_identity": truth_identity,
             "artifact_policy": _artifact_policy(plan),
+            "coadd_shard": dict(coadd_shard),
             "runtime_psf": {
                 "selected_field_ids": selected_field_ids.tolist(),
                 "provenance": dict(services.psf_result.provenance),
@@ -1758,12 +1861,16 @@ def _upgrade_stamp_artifact_manifest(
     *,
     workload: Mapping[str, Any],
     artifact_policy: Mapping[str, Any],
+    frame_plan: Mapping[str, Any],
+    coadd_shard: Mapping[str, Any],
 ) -> None:
     payload = store.load()
     stored_workload = dict(payload.get("workload", {}))
     normalized_workload = dict(stored_workload)
     normalized_workload.setdefault("artifact_profile", "detailed")
     normalized_workload.setdefault("write_batch_size", 32)
+    normalized_workload.setdefault("coadd_shard_index", 0)
+    normalized_workload.setdefault("coadd_shard_count", 1)
     if normalized_workload != dict(workload):
         return
     artifacts = dict(payload.get("artifacts", {}))
@@ -1771,10 +1878,21 @@ def _upgrade_stamp_artifact_manifest(
     if "artifact_policy" not in artifacts:
         artifacts["artifact_policy"] = dict(artifact_policy)
         changed = True
+    if "coadd_shard" not in artifacts:
+        artifacts["coadd_shard"] = dict(coadd_shard)
+        changed = True
+    provenance = dict(payload.get("provenance", {}))
+    if "coadd_shard" not in provenance:
+        provenance["coadd_shard"] = dict(coadd_shard)
+        changed = True
+    if payload.get("frame_plan") != dict(frame_plan):
+        payload["frame_plan"] = dict(frame_plan)
+        changed = True
     if not changed:
         return
     payload["workload"] = normalized_workload
     payload["artifacts"] = artifacts
+    payload["provenance"] = provenance
     from et_mainsim.manifest import _atomic_write_json
 
     _atomic_write_json(store.path, payload)
@@ -1804,11 +1922,15 @@ def run_stamp(
     }
     workload_payload = _workload_identity(plan)
     spec_payload = plan.spec.to_json_dict()
+    frame_plan = _frame_plan(plan.spec, plan.workload)
+    coadd_shard = _coadd_shard_provenance(plan)
     if store.path.exists():
         _upgrade_stamp_artifact_manifest(
             store,
             workload=workload_payload,
             artifact_policy=_artifact_policy(plan),
+            frame_plan=frame_plan,
+            coadd_shard=coadd_shard,
         )
         store.ensure_identity(
             workflow="et-stamp",
@@ -1825,8 +1947,11 @@ def run_stamp(
             simulation_spec=spec_payload,
             execution=execution_payload,
             workload=workload_payload,
-            frame_plan=_frame_plan(plan.spec),
-            provenance=collect_provenance(plan.repo_root),
+            frame_plan=frame_plan,
+            provenance={
+                **collect_provenance(plan.repo_root),
+                "coadd_shard": coadd_shard,
+            },
             artifacts={
                 "run_manifest": str(store.path),
                 "stamp_root": str(plan.run_dir / "stamps"),
@@ -1840,6 +1965,7 @@ def run_stamp(
                 "source_variability_truth_name": "source_variability_truth.ecsv",
                 "target_artifact_manifest_name": "target_artifacts.json",
                 "artifact_policy": _artifact_policy(plan),
+                "coadd_shard": coadd_shard,
             },
         )
     try:

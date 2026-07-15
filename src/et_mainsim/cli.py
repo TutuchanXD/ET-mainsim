@@ -130,6 +130,8 @@ def _parser() -> argparse.ArgumentParser:
         choices=("detailed", "compact"),
     )
     stamp.add_argument("--write-batch-size", type=int)
+    stamp.add_argument("--coadd-shard-index", type=int)
+    stamp.add_argument("--coadd-shard-count", type=int)
     stamp.add_argument("--dry-run", action="store_true")
 
     legacy = run_subparsers.add_parser(
@@ -341,6 +343,10 @@ def _stamp_config_from_args(args, loaded) -> RunConfig:
         updates["artifact_profile"] = args.artifact_profile
     if args.write_batch_size is not None:
         updates["write_batch_size"] = args.write_batch_size
+    if args.coadd_shard_index is not None:
+        updates["coadd_shard_index"] = args.coadd_shard_index
+    if args.coadd_shard_count is not None:
+        updates["coadd_shard_count"] = args.coadd_shard_count
     if updates:
         workload = replace(workload, **updates)
     return replace(config, workload=workload)

@@ -503,7 +503,15 @@ def test_stamp_run_writes_readable_raw_coadd_truth_and_resumes(tmp_path) -> None
     legacy_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     legacy_manifest["workload"].pop("artifact_profile")
     legacy_manifest["workload"].pop("write_batch_size")
+    legacy_manifest["workload"].pop("coadd_shard_index", None)
+    legacy_manifest["workload"].pop("coadd_shard_count", None)
     legacy_manifest["artifacts"].pop("artifact_policy")
+    legacy_manifest["artifacts"].pop("coadd_shard", None)
+    legacy_manifest["provenance"].pop("coadd_shard", None)
+    legacy_manifest["frame_plan"].pop("global_raw_frame_count", None)
+    legacy_manifest["frame_plan"].pop("global_coadd_count", None)
+    legacy_manifest["frame_plan"].pop("coadd_shard_index", None)
+    legacy_manifest["frame_plan"].pop("coadd_shard_count", None)
     manifest_path.write_text(json.dumps(legacy_manifest), encoding="utf-8")
 
     second = run_stamp(plan)
@@ -514,7 +522,15 @@ def test_stamp_run_writes_readable_raw_coadd_truth_and_resumes(tmp_path) -> None
     assert len(second["attempts"]) == 2
     assert second["workload"]["artifact_profile"] == "detailed"
     assert second["workload"]["write_batch_size"] == 32
+    assert second["workload"]["coadd_shard_index"] == 0
+    assert second["workload"]["coadd_shard_count"] == 1
     assert second["artifacts"]["artifact_policy"]["profile"] == "detailed"
+    assert second["artifacts"]["coadd_shard"]["coadd_shard_index"] == 0
+    assert second["frame_plan"]["global_coadd_count"] == 1
+    assert second["frame_plan"]["coadd_shard_count"] == 1
+    assert second["provenance"]["coadd_shard"]["logical_run_id"] == (
+        plan.run_config.run_id
+    )
 
     for run_id, save_raw, save_coadd, absent_name in (
         ("raw-only", True, False, "coadd"),
@@ -726,6 +742,35 @@ def test_truth_accumulator_uses_fixed_column_arrays_and_orders_frames() -> None:
     with pytest.raises(RuntimeError, match="missing raw frames"):
         incomplete.to_table(source_input_truth={})
 
+    global_frames = _SourceVariabilityTruthAccumulator(
+        frame_indices=(2, 3),
+        target_id=10,
+        curve_id="sn",
+        coadd_shard={"selected_global_coadd_indices": [1]},
+    )
+    global_frames.add(products(3, 4.0))
+    global_frames.add(products(2, 3.0))
+    global_table = global_frames.to_table(source_input_truth={})
+    np.testing.assert_array_equal(global_table["frame_index"], [2, 3])
+    np.testing.assert_allclose(global_table["relative_flux"], [3.0, 4.0])
+    assert global_table.meta["coadd_shard"] == {
+        "selected_global_coadd_indices": [1]
+    }
+
+
+def test_coadd_shard_must_select_at_least_one_global_coadd(tmp_path) -> None:
+    from et_mainsim.workflows.stamp import _frame_plan
+
+    plan = _table_plan(tmp_path)
+    workload = replace(
+        plan.workload,
+        coadd_shard_index=1,
+        coadd_shard_count=2,
+    )
+
+    with pytest.raises(ValueError, match="selects no global coadds"):
+        _frame_plan(plan.spec, workload)
+
 
 def test_stamp_write_buffer_flushes_at_configured_batch_size() -> None:
     from et_mainsim.workflows.stamp import _StampWriteBuffer
@@ -822,6 +867,151 @@ def test_compact_artifact_profile_omits_schema_sidecars_and_resumes(
 
     assert second["completion"]["rendered_targets"] == 0
     assert second["completion"]["skipped_targets"] == 1
+
+
+def test_coadd_shard_renders_global_indices_with_full_timespan_services(
+    tmp_path,
+) -> None:
+    from et_mainsim.workflows.stamp import (
+        _science_api,
+        build_run_plan,
+        run_stamp,
+    )
+    from photsim7.artifacts import StampShardReader
+
+    base_plan = _variable_table_plan(
+        tmp_path,
+        target_body=(
+            "source_id,gaia_g_mag,psf_id,curve_id\n10,12.0,0,sn\n"
+        ),
+        curve_body=(
+            "curve_id,frame_index,relative_flux\n"
+            "sn,0,1\nsn,1,2\nsn,2,3\nsn,3,4\nsn,4,5\n"
+            "sn,5,6\nsn,6,7\nsn,7,8\nsn,8,9\nsn,9,10\n"
+        ),
+    )
+    bundle_name = _write_test_psf_bundle(base_plan.paths.data_root)
+    config = replace(
+        base_plan.run_config,
+        workload=replace(
+            base_plan.workload,
+            coadd_shard_index=1,
+            coadd_shard_count=2,
+        ),
+    )
+    spec = replace(
+        base_plan.spec,
+        detector=replace(base_plan.spec.detector, n_subpixels=3),
+        psf=replace(base_plan.spec.psf, bundle_name=bundle_name),
+        observation=replace(
+            base_plan.spec.observation,
+            exposure_duration=10 * u.s,
+            readout_duration=0 * u.s,
+            observing_duration=100 * u.s,
+            n_frames=10,
+            n_raw_frames_per_coadd=2,
+        ),
+    )
+    plan = build_run_plan(
+        preset_name=base_plan.preset_name,
+        run_config=config,
+        spec=spec,
+        repo_root=tmp_path,
+    )
+    assert plan.run_dir == (
+        plan.paths.output_root
+        / plan.run_config.run_id
+        / "coadd_shard_0001_of_0002"
+    )
+    api = _science_api()
+    original_build_services = api.build_stamp_services
+    original_run_coadd = api.run_stamp_coadd
+    service_frame_counts = []
+    rendered_coadd_indices = []
+
+    def build_services(spec, *args, **kwargs):
+        service_frame_counts.append(int(spec.observation.resolved_n_frames))
+        return original_build_services(spec, *args, **kwargs)
+
+    def run_coadd(spec, *args, coadd_index, **kwargs):
+        rendered_coadd_indices.append(coadd_index)
+        assert int(spec.observation.resolved_n_frames) == 10
+        return original_run_coadd(
+            spec,
+            *args,
+            coadd_index=coadd_index,
+            **kwargs,
+        )
+
+    api.build_stamp_services = build_services
+    api.run_stamp_coadd = run_coadd
+
+    manifest = run_stamp(plan, science_api=api)
+
+    assert service_frame_counts == [10]
+    assert rendered_coadd_indices == [1, 3]
+    assert manifest["simulation_spec"]["observation"]["n_frames"] == 10
+    assert manifest["frame_plan"] == {
+        "global_raw_frame_count": 10,
+        "global_coadd_count": 5,
+        "n_raw_frames_per_coadd": 2,
+        "coadd_shard_index": 1,
+        "coadd_shard_count": 2,
+        "raw_frame_count": 4,
+        "raw_frame_indices": [2, 3, 6, 7],
+        "coadd_count": 2,
+        "coadd_indices": [1, 3],
+    }
+    shard_provenance = {
+        "logical_run_id": plan.run_config.run_id,
+        "output_relative_path": "coadd_shard_0001_of_0002",
+        "global_raw_frame_count": 10,
+        "global_coadd_count": 5,
+        "n_raw_frames_per_coadd": 2,
+        "coadd_shard_index": 1,
+        "coadd_shard_count": 2,
+        "selected_global_raw_frame_indices": [2, 3, 6, 7],
+        "selected_global_coadd_indices": [1, 3],
+    }
+    assert manifest["artifacts"]["coadd_shard"] == shard_provenance
+
+    target_dir = plan.run_dir / "stamps" / "target_10"
+    with StampShardReader(target_dir / "raw.h5") as raw_reader:
+        assert raw_reader.frame_ids == (2, 3, 6, 7)
+        assert raw_reader.spec.provenance["coadd_shard"] == shard_provenance
+    with StampShardReader(target_dir / "coadd.h5") as coadd_reader:
+        assert coadd_reader.frame_ids == (1, 3)
+        assert coadd_reader.spec.provenance["coadd_shard"] == shard_provenance
+    truth = Table.read(
+        target_dir / "source_variability_truth.ecsv",
+        format="ascii.ecsv",
+    )
+    np.testing.assert_array_equal(truth["frame_index"], [2, 3, 6, 7])
+    np.testing.assert_allclose(truth["relative_flux"], [3.0, 4.0, 7.0, 8.0])
+    assert truth.meta["coadd_shard"] == shard_provenance
+    assert not (target_dir / "schemas" / "raw" / "frame_000000.json").exists()
+    raw_schema = json.loads(
+        (target_dir / "schemas" / "raw" / "frame_000002.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    coadd_schema = json.loads(
+        (target_dir / "schemas" / "coadd" / "coadd_000001.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert raw_schema["coadd_shard"] == shard_provenance
+    assert coadd_schema["coadd_shard"] == shard_provenance
+    target_artifacts = json.loads(
+        (target_dir / "target_artifacts.json").read_text(encoding="utf-8")
+    )
+    assert target_artifacts["coadd_shard"] == shard_provenance
+
+    second = run_stamp(plan, science_api=api)
+
+    assert second["completion"]["rendered_targets"] == 0
+    assert second["completion"]["skipped_targets"] == 1
+    assert rendered_coadd_indices == [1, 3]
 
 
 def test_variable_table_local_subprocess_worker_preserves_input_contract(
