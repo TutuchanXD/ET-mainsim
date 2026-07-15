@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 import sys
 
+import numpy as np
 import pytest
 from astropy.table import Table
 
@@ -61,6 +62,75 @@ def test_stamp_target_table_accepts_documented_aliases_and_coordinates(tmp_path)
         "psf_node_angle_deg": None,
         "psf_angle_delta_deg": None,
     }
+
+
+@pytest.mark.parametrize(
+    "source_id",
+    [
+        2_100_787_084_231_447_424,
+        9_000_000_000_000_000_000,
+    ],
+)
+def test_stamp_target_table_preserves_large_int64_source_id_from_ecsv(
+    tmp_path, source_id
+) -> None:
+    from et_mainsim.stamp_inputs import load_stamp_target_table
+
+    path = tmp_path / f"target-{source_id}.ecsv"
+    Table(
+        {
+            "source_id": np.asarray([source_id], dtype=np.int64),
+            "gaia_g_mag": [13.2],
+            "psf_id": [5],
+        }
+    ).write(path, format="ascii.ecsv")
+
+    loaded = load_stamp_target_table(path, detector_shape=(9, 11))
+
+    assert loaded.targets[0].source_id == source_id
+    assert type(loaded.targets[0].source_id) is int
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        2_100_787_084_231_447_424,
+        np.int64(2_100_787_084_231_447_424),
+        "2100787084231447424",
+        "  +2100787084231447424  ",
+        np.iinfo(np.int64).max,
+        float(42),
+    ],
+)
+def test_integer_preserves_exact_int64_values(value) -> None:
+    from et_mainsim.stamp_inputs import _integer
+
+    assert _integer(value, field_name="source_id", row_index=3) == int(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        np.bool_(False),
+        -1,
+        np.int64(-1),
+        "-1",
+        1.5,
+        np.float64(1.5),
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        np.iinfo(np.int64).max + 1,
+        np.uint64(np.iinfo(np.int64).max) + np.uint64(1),
+        str(np.iinfo(np.int64).max + 1),
+    ],
+)
+def test_integer_rejects_invalid_or_out_of_int64_range(value) -> None:
+    from et_mainsim.stamp_inputs import _integer
+
+    with pytest.raises(ValueError, match="integer"):
+        _integer(value, field_name="source_id", row_index=3)
 
 
 def test_stamp_target_table_preserves_curve_and_ecsv_semantics_note(tmp_path) -> None:
