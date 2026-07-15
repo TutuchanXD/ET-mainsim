@@ -43,3 +43,4 @@ def test_h100_validation_distinguishes_physical_and_visible_gpu_ids() -> None:
     assert 'physical_gpu="${SLURM_JOB_GPUS%%,*}"' in script
     assert '--id="${physical_gpu}"' in script
     assert '--gpus "${visible_gpu}"' in script
+    assert '--focalplane-registry "${ET_FOCALPLANE_ROOT%/}/data"' in script

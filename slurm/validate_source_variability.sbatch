@@ -67,7 +67,7 @@ cd "${ET_MAINSIM_WORKTREE}"
   --sn-csv "${SN_CSV}" \
   --output-root "${job_output_root}" \
   --data-root "${ET_DATA_DIR}" \
-  --focalplane-registry "${ET_FOCALPLANE_ROOT}" \
+  --focalplane-registry "${ET_FOCALPLANE_ROOT%/}/data" \
   --frame-count 22 \
   --coadd-size 2 \
   --run-id "${run_id}" \
