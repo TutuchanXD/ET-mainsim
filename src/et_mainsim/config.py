@@ -193,6 +193,7 @@ class StampWorkload:
     kind: str = "stamp"
     input_mode: str = "catalog"
     input_table: str = ""
+    variability_table: str = ""
     target_source_ids: tuple[int, ...] = field(default_factory=tuple)
     target_limit: int = 0
     stamp_rows: int = 15
@@ -206,6 +207,7 @@ class StampWorkload:
         kind = str(self.kind).strip().lower()
         input_mode = str(self.input_mode).strip().lower()
         input_table = str(self.input_table).strip()
+        variability_table = str(self.variability_table).strip()
         if kind != "stamp":
             raise ValueError("stamp workload kind must be 'stamp'")
         if input_mode not in {"catalog", "table"}:
@@ -218,6 +220,10 @@ class StampWorkload:
             )
         if input_mode == "catalog" and input_table:
             raise ValueError("stamp catalog input_mode cannot set input_table")
+        if input_mode != "table" and variability_table:
+            raise ValueError(
+                "stamp variability_table is supported only for table input_mode"
+            )
         rows = int(self.stamp_rows)
         cols = int(self.stamp_cols)
         target_limit = int(self.target_limit)
@@ -231,6 +237,7 @@ class StampWorkload:
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "input_mode", input_mode)
         object.__setattr__(self, "input_table", input_table)
+        object.__setattr__(self, "variability_table", variability_table)
         object.__setattr__(self, "target_source_ids", target_ids)
         object.__setattr__(self, "target_limit", target_limit)
         object.__setattr__(self, "stamp_rows", rows)

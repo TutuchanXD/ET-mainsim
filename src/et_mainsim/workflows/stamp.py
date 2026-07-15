@@ -5,12 +5,13 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping
 
 import numpy as np
+from astropy.table import Table
 
 from et_mainsim.config import (
     ResolvedRunPaths,
@@ -21,7 +22,12 @@ from et_mainsim.config import (
 from et_mainsim.manifest import RunManifestStore
 from et_mainsim.presets import resource_path
 from et_mainsim.provenance import collect_provenance
-from et_mainsim.stamp_inputs import StampTarget, load_stamp_target_table
+from et_mainsim.stamp_inputs import (
+    StampTarget,
+    file_identity,
+    load_stamp_target_table,
+    load_stamp_variability_table,
+)
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,7 @@ class StampRunPlan:
     run_dir: Path
     catalog_cache: Path
     input_table_path: Path | None
+    variability_table_path: Path | None
     repo_root: Path
 
     @property
@@ -53,6 +60,11 @@ class StampRunPlan:
             "input_table": (
                 None if self.input_table_path is None else str(self.input_table_path)
             ),
+            "variability_table": (
+                None
+                if self.variability_table_path is None
+                else str(self.variability_table_path)
+            ),
             "paths": self.paths.to_dict(),
             "execution": self.run_config.execution.to_dict(),
             "workload": self.workload.to_dict(),
@@ -66,8 +78,12 @@ class PreparedStampInputs:
     target_ids: tuple[int, ...]
     catalogs: Mapping[int, Any]
     psf_ids: Mapping[int, int]
+    targets: Mapping[int, StampTarget]
+    source_variability: Mapping[int, Any | None]
+    source_input_truth: Mapping[int, Mapping[str, Any]]
     shared_catalog: Any | None
     provenance: Mapping[str, Any]
+    input_identities: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -76,6 +92,7 @@ class StampWorkerRequest:
     target_ids: tuple[int, ...]
     rank: int = 0
     world_size: int = 1
+    input_identities: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         target_ids = tuple(int(value) for value in self.target_ids)
@@ -83,9 +100,15 @@ class StampWorkerRequest:
         world_size = int(self.world_size)
         if rank < 0 or world_size <= 0 or rank >= world_size:
             raise ValueError("rank must be smaller than positive world_size")
+        input_identities = dict(self.input_identities)
+        if self.plan.workload.input_mode == "table" and not input_identities:
+            raise ValueError(
+                "stamp table worker requests require verified input identities"
+            )
         object.__setattr__(self, "target_ids", target_ids)
         object.__setattr__(self, "rank", rank)
         object.__setattr__(self, "world_size", world_size)
+        object.__setattr__(self, "input_identities", input_identities)
 
     @classmethod
     def from_plan(
@@ -95,18 +118,20 @@ class StampWorkerRequest:
         target_ids: tuple[int, ...],
         rank: int = 0,
         world_size: int = 1,
+        input_identities: Mapping[str, Any] | None = None,
     ) -> "StampWorkerRequest":
         return cls(
             plan=plan,
             target_ids=target_ids,
             rank=rank,
             world_size=world_size,
+            input_identities=dict(input_identities or {}),
         )
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
             "schema_id": "et_mainsim.stamp_worker_request",
-            "schema_version": 1,
+            "schema_version": 2,
             "preset_name": self.plan.preset_name,
             "run_config": {
                 "schema_id": self.plan.run_config.schema_id,
@@ -129,17 +154,23 @@ class StampWorkerRequest:
                 if self.plan.input_table_path is None
                 else str(self.plan.input_table_path)
             ),
+            "variability_table_path": (
+                None
+                if self.plan.variability_table_path is None
+                else str(self.plan.variability_table_path)
+            ),
             "repo_root": str(self.plan.repo_root),
             "target_ids": list(self.target_ids),
             "rank": self.rank,
             "world_size": self.world_size,
+            "input_identities": dict(self.input_identities),
         }
 
     @classmethod
     def from_json_dict(cls, payload: Mapping[str, Any]) -> "StampWorkerRequest":
         if payload.get("schema_id") != "et_mainsim.stamp_worker_request":
             raise ValueError("Unsupported stamp worker request")
-        if int(payload.get("schema_version", 0)) != 1:
+        if int(payload.get("schema_version", 0)) != 2:
             raise ValueError("Unsupported stamp worker request version")
         from photsim7.specs import SimulationSpec
 
@@ -181,6 +212,11 @@ class StampWorkerRequest:
                 if payload.get("input_table_path") is None
                 else Path(payload["input_table_path"])
             ),
+            variability_table_path=(
+                None
+                if payload.get("variability_table_path") is None
+                else Path(payload["variability_table_path"])
+            ),
             repo_root=Path(payload["repo_root"]),
         )
         return cls(
@@ -188,6 +224,7 @@ class StampWorkerRequest:
             target_ids=tuple(payload["target_ids"]),
             rank=int(payload["rank"]),
             world_size=int(payload["world_size"]),
+            input_identities=dict(payload.get("input_identities", {})),
         )
 
 
@@ -199,6 +236,9 @@ def _science_api() -> SimpleNamespace:
         build_catalog_from_spec,
         build_stamp_services,
     )
+    from photsim7.source_variability import SourceVariability
+    from photsim7.psf.model import load_psf_bundle
+    from photsim7.psf_bundle_paths import resolve_psf_bundle_filename
     from photsim7.stamp_pipeline import run_stamp_coadd
     from photsim7.stamp_products import write_stamp_product_schema
 
@@ -211,6 +251,9 @@ def _science_api() -> SimpleNamespace:
         StampShardWriter=StampShardWriter,
         build_catalog_from_spec=build_catalog_from_spec,
         build_stamp_services=build_stamp_services,
+        SourceVariability=SourceVariability,
+        load_psf_bundle=load_psf_bundle,
+        resolve_psf_bundle_filename=resolve_psf_bundle_filename,
         run_stamp_coadd=run_stamp_coadd,
         write_stamp_product_schema=write_stamp_product_schema,
     )
@@ -286,12 +329,18 @@ def build_run_plan(
     if resolved_spec.psf.mode != "stamp":
         raise ValueError("et-stamp requires a SimulationSpec with psf.mode='stamp'")
     input_table_path = None
+    variability_table_path = None
     if run_config.workload.input_mode == "table":
         input_table_path = _resolve_table_path(
             run_config.workload.input_table,
             cwd=base,
         )
         resolved_spec = _table_spec(resolved_spec)
+        if run_config.workload.variability_table:
+            variability_table_path = _resolve_table_path(
+                run_config.workload.variability_table,
+                cwd=base,
+            )
     return StampRunPlan(
         preset_name=preset_name,
         run_config=run_config,
@@ -300,6 +349,7 @@ def build_run_plan(
         run_dir=run_dir,
         catalog_cache=catalog_cache,
         input_table_path=input_table_path,
+        variability_table_path=variability_table_path,
         repo_root=Path(repo_root).resolve(),
     )
 
@@ -329,6 +379,14 @@ def preflight(plan: StampRunPlan) -> None:
         if plan.input_table_path is None or not plan.input_table_path.is_file():
             raise FileNotFoundError(
                 f"stamp target table does not exist: {plan.input_table_path}"
+            )
+        if (
+            plan.variability_table_path is not None
+            and not plan.variability_table_path.is_file()
+        ):
+            raise FileNotFoundError(
+                "stamp variability table does not exist: "
+                f"{plan.variability_table_path}"
             )
         return
     cache_available = (
@@ -360,26 +418,55 @@ def preflight(plan: StampRunPlan) -> None:
         raise FileNotFoundError(f"Catalog source does not exist: {catalog.source_path}")
 
 
-def _table_catalog(plan: StampRunPlan, target: StampTarget, api: Any) -> Any:
+def _table_catalog(
+    plan: StampRunPlan,
+    target: StampTarget,
+    api: Any,
+    *,
+    source_input_truth: Mapping[str, Any] | None = None,
+) -> Any:
     rows, cols = (int(value) for value in plan.spec.detector.shape)
     center_x = (cols - 1) / 2.0
     center_y = (rows - 1) / 2.0
+    star_data: dict[str, Any] = {
+        "x0": np.asarray([0.0], dtype=np.float64),
+        "y0": np.asarray([0.0], dtype=np.float64),
+        "frame_xpix": np.asarray([center_x], dtype=np.float64),
+        "frame_ypix": np.asarray([center_y], dtype=np.float64),
+        "ra": np.asarray(
+            [
+                target.ra_deg
+                if target.ra_deg is not None
+                else plan.spec.catalog.target_ra_deg or 0.0
+            ]
+        ),
+        "dec": np.asarray(
+            [
+                target.dec_deg
+                if target.dec_deg is not None
+                else plan.spec.catalog.target_dec_deg or 0.0
+            ]
+        ),
+        "source_id": np.asarray([target.source_id], dtype=np.int64),
+        "gaia_g_mag": np.asarray([target.gaia_g_mag], dtype=np.float64),
+        "detector_xpix": np.asarray([target.detector_xpix], dtype=np.float64),
+        "detector_ypix": np.asarray([target.detector_ypix], dtype=np.float64),
+        "detector_xpix_shifted": np.asarray([center_x], dtype=np.float64),
+        "detector_ypix_shifted": np.asarray([center_y], dtype=np.float64),
+        "detector_id": str(plan.spec.detector.detector_id),
+    }
+    if target.field_x_deg is not None:
+        star_data["field_x_deg"] = np.asarray(
+            [target.field_x_deg], dtype=np.float64
+        )
+        star_data["field_y_deg"] = np.asarray(
+            [target.field_y_deg], dtype=np.float64
+        )
+        star_data["field_angle_deg"] = np.asarray(
+            [target.field_angle_deg], dtype=np.float64
+        )
     return api.PreparedStarCatalog(
-        star_data={
-            "x0": np.asarray([0.0], dtype=np.float64),
-            "y0": np.asarray([0.0], dtype=np.float64),
-            "frame_xpix": np.asarray([center_x], dtype=np.float64),
-            "frame_ypix": np.asarray([center_y], dtype=np.float64),
-            "ra": np.asarray([plan.spec.catalog.target_ra_deg or 0.0]),
-            "dec": np.asarray([plan.spec.catalog.target_dec_deg or 0.0]),
-            "source_id": np.asarray([target.source_id], dtype=np.int64),
-            "gaia_g_mag": np.asarray([target.gaia_g_mag], dtype=np.float64),
-            "detector_xpix": np.asarray([target.detector_xpix], dtype=np.float64),
-            "detector_ypix": np.asarray([target.detector_ypix], dtype=np.float64),
-            "detector_xpix_shifted": np.asarray([center_x], dtype=np.float64),
-            "detector_ypix_shifted": np.asarray([center_y], dtype=np.float64),
-            "detector_id": str(plan.spec.detector.detector_id),
-        },
+        star_data=star_data,
         metadata={
             "source": {
                 "type": "et_mainsim_stamp_target_table",
@@ -393,7 +480,343 @@ def _table_catalog(plan: StampRunPlan, target: StampTarget, api: Any) -> Any:
                 "conversion": "gaia_g_vega_equals_et_ab_g2v_approx",
             },
             "scene_policy": "independent_target_only_no_neighbors",
+            "source_input_truth": dict(source_input_truth or {}),
         },
+    )
+
+
+@dataclass(frozen=True)
+class _PsfBundleIndex:
+    node_angles_deg: Mapping[int, float]
+    provenance: Mapping[str, Any]
+
+
+def _psf_bundle_asset_identity(plan: StampRunPlan) -> dict[str, Any]:
+    if plan.paths.data_root is None:
+        raise ValueError("data_root is required")
+    bundle_name = str(plan.spec.psf.bundle_name)
+    if bundle_name.lower().startswith("kp_"):
+        raise ValueError(
+            "stamp table input requires a deterministic ET PSF bundle; "
+            "kp_N randomly reselects backing interpolants and is not supported"
+        )
+    from photsim7.psf_bundle_paths import resolve_psf_bundle_filename
+
+    bundle_path = Path(
+        resolve_psf_bundle_filename(bundle_name, plan.paths.data_root)
+    )
+    return file_identity(bundle_path)
+
+
+def _load_psf_bundle_index(plan: StampRunPlan, api: Any) -> _PsfBundleIndex:
+    if plan.paths.data_root is None:
+        raise ValueError("data_root is required")
+    bundle_name = str(plan.spec.psf.bundle_name)
+    if bundle_name.lower().startswith("kp_"):
+        raise ValueError(
+            "stamp table input requires a deterministic ET PSF bundle; "
+            "kp_N randomly reselects backing interpolants and is not supported"
+        )
+    bundle = api.load_psf_bundle(
+        bundle_name,
+        n_rows=int(plan.spec.detector.shape[0]),
+        n_cols=int(plan.spec.detector.shape[1]),
+        n_subpixels=int(plan.spec.detector.n_subpixels),
+        pad_to_detector_shape=False,
+        base_data_dir=str(plan.paths.data_root),
+    )
+    images = bundle.get("images")
+    angles = np.asarray(bundle.get("angles"), dtype=np.float64)
+    if not isinstance(images, Mapping) or not images:
+        raise ValueError(f"PSF bundle {bundle_name!r} has no field IDs")
+    node_angles: dict[int, float] = {}
+    for raw_field_id in images:
+        field_id = int(raw_field_id)
+        if field_id < 0 or field_id >= angles.size:
+            raise ValueError(
+                f"PSF bundle field ID {field_id} has no matching angle node"
+            )
+        angle = float(angles[field_id])
+        if not np.isfinite(angle):
+            raise ValueError(f"PSF bundle field ID {field_id} angle is not finite")
+        node_angles[field_id] = angle
+    provenance: dict[str, Any] = {
+        "bundle_name": bundle_name,
+        "available_field_ids": sorted(node_angles),
+        "node_angles_deg": {
+            str(key): value for key, value in sorted(node_angles.items())
+        },
+    }
+    try:
+        provenance["file_identity"] = _psf_bundle_asset_identity(plan)
+    except FileNotFoundError:
+        if hasattr(api, "resolve_psf_bundle_filename"):
+            raise
+    return _PsfBundleIndex(
+        node_angles_deg=node_angles,
+        provenance=provenance,
+    )
+
+
+def _resolve_target_psf(
+    target: StampTarget,
+    *,
+    bundle: _PsfBundleIndex,
+) -> StampTarget:
+    if target.location_mode == "explicit_psf":
+        requested = int(target.psf_id)  # validated by the target-table loader
+        if requested not in bundle.node_angles_deg:
+            raise ValueError(
+                f"target {target.source_id} requests unavailable PSF ID {requested}; "
+                f"available={sorted(bundle.node_angles_deg)}"
+            )
+        return replace(
+            target,
+            psf_node_angle_deg=float(bundle.node_angles_deg[requested]),
+        )
+    if target.field_angle_deg is None:
+        raise ValueError(
+            f"coordinate target {target.source_id} is missing field_angle_deg"
+        )
+    available_ids = np.asarray(sorted(bundle.node_angles_deg), dtype=np.int64)
+    available_angles = np.asarray(
+        [bundle.node_angles_deg[int(value)] for value in available_ids],
+        dtype=np.float64,
+    )
+    offset = int(
+        np.argmin(np.abs(available_angles - float(target.field_angle_deg)))
+    )
+    chosen_id = int(available_ids[offset])
+    node_angle = float(available_angles[offset])
+    return replace(
+        target,
+        psf_id=chosen_id,
+        psf_node_angle_deg=node_angle,
+        psf_angle_delta_deg=abs(float(target.field_angle_deg) - node_angle),
+    )
+
+
+def _source_input_truth(
+    target: StampTarget,
+    *,
+    target_provenance: Mapping[str, Any],
+    variability_provenance: Mapping[str, Any] | None,
+    psf_bundle_provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    location = {
+        "mode": target.location_mode,
+        "coordinate_frame": (
+            "ICRS_J2000" if target.location_mode == "sky_icrs_j2000" else None
+        ),
+        "ra_deg": target.ra_deg,
+        "dec_deg": target.dec_deg,
+        "detector_xpix": target.detector_xpix,
+        "detector_ypix": target.detector_ypix,
+        "field_x_deg": target.field_x_deg,
+        "field_y_deg": target.field_y_deg,
+        "field_angle_deg": target.field_angle_deg,
+        "focalplane_residual_arcsec": target.focalplane_residual_arcsec,
+    }
+    psf = {
+        "selection_policy": (
+            "nearest_radial_field_angle"
+            if target.location_mode == "sky_icrs_j2000"
+            else "explicit_field_id"
+        ),
+        "chosen_psf_id": target.psf_id,
+        "node_angle_deg": target.psf_node_angle_deg,
+        "angle_delta_deg": target.psf_angle_delta_deg,
+        "bundle": dict(psf_bundle_provenance),
+    }
+    variability_identity = (
+        None
+        if variability_provenance is None
+        else variability_provenance.get("file_identity")
+    )
+    return {
+        "schema_id": "et_mainsim.stamp_source_input_truth",
+        "schema_version": 1,
+        "source_id": target.source_id,
+        "gaia_g_mag": target.gaia_g_mag,
+        "magnitude_system": "Gaia_G_Vega",
+        "target_table_identity": target_provenance["file_identity"],
+        "target_table_meta": target_provenance.get("table_meta", {}),
+        "focalplane_registry_identity": target_provenance.get(
+            "focalplane_registry_identity"
+        ),
+        "location": location,
+        "psf": psf,
+        "variability": {
+            "enabled": target.curve_id is not None,
+            "curve_id": target.curve_id,
+            "semantics": "dimensionless_relative_flux_per_raw_frame",
+            "time_alignment": "simulation_raw_frame_index",
+            "variability_table_identity": variability_identity,
+            "variability_table_meta": (
+                {}
+                if variability_provenance is None
+                else variability_provenance.get("table_meta", {})
+            ),
+        },
+    }
+
+
+def _validate_input_identities(
+    actual: Mapping[str, Any],
+    expected: Mapping[str, Any] | None,
+) -> None:
+    if not expected:
+        return
+    if dict(actual) != dict(expected):
+        raise ValueError(
+            "stamp worker input identity mismatch; a target, variability, "
+            "focalplane registry, or PSF bundle input changed after worker planning"
+        )
+
+
+def _prepare_table_inputs(
+    plan: StampRunPlan,
+    api: Any,
+    *,
+    requested_target_ids: tuple[int, ...] | None = None,
+    apply_workload_selection: bool = True,
+    expected_identities: Mapping[str, Any] | None = None,
+) -> PreparedStampInputs:
+    if plan.input_table_path is None:
+        raise ValueError("table input path is required")
+    loaded = load_stamp_target_table(
+        plan.input_table_path,
+        detector_shape=tuple(plan.spec.detector.shape),
+        detector_id=str(plan.spec.detector.detector_id),
+        focalplane_registry=plan.paths.focalplane_registry,
+    )
+    targets = list(loaded.targets)
+    requested = (
+        set(requested_target_ids)
+        if requested_target_ids is not None
+        else set(plan.workload.target_source_ids)
+    )
+    if requested:
+        by_available_id = {target.source_id: target for target in targets}
+        missing = sorted(requested - set(by_available_id))
+        if missing:
+            raise ValueError(f"stamp target rows are absent: {missing}")
+        targets = [
+            by_available_id[target_id]
+            for target_id in (
+                requested_target_ids
+                if requested_target_ids is not None
+                else plan.workload.target_source_ids
+            )
+        ]
+    if apply_workload_selection and plan.workload.target_limit:
+        targets = targets[: plan.workload.target_limit]
+    if not targets:
+        raise ValueError("stamp target table selected no rows")
+
+    variability = None
+    if plan.variability_table_path is not None:
+        variability = load_stamp_variability_table(
+            plan.variability_table_path,
+            raw_frame_count=int(plan.spec.observation.resolved_n_frames),
+        )
+    referenced_curve_ids = sorted(
+        {target.curve_id for target in targets if target.curve_id is not None}
+    )
+    if referenced_curve_ids and variability is None:
+        raise ValueError(
+            "stamp targets reference curve_id values but no variability_table was provided"
+        )
+    available_curve_ids = set() if variability is None else set(variability.curves)
+    missing_curves = sorted(set(referenced_curve_ids) - available_curve_ids)
+    if missing_curves:
+        raise ValueError(
+            f"stamp targets reference absent variability curves: {missing_curves}"
+        )
+
+    bundle = _load_psf_bundle_index(plan, api)
+    targets = [_resolve_target_psf(target, bundle=bundle) for target in targets]
+    input_identities: dict[str, Any] = {
+        "target_table": loaded.provenance["file_identity"],
+    }
+    if variability is not None:
+        input_identities["variability_table"] = variability.provenance[
+            "file_identity"
+        ]
+    registry_identity = loaded.provenance.get("focalplane_registry_identity")
+    if registry_identity is not None:
+        input_identities["focalplane_registry"] = registry_identity
+    if bundle.provenance.get("file_identity") is not None:
+        input_identities["psf_bundle"] = bundle.provenance["file_identity"]
+    _validate_input_identities(input_identities, expected_identities)
+
+    source_variability: dict[int, Any | None] = {}
+    input_truth: dict[int, Mapping[str, Any]] = {}
+    catalogs: dict[int, Any] = {}
+    for target in targets:
+        curve = (
+            None
+            if target.curve_id is None or variability is None
+            else variability.curves[target.curve_id]
+        )
+        source_variability[target.source_id] = (
+            None
+            if curve is None
+            else api.SourceVariability(
+                source_ids=np.asarray([target.source_id], dtype=np.int64),
+                relative_flux=np.asarray([curve], dtype=np.float64),
+            )
+        )
+        truth = _source_input_truth(
+            target,
+            target_provenance=loaded.provenance,
+            variability_provenance=(
+                None if variability is None else variability.provenance
+            ),
+            psf_bundle_provenance=bundle.provenance,
+        )
+        input_truth[target.source_id] = truth
+        catalogs[target.source_id] = _table_catalog(
+            plan,
+            target,
+            api,
+            source_input_truth=truth,
+        )
+
+    unreferenced = sorted(available_curve_ids - set(referenced_curve_ids))
+    provenance = {
+        "schema_id": "et_mainsim.prepared_stamp_table_inputs",
+        "schema_version": 1,
+        "scene_policy": "one_independent_target_per_row_no_neighbors",
+        "target_table": dict(loaded.provenance),
+        "variability_table": (
+            None if variability is None else dict(variability.provenance)
+        ),
+        "variability_selection": {
+            "referenced_curve_ids": referenced_curve_ids,
+            "referenced_curve_count": len(referenced_curve_ids),
+            "unreferenced_curve_ids": unreferenced,
+            "unreferenced_curve_count": len(unreferenced),
+            "static_target_count": sum(
+                target.curve_id is None for target in targets
+            ),
+            "variable_target_count": sum(
+                target.curve_id is not None for target in targets
+            ),
+        },
+        "psf_bundle": dict(bundle.provenance),
+        "targets": [input_truth[target.source_id] for target in targets],
+    }
+    return PreparedStampInputs(
+        target_ids=tuple(target.source_id for target in targets),
+        catalogs=catalogs,
+        psf_ids={target.source_id: int(target.psf_id) for target in targets},
+        targets={target.source_id: target for target in targets},
+        source_variability=source_variability,
+        source_input_truth=input_truth,
+        shared_catalog=None,
+        provenance=provenance,
+        input_identities=input_identities,
     )
 
 
@@ -421,33 +844,7 @@ def prepare_stamp_inputs(
     api = _science_api() if science_api is None else science_api
     workload = plan.workload
     if workload.input_mode == "table":
-        if plan.input_table_path is None:
-            raise ValueError("table input path is required")
-        loaded = load_stamp_target_table(
-            plan.input_table_path,
-            detector_shape=tuple(plan.spec.detector.shape),
-        )
-        targets = list(loaded.targets)
-        if workload.target_source_ids:
-            requested = set(workload.target_source_ids)
-            targets = [target for target in targets if target.source_id in requested]
-            missing = sorted(requested - {target.source_id for target in targets})
-            if missing:
-                raise ValueError(f"stamp target rows are absent: {missing}")
-        if workload.target_limit:
-            targets = targets[: workload.target_limit]
-        if not targets:
-            raise ValueError("stamp target table selected no rows")
-        catalogs = {
-            target.source_id: _table_catalog(plan, target, api) for target in targets
-        }
-        return PreparedStampInputs(
-            target_ids=tuple(target.source_id for target in targets),
-            catalogs=catalogs,
-            psf_ids={target.source_id: target.psf_id for target in targets},
-            shared_catalog=None,
-            provenance=dict(loaded.provenance),
-        )
+        return _prepare_table_inputs(plan, api)
 
     if plan.paths.data_root is None:
         raise ValueError("data_root is required")
@@ -460,6 +857,9 @@ def prepare_stamp_inputs(
         target_ids=target_ids,
         catalogs={target_id: catalog for target_id in target_ids},
         psf_ids={},
+        targets={},
+        source_variability={target_id: None for target_id in target_ids},
+        source_input_truth={target_id: {} for target_id in target_ids},
         shared_catalog=catalog,
         provenance={
             "schema_id": "et_mainsim.stamp_catalog_selection",
@@ -469,11 +869,90 @@ def prepare_stamp_inputs(
             "target_ids": list(target_ids),
             "include_neighbors": workload.include_neighbors,
         },
+        input_identities={},
     )
 
 
 def _target_dir(plan: StampRunPlan, target_id: int) -> Path:
     return plan.run_dir / "stamps" / f"target_{int(target_id)}"
+
+
+def _target_artifact_manifest_path(plan: StampRunPlan, target_id: int) -> Path:
+    return _target_dir(plan, target_id) / "target_artifacts.json"
+
+
+def _source_variability_truth_path(plan: StampRunPlan, target_id: int) -> Path:
+    return _target_dir(plan, target_id) / "source_variability_truth.ecsv"
+
+
+def _read_target_artifacts(
+    plan: StampRunPlan,
+    target_id: int,
+) -> dict[str, Any] | None:
+    path = _target_artifact_manifest_path(plan, target_id)
+    if not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("schema_id") != "et_mainsim.stamp_target_artifacts":
+            return None
+        if int(payload.get("schema_version", 0)) != 1:
+            return None
+        if int(payload.get("target_source_id", -1)) != int(target_id):
+            return None
+        expected = payload.get("source_variability_truth_identity")
+        truth_path = _source_variability_truth_path(plan, target_id)
+        if not isinstance(expected, Mapping) or not truth_path.is_file():
+            return None
+        if file_identity(truth_path) != dict(expected):
+            return None
+        table = Table.read(truth_path, format="ascii.ecsv")
+        if len(table) != int(plan.spec.observation.resolved_n_frames):
+            return None
+        required_columns = {
+            "frame_index",
+            "source_id",
+            "curve_id",
+            "relative_flux",
+            "baseline_photon_count_electron",
+            "effective_photon_count_electron",
+            "psf_field_id",
+        }
+        if not required_columns.issubset(table.colnames):
+            return None
+        if tuple(int(value) for value in table["frame_index"]) != tuple(
+            range(int(plan.spec.observation.resolved_n_frames))
+        ):
+            return None
+        if any(int(value) != int(target_id) for value in table["source_id"]):
+            return None
+        relative_flux = np.asarray(table["relative_flux"], dtype=np.float64)
+        baseline = np.asarray(
+            table["baseline_photon_count_electron"], dtype=np.float64
+        )
+        effective = np.asarray(
+            table["effective_photon_count_electron"], dtype=np.float64
+        )
+        if not all(
+            np.all(np.isfinite(values))
+            for values in (relative_flux, baseline, effective)
+        ):
+            return None
+        if np.any(relative_flux < 0.0) or np.any(baseline < 0.0):
+            return None
+        if not np.allclose(
+            effective,
+            baseline * relative_flux,
+            rtol=1e-12,
+            atol=1e-9,
+        ):
+            return None
+        if any(int(value) < 0 for value in table["psf_field_id"]):
+            return None
+        return payload
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
 
 
 def _expected_ids(plan: StampRunPlan) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -548,6 +1027,7 @@ def target_is_complete(plan: StampRunPlan, target_id: int, *, api: Any) -> bool:
                 for coadd_id in coadd_ids
             )
         )
+    checks.append(_read_target_artifacts(plan, target_id) is not None)
     return bool(checks) and all(checks)
 
 
@@ -573,7 +1053,134 @@ def _save_electron_components(path: Path, products: Any) -> None:
     np.savez_compressed(path, **arrays)
 
 
-def _target_spec(plan: StampRunPlan, psf_id: int | None) -> Any:
+def _truth_value_for_target(
+    payload: Mapping[str, Any],
+    name: str,
+    *,
+    target_id: int,
+) -> float | int:
+    if "source_id" not in payload or name not in payload:
+        raise RuntimeError(f"stamp truth payload is missing {name!r}")
+    source_ids = _to_numpy(payload["source_id"]).reshape(-1)
+    offsets = np.flatnonzero(source_ids == int(target_id))
+    if offsets.size != 1:
+        raise RuntimeError(
+            f"stamp truth must contain target {target_id} exactly once"
+        )
+    values = _to_numpy(payload[name]).reshape(-1)
+    if values.size != source_ids.size:
+        raise RuntimeError(
+            f"stamp truth field {name!r} does not align with source_id"
+        )
+    value = values[int(offsets[0])]
+    if np.issubdtype(values.dtype, np.integer):
+        return int(value)
+    converted = float(value)
+    if not np.isfinite(converted):
+        raise RuntimeError(f"stamp truth field {name!r} is not finite")
+    return converted
+
+
+def _variability_truth_row(
+    products: Any,
+    *,
+    target_id: int,
+    curve_id: str | None,
+) -> dict[str, Any]:
+    truth = getattr(products, "truth", None)
+    payload = None if truth is None else getattr(truth, "payload", None)
+    if not isinstance(payload, Mapping):
+        raise RuntimeError("stamp products must expose the numeric truth payload")
+    return {
+        "frame_index": int(products.frame_index),
+        "source_id": int(target_id),
+        "curve_id": "" if curve_id is None else str(curve_id),
+        "relative_flux": float(
+            _truth_value_for_target(
+                payload,
+                "source_relative_flux_factor",
+                target_id=target_id,
+            )
+        ),
+        "baseline_photon_count_electron": float(
+            _truth_value_for_target(
+                payload,
+                "source_baseline_photon_count_electron",
+                target_id=target_id,
+            )
+        ),
+        "effective_photon_count_electron": float(
+            _truth_value_for_target(
+                payload,
+                "source_effective_photon_count_electron",
+                target_id=target_id,
+            )
+        ),
+        "psf_field_id": int(
+            _truth_value_for_target(
+                payload,
+                "source_psf_field_index",
+                target_id=target_id,
+            )
+        ),
+    }
+
+
+def _write_source_variability_truth(
+    path: Path,
+    *,
+    rows: list[Mapping[str, Any]],
+    target_id: int,
+    source_input_truth: Mapping[str, Any],
+) -> dict[str, Any]:
+    ordered = sorted(rows, key=lambda row: int(row["frame_index"]))
+    frame_indices = tuple(int(row["frame_index"]) for row in ordered)
+    if frame_indices != tuple(range(len(ordered))):
+        raise RuntimeError(
+            "source variability truth rows must contain every raw frame exactly once"
+        )
+    table = Table(
+        {
+            "frame_index": [int(row["frame_index"]) for row in ordered],
+            "source_id": [int(row["source_id"]) for row in ordered],
+            "curve_id": [str(row["curve_id"]) for row in ordered],
+            "relative_flux": [float(row["relative_flux"]) for row in ordered],
+            "baseline_photon_count_electron": [
+                float(row["baseline_photon_count_electron"]) for row in ordered
+            ],
+            "effective_photon_count_electron": [
+                float(row["effective_photon_count_electron"]) for row in ordered
+            ],
+            "psf_field_id": [int(row["psf_field_id"]) for row in ordered],
+        },
+        meta={
+            "schema_id": "et_mainsim.source_variability_truth",
+            "schema_version": 1,
+            "target_source_id": int(target_id),
+            "time_alignment": "simulation_raw_frame_index",
+            "source_input_truth": dict(source_input_truth),
+        },
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table.write(path, format="ascii.ecsv", overwrite=True)
+    return file_identity(path)
+
+
+def _target_spec(
+    plan: StampRunPlan,
+    *,
+    target: StampTarget | None,
+    psf_id: int | None,
+) -> Any:
+    if target is not None and target.location_mode == "sky_icrs_j2000":
+        return replace(
+            plan.spec,
+            psf=replace(
+                plan.spec.psf,
+                field_id="nearest",
+                field_id_policy="nearest",
+            ),
+        )
     if psf_id is None:
         return plan.spec
     return replace(
@@ -598,6 +1205,7 @@ def _open_writer(
     unit: str,
     domain: str,
     product_schema: Mapping[str, Any] | None,
+    source_input_truth: Mapping[str, Any],
 ) -> Any | None:
     if path.is_file():
         if _shard_complete(
@@ -623,6 +1231,7 @@ def _open_writer(
             "preset": plan.preset_name,
             "target_source_id": target_id,
             "input_mode": plan.workload.input_mode,
+            "source_input_truth": dict(source_input_truth),
         },
         product_schema=product_schema,
         resume=plan.run_config.execution.resume,
@@ -635,13 +1244,21 @@ def _render_target(
     target_id: int,
     catalog: Any,
     psf_id: int | None,
+    target: StampTarget | None,
+    source_variability: Any | None,
+    source_input_truth: Mapping[str, Any],
     api: Any,
     worker_rank: int = 0,
 ) -> dict[str, Any]:
     target_dir = _target_dir(plan, target_id)
     if target_is_complete(plan, target_id, api=api):
         if plan.run_config.execution.resume:
-            return {"target_id": target_id, "status": "skipped"}
+            artifacts = _read_target_artifacts(plan, target_id)
+            return {
+                "target_id": target_id,
+                "status": "skipped",
+                "artifacts": artifacts,
+            }
         if not plan.run_config.execution.overwrite:
             raise FileExistsError(
                 f"target {target_id} already has complete artifacts; use resume or overwrite"
@@ -652,7 +1269,7 @@ def _render_target(
     if plan.paths.data_root is None:
         raise ValueError("data_root is required")
 
-    spec = _target_spec(plan, psf_id)
+    spec = _target_spec(plan, target=target, psf_id=psf_id)
     registry = api.DataRegistry(data_root=plan.paths.data_root)
     services = api.build_stamp_services(
         spec,
@@ -664,6 +1281,7 @@ def _render_target(
     coadd_writer = None
     raw_path = target_dir / "raw.h5"
     coadd_path = target_dir / "coadd.h5"
+    truth_rows: list[dict[str, Any]] = []
     try:
         for coadd_index in coadd_ids:
             result = api.run_stamp_coadd(
@@ -672,6 +1290,7 @@ def _render_target(
                 stamp_shape=plan.workload.stamp_shape,
                 coadd_index=coadd_index,
                 services=services,
+                source_variability=source_variability,
                 include_neighbors=plan.workload.include_neighbors,
                 worker_rank=worker_rank,
                 rng_trace_scope={
@@ -695,6 +1314,7 @@ def _render_target(
                     unit=first_raw.final_stamp.unit,
                     domain=first_raw.final_stamp.domain,
                     product_schema=first_raw.to_schema_dict(),
+                    source_input_truth=source_input_truth,
                 )
             if (
                 plan.workload.save_coadd
@@ -712,18 +1332,28 @@ def _render_target(
                     unit=coadd_products.coadd_stamp.unit,
                     domain=coadd_products.coadd_stamp.domain,
                     product_schema=None,
+                    source_input_truth=source_input_truth,
                 )
 
             for raw_result in result.raw_results:
                 products = raw_result.stamp_products
                 frame_id = int(products.frame_index)
+                truth_rows.append(
+                    _variability_truth_row(
+                        products,
+                        target_id=target_id,
+                        curve_id=(None if target is None else target.curve_id),
+                    )
+                )
                 if plan.workload.save_raw:
+                    schema = products.to_schema_dict()
+                    schema["source_input_truth"] = dict(source_input_truth)
                     api.write_stamp_product_schema(
                         target_dir
                         / "schemas"
                         / "raw"
                         / f"frame_{frame_id:06d}.json",
-                        products,
+                        schema,
                     )
                 if raw_writer is not None and raw_writer.item_status(
                     target_id, frame_id
@@ -742,12 +1372,14 @@ def _render_target(
                         products,
                     )
             if plan.workload.save_coadd:
+                coadd_schema = coadd_products.to_schema_dict()
+                coadd_schema["source_input_truth"] = dict(source_input_truth)
                 api.write_stamp_product_schema(
                     target_dir
                     / "schemas"
                     / "coadd"
                     / f"coadd_{coadd_index:06d}.json",
-                    coadd_products,
+                    coadd_schema,
                 )
             if coadd_writer is not None and coadd_writer.item_status(
                 target_id, coadd_index
@@ -764,6 +1396,39 @@ def _render_target(
         if coadd_writer is not None:
             coadd_writer.finalize()
             coadd_writer = None
+        truth_identity = _write_source_variability_truth(
+            _source_variability_truth_path(plan, target_id),
+            rows=truth_rows,
+            target_id=target_id,
+            source_input_truth=source_input_truth,
+        )
+        selected_field_ids = np.asarray(
+            services.psf_result.psf_field_ids, dtype=np.int64
+        )
+        if psf_id is not None and (
+            selected_field_ids.size != 1 or int(selected_field_ids[0]) != int(psf_id)
+        ):
+            raise RuntimeError(
+                f"resolved PSF ID {psf_id} disagrees with runtime selection "
+                f"{selected_field_ids.tolist()}"
+            )
+        from et_mainsim.manifest import _atomic_write_json
+
+        target_artifacts = {
+            "schema_id": "et_mainsim.stamp_target_artifacts",
+            "schema_version": 1,
+            "target_source_id": target_id,
+            "source_input_truth": dict(source_input_truth),
+            "source_variability_truth_identity": truth_identity,
+            "runtime_psf": {
+                "selected_field_ids": selected_field_ids.tolist(),
+                "provenance": dict(services.psf_result.provenance),
+            },
+        }
+        _atomic_write_json(
+            _target_artifact_manifest_path(plan, target_id),
+            target_artifacts,
+        )
     finally:
         if raw_writer is not None:
             raw_writer.close()
@@ -773,40 +1438,34 @@ def _render_target(
         raise RuntimeError(
             f"stamp artifacts for target {target_id} failed readback validation"
         )
-    return {"target_id": target_id, "status": "rendered"}
+    return {
+        "target_id": target_id,
+        "status": "rendered",
+        "artifacts": target_artifacts,
+    }
 
 
 def _worker_inputs(request: StampWorkerRequest, api: Any) -> PreparedStampInputs:
     plan = request.plan
     if plan.workload.input_mode == "table":
-        if plan.input_table_path is None:
-            raise ValueError("table input path is required")
-        loaded = load_stamp_target_table(
-            plan.input_table_path,
-            detector_shape=tuple(plan.spec.detector.shape),
-        )
-        by_id = {target.source_id: target for target in loaded.targets}
-        missing = sorted(set(request.target_ids) - set(by_id))
-        if missing:
-            raise ValueError(f"stamp worker target rows are absent: {missing}")
-        targets = [by_id[target_id] for target_id in request.target_ids]
-        return PreparedStampInputs(
-            target_ids=request.target_ids,
-            catalogs={
-                target.source_id: _table_catalog(plan, target, api)
-                for target in targets
-            },
-            psf_ids={target.source_id: target.psf_id for target in targets},
-            shared_catalog=None,
-            provenance=dict(loaded.provenance),
+        return _prepare_table_inputs(
+            plan,
+            api,
+            requested_target_ids=request.target_ids,
+            apply_workload_selection=False,
+            expected_identities=request.input_identities,
         )
     catalog = api.StarCatalogCache.read(plan.catalog_cache)
     return PreparedStampInputs(
         target_ids=request.target_ids,
         catalogs={target_id: catalog for target_id in request.target_ids},
         psf_ids={},
+        targets={},
+        source_variability={target_id: None for target_id in request.target_ids},
+        source_input_truth={target_id: {} for target_id in request.target_ids},
         shared_catalog=catalog,
         provenance={"catalog_cache": str(plan.catalog_cache)},
+        input_identities={},
     )
 
 
@@ -824,6 +1483,9 @@ def run_stamp_worker(
             target_id=target_id,
             catalog=prepared.catalogs[target_id],
             psf_id=prepared.psf_ids.get(target_id),
+            target=prepared.targets.get(target_id),
+            source_variability=prepared.source_variability.get(target_id),
+            source_input_truth=prepared.source_input_truth.get(target_id, {}),
             api=api,
             worker_rank=request.rank,
         )
@@ -855,6 +1517,8 @@ def run_stamp_worker_request_file(path: Path | str) -> list[dict[str, Any]]:
 def _launch_subprocess_workers(
     plan: StampRunPlan,
     target_ids: tuple[int, ...],
+    *,
+    input_identities: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     from et_mainsim.manifest import _atomic_write_json
 
@@ -870,6 +1534,7 @@ def _launch_subprocess_workers(
             target_ids=target_ids,
             rank=assignment.rank,
             world_size=assignment.world_size,
+            input_identities=input_identities,
         )
         request_path = request_dir / f"stamp_worker_{assignment.rank:02d}.json"
         _atomic_write_json(request_path, request.to_json_dict())
@@ -877,6 +1542,13 @@ def _launch_subprocess_workers(
         log_handle = log_path.open("w", encoding="utf-8")
         environment = os.environ.copy()
         environment["PYTHONUNBUFFERED"] = "1"
+        source_root = str(Path(__file__).resolve().parents[2])
+        existing_pythonpath = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = (
+            source_root
+            if not existing_pythonpath
+            else os.pathsep.join((source_root, existing_pythonpath))
+        )
         if assignment.visible_device is not None:
             environment["CUDA_VISIBLE_DEVICES"] = assignment.visible_device
         process = subprocess.Popen(
@@ -933,12 +1605,23 @@ def _workload_identity(plan: StampRunPlan) -> dict[str, Any]:
         return payload
     if plan.input_table_path is None:
         raise ValueError("table input path is required")
-    stat = plan.input_table_path.stat()
-    payload["input_table_identity"] = {
-        "path": str(plan.input_table_path),
-        "size_bytes": int(stat.st_size),
-        "mtime_ns": int(stat.st_mtime_ns),
-    }
+    payload["input_table_identity"] = file_identity(plan.input_table_path)
+    if plan.variability_table_path is not None:
+        payload["variability_table_identity"] = file_identity(
+            plan.variability_table_path
+        )
+    target_table = load_stamp_target_table(
+        plan.input_table_path,
+        detector_shape=tuple(plan.spec.detector.shape),
+        detector_id=str(plan.spec.detector.detector_id),
+        focalplane_registry=plan.paths.focalplane_registry,
+    )
+    registry_identity = target_table.provenance.get(
+        "focalplane_registry_identity"
+    )
+    if registry_identity is not None:
+        payload["focalplane_registry_identity"] = registry_identity
+    payload["psf_bundle_identity"] = _psf_bundle_asset_identity(plan)
     return payload
 
 
@@ -990,6 +1673,8 @@ def run_stamp(
                 "raw_shard_name": "raw.h5",
                 "coadd_shard_name": "coadd.h5",
                 "schema_root_name": "schemas",
+                "source_variability_truth_name": "source_variability_truth.ecsv",
+                "target_artifact_manifest_name": "target_artifacts.json",
             },
         )
     try:
@@ -1003,6 +1688,26 @@ def run_stamp(
             }
         )
         prepared = prepare_stamp_inputs(plan, science_api=api)
+        planned_input_identities: dict[str, Any] = {}
+        if plan.workload.input_mode == "table":
+            planned_input_identities["target_table"] = workload_payload[
+                "input_table_identity"
+            ]
+            if "variability_table_identity" in workload_payload:
+                planned_input_identities["variability_table"] = workload_payload[
+                    "variability_table_identity"
+                ]
+            if "focalplane_registry_identity" in workload_payload:
+                planned_input_identities["focalplane_registry"] = workload_payload[
+                    "focalplane_registry_identity"
+                ]
+            planned_input_identities["psf_bundle"] = workload_payload[
+                "psf_bundle_identity"
+            ]
+            _validate_input_identities(
+                prepared.input_identities,
+                planned_input_identities,
+            )
         store.update(catalog=_catalog_manifest(prepared, plan))
         if plan.run_config.execution.backend == "in-process":
             results = [
@@ -1011,12 +1716,21 @@ def run_stamp(
                     target_id=target_id,
                     catalog=prepared.catalogs[target_id],
                     psf_id=prepared.psf_ids.get(target_id),
+                    target=prepared.targets.get(target_id),
+                    source_variability=prepared.source_variability.get(target_id),
+                    source_input_truth=prepared.source_input_truth.get(
+                        target_id, {}
+                    ),
                     api=api,
                 )
                 for target_id in prepared.target_ids
             ]
         else:
-            results = _launch_subprocess_workers(plan, prepared.target_ids)
+            results = _launch_subprocess_workers(
+                plan,
+                prepared.target_ids,
+                input_identities=prepared.input_identities,
+            )
         rendered = sum(result["status"] == "rendered" for result in results)
         skipped = sum(result["status"] == "skipped" for result in results)
         return store.transition(
