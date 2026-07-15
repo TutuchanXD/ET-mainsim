@@ -163,9 +163,54 @@ include_neighbors = false
 
 `variability_table` 只允许用于 table mode。为了让静态和注入对照共享随机数，应使用相同的 `run_id`、seed、SimulationSpec、目标、位置、PSF 和 stamp 参数，只把结果写到不同的 `output_root`。
 
+### 5.1 长时运行：紧凑输出与 coadd 时间分片
+
+30 d、10 s raw cadence、每 6 帧合成 1 min coadd 时，每个场景共有
+259,200 个 raw frame 和 43,200 个 coadd。长时快看可同时使用以下三个参数，
+降低小文件数量并把一个逻辑时间轴拆给多个独立进程：
+
+```bash
+et-mainsim run et-stamp \
+  ... \
+  --no-save-raw \
+  --save-coadd \
+  --artifact-profile compact \
+  --write-batch-size 32 \
+  --coadd-shard-index 0 \
+  --coadd-shard-count 6
+```
+
+- `artifact_profile=compact` 保留 HDF5、manifest、source-variability truth 和
+  provenance，但不生成逐帧 JSON schema sidecar。`detailed` 是兼容旧行为的默认值。
+- `write_batch_size` 只改变 HDF5 落盘批次，不改变物理结果、frame ID 或随机数。
+  每批先完整校验，再以 `WRITING -> payload flush -> COMPLETE flush` 两阶段提交；
+  中断后的未完成项可通过 `--resume` 重算。
+- `coadd_shard_index=i, coadd_shard_count=N` 选择全局 coadd
+  `i, i+N, i+2N, ...`，并选择这些 coadd 对应的 raw frame。它不会把总时长
+  缩短为 `1/N`，也不会重新从 frame 0 建立局部时间轴。
+- 每个分片仍使用同一个逻辑 `run_id`、完整 SimulationSpec 和全局 frame ID，
+  因而 source variability、动态效应与 RNG 都在完整 30 d 时间轴上求值。
+- 当前一个 coadd 时间分片只能使用一个 stamp worker。并行时应启动 N 个独立
+  进程，各自设置不同的 shard index；不要再在单个分片内部配置多 worker。
+
+当 `N > 1` 时，物理输出写在同一逻辑运行目录下的独立子目录：
+
+```text
+<output_root>/<run_id>/
+  coadd_shard_0000_of_0006/
+  coadd_shard_0001_of_0006/
+  ...
+  coadd_shard_0005_of_0006/
+```
+
+每个分片的 manifest、HDF5 provenance 和 truth 都记录逻辑 run ID、全局 raw/coadd
+总数、分片编号及实际选中的全局 frame ID。下游合并必须按这些全局 ID 排序并
+验证唯一覆盖，不能按文件名简单拼接。static/injected 配对运行还应逐个全局 coadd
+核对 HDF5 seed 完全一致。
+
 ## 6. 输出、truth 与可复现性
 
-每个目标目录除原有 raw/coadd 产品外，还包含：
+默认 `detailed` profile 下，每个目标目录除 raw/coadd 产品外，还包含：
 
 ```text
 stamps/target_<source_id>/
@@ -177,6 +222,11 @@ stamps/target_<source_id>/
   schemas/coadd/coadd_NNNNNN.json
   electron_components/frame_NNNNNN.npz  # 按需开启
 ```
+
+`save_raw`、`save_coadd` 与 `save_electron_components` 独立决定是否生成相应产品。
+`compact` profile 省略 `schemas/raw` 和 `schemas/coadd` 逐帧 JSON；关闭 raw 时也不会
+生成 `raw.h5`。无论 profile 如何，已请求的 HDF5、`source_variability_truth.ecsv`、
+`target_artifacts.json`、manifest 及其中的输入身份和分片 provenance 都必须保留。
 
 `source_variability_truth.ecsv` 逐帧保存实际使用的 `relative_flux`、baseline/effective photon count、source ID、curve ID 和运行时 PSF ID。目标表、光变表以及坐标模式使用的 focal-plane registry 都有内容身份记录；普通文件记录 resolved path、byte size 和 SHA-256。
 
