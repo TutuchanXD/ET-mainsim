@@ -111,6 +111,42 @@ def test_integer_preserves_exact_int64_values(value) -> None:
 @pytest.mark.parametrize(
     "value",
     [
+        float(2_100_787_084_231_447_424),
+        np.float64(2_100_787_084_231_447_424),
+    ],
+)
+def test_integer_rejects_real_gaia_source_id_represented_as_float(value) -> None:
+    from et_mainsim.stamp_inputs import _integer
+
+    source_id = 2_100_787_084_231_447_424
+    assert _integer(
+        np.int64(source_id), field_name="source_id", row_index=3
+    ) == source_id
+    assert _integer(
+        str(source_id), field_name="source_id", row_index=3
+    ) == source_id
+    with pytest.raises(ValueError, match="integer"):
+        _integer(value, field_name="source_id", row_index=3)
+
+
+@pytest.mark.parametrize("value", [float(2**53), np.float64(2**53)])
+def test_integer_accepts_exact_float_safety_boundary(value) -> None:
+    from et_mainsim.stamp_inputs import _integer
+
+    assert _integer(value, field_name="source_id", row_index=3) == 2**53
+
+
+@pytest.mark.parametrize("value", [float(2**53 + 2), np.float64(2**53 + 2)])
+def test_integer_rejects_float_above_exact_safety_boundary(value) -> None:
+    from et_mainsim.stamp_inputs import _integer
+
+    with pytest.raises(ValueError, match="integer"):
+        _integer(value, field_name="source_id", row_index=3)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
         True,
         np.bool_(False),
         -1,

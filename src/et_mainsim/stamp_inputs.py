@@ -16,6 +16,7 @@ from astropy.table import Table
 _COLUMN_TOKEN = re.compile(r"[^a-z0-9]+")
 _DECIMAL_INTEGER = re.compile(r"[+-]?[0-9]+")
 _INT64_MAX = int(np.iinfo(np.int64).max)
+_MAX_EXACT_FLOAT_INTEGER = 2**53
 _ALIASES = {
     "source_id": {"source_id", "gaia_source_id", "id"},
     "gaia_g_mag": {
@@ -117,6 +118,11 @@ def _integer(value: Any, *, field_name: str, row_index: int) -> int:
         if not math.isfinite(numeric) or not numeric.is_integer():
             raise ValueError(
                 f"row {row_index} {field_name} must be a non-negative integer"
+            )
+        if abs(numeric) > _MAX_EXACT_FLOAT_INTEGER:
+            raise ValueError(
+                f"row {row_index} {field_name} float must be an integer with "
+                f"absolute value no greater than {_MAX_EXACT_FLOAT_INTEGER}"
             )
         converted = int(numeric)
     else:
