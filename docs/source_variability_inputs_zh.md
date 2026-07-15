@@ -37,7 +37,7 @@ delivery/
 
 位置有且只有两种合法模式：
 
-1. **天球坐标模式**：填写 `ra_deg` 和 `dec_deg`，不要填写 `psf_id` 或 detector pixel。ET-mainsim 使用固定 transit 的 ET focal-plane registry 将 ICRS/J2000 映射到 detector、pixel 和视场角；映射到其他 detector 或落在视场外时直接失败。随后按视场角半径选择最近的可用 PSF 节点。
+1. **天球坐标模式**：填写 `ra_deg` 和 `dec_deg`，不要填写 `psf_id` 或 detector pixel。ET-mainsim 使用固定 transit 的 ET focal-plane registry 将 ICRS/J2000 映射到 detector、pixel 和视场角，随后按视场角半径选择最近的可用 PSF 节点。单源 stamp 不需要把同一目标复制成四个 detector 工作负载；运行规格中的 detector 只需与该坐标的真实落点一致。坐标落在规格所写 detector 之外或落在视场外时直接失败，防止悄悄使用错误几何。
 2. **显式 PSF 模式**：不填写 RA/Dec，必须填写 `psf_id`。detector X/Y 可以成对填写；两者都省略时，源放在配置 detector 的物理中心。请求的 PSF ID 在 bundle 中不存在时直接失败。
 
 同一张表可以混合这两种行，但每一行内部不能混用。坐标模式需要运行环境安装 `et-coord`，并通过 `--focalplane-registry` 或 `ET_FOCALPLANE_ROOT` 指向固定 transit registry。
@@ -256,19 +256,48 @@ raw/coadd HDF5 provenance 和逐帧 schema 还会保存：
 
 仓库中的 `scripts/validate_source_variability_stamp.py` 会从 production spec 派生 22 raw frame、220 s、2 raw/coadd 的短时 spec，并自动运行相同链路的静态/注入两组；不要只对 production preset 加 `--frames 22`，因为原 preset 的 30 raw/coadd 与 22 不整除。
 
-## 9. 当前银河系考古团队数据阻塞
+## 9. 当前银河系考古团队数据评估
 
-所给文件名为 `BaiduNetdisk_mac_..._arm64....dmg`。当前工作区中的同一 payload 被保存为 `.zip`，但文件头是 zlib block、尾部有 Apple UDIF 的 `koly` 标记；文件名和已展开目录都指向 **macOS ARM64 百度网盘客户端安装镜像**，不是科学数据压缩包。当前展开目录中没有 CSV、ECSV、FITS、HDF5 或其他 regular science file。
+重新交付的 `mock_lightcurves_sourceid.fits` 是可读的科学数据，而不是此前误交的安装镜像。FITS 主表有 74 个源、17 列，每个源保存 1,051,921 个采样点；其中 60 个 `subgiant`、14 个 `rotation`。表中包含 Gaia source ID、ICRS/J2000 RA/Dec、`Gmag` 和逐点相对光变。典型 cadence 是 120 s，覆盖约 1,461 d。
 
-因此这份输入无法评估光变注入。请银河系考古团队重新交付实际数据文件，并至少说明：
+这份数据已经具备第一版输入所需的四类核心信息，但正式交付仍需要团队确认以下语义：
 
-- 每个源的 `source_id`、Gaia G Vega 基准星等；
-- ICRS/J2000 RA/Dec，或缺坐标时的 PSF ID；
-- 是否存在内禀光变；若有，按本文格式给出 frame-aligned relative flux；
-- 波段、星等制、单位、frame 对齐/归一化方法；
-- 文件版本、生成说明与 SHA-256。
+1. 已按团队说明把光变列解释为 `deltaF/F_ref`，并采用 `relative_flux = 1 + deltaF/F_ref`。需要团队在正式 README 中定义 `F_ref`，并确认该量对应 Gaia G 波段而不是其他合成波段。
+2. 当前把 `Gmag` 直接解释为 Gaia G Vega。需要团队明确星等制、所用 Gaia G 响应曲线和零点版本。
+3. FITS 的原始 120 s cadence 不能直接对应 10 s raw frame。本次预处理先把仿真 `t=0` 对齐到所选曲线起点，再对分段线性模型做每个 10 s 曝光的精确平均；不会使用原表的绝对时间作为仿真时间。
+4. 60 个源至少有一个无效样本，主要表现为超长曲线边界的单点缺失；转换前必须逐源做 finite/coverage 检查，不能直接整列注入。
+5. 坐标映射会给出唯一 detector、pixel 和视场角。单源 stamp 只运行该源实际落点的一条任务，不为四个主 detector 重复构造四份 workload。
 
-## 10. 第一版明确不做的事情
+30 d 快看选用 Gaia DR3 `2100787084231447424`（KIC 5689820，subgiant，`G=11.279311`）：
+
+- ICRS 坐标为 `(286.22724291624 deg, 40.92773407565 deg)`；
+- 固定 transit 映射到 `main_ld`，视场角 `9.089849 deg`；
+- 最近 PSF 节点为 ID 5（10 deg），节点角差 `0.910151 deg`；
+- 30 d、10 s 曝光平均后有 259,200 点，`relative_flux` 范围为 `0.99891319` 至 `1.00098016`；
+- 绝对源时间被丢弃，仿真 frame 0 重新作为时间零点；积分守恒与 1 min 直接平均均已数值检查。
+
+## 10. 当前 Aster 数据评估
+
+Aster 的 `0000000622.dat` 已是原生 10 s cadence，光变列按团队格式解释为 ppm，因此直接使用 `relative_flux = 1 + ppm * 1e-6`，不做时间插值。30 d 窗口正好得到 259,200 个 finite、positive 且质量标志为 0 的点，`relative_flux` 范围为 `0.99875296` 至 `1.00110711`。
+
+当前还需记录两项工程代理：
+
+- 团队提供原始 `G=6`，在 10 s、12 deg PSF 下会严重超过 90,680 electron 满阱；为保证快看测光可解释，本次只把基准临时重标为 Gaia G Vega `11.5`，不改变相对光变。正式科学仿真需要团队决定饱和源科学目标和处理策略。
+- 数据没有 Gaia source ID 或天球坐标。本次使用 synthetic ID `9000000000000000622` 和显式 PSF ID 6（12 deg）；正式交付应补充 Gaia ID 与 ICRS/J2000 坐标，或明确接受固定 PSF 的非空间化仿真。
+
+## 11. 30 d 快看采用的 SN 工程代理
+
+快看使用 `z=0.01` 的 Type II-P 曲线，仿真 `t=0` 对齐到静止系相位 `-8 d`：
+
+```text
+phase_rest_day = -8 + t_sim_s / [86400 * (1 + 0.01)]
+```
+
+30 d observer-frame 覆盖静止系 `-8` 至约 `21.703 d`。先对星等曲线转成相对流量，再对每个 10 s observer-frame 曝光做分段线性精确平均；不是先粗略插值到 1 min。6 个完整 10 s raw stamp 经过噪声和读出链路后才相加成一个 1 min coadd。
+
+该曲线仍使用交付文件中的 AB 数值临时充当 Gaia G Vega 数值，未做 AB/Vega 零点换算；也没有 Gaia ID 或坐标，因此使用 synthetic ID `2001000000001` 和 12 deg PSF。以上只允许用于工程快看，不允许解释为最终科学测光。
+
+## 12. 第一版明确不做的事情
 
 - 不自动解释或重采样物理时间；
 - 不直接接收每帧 magnitude 作为运行时输入；
