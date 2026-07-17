@@ -1,6 +1,6 @@
 {
   "schema_id": "photsim7.simulation_spec",
-  "schema_version": 1,
+  "schema_version": 2,
   "observation": {
     "simulation_name": "ET",
     "observing_start_date": "2024-01-01T00:00:00",
@@ -137,7 +137,7 @@
     },
     "thermal_drift": {
       "enabled": true,
-      "profile": "main_rd_reference",
+      "profile": "et_temperature_table",
       "temperature_profile_path": "thermal/TESS/tess_temperatures_241209.pkl",
       "motion_table_path": "thermal/ET/et_lens_temperature_to_centroid_motion_df_241209.pkl",
       "temperature_values_are_et_lens_c": false,
@@ -151,9 +151,12 @@
     },
     "psf_breathing": {
       "enabled": true,
-      "profile": "main_rd_reference",
+      "profile": "et_temperature_table",
       "temperature_profile_path": "thermal/TESS/tess_temperatures_241209.pkl",
-      "time_policy": "normalized_observation_phase"
+      "time_policy": "normalized_observation_phase",
+      "temperature_values_are_et_lens_c": false,
+      "reference_temperature_c": -15.0,
+      "scale_per_c": 0.1
     },
     "scripted_motion": {"enabled": false}
   },
@@ -165,5 +168,10 @@
     "save_preview_images": true
   },
   "rng": {"run_seed": 20260714},
+  "science_profile": {
+    "profile_id": "unclaimed",
+    "composition_id": "unclaimed",
+    "science_realization_id": 0
+  },
   "unmodeled_config": {}
 }

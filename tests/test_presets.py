@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -9,6 +10,32 @@ from astropy import units as u
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+TESS_TEMPERATURE_PROFILE = "thermal/TESS/tess_temperatures_241209.pkl"
+ET_THERMAL_MOTION_TABLE = (
+    "thermal/ET/et_lens_temperature_to_centroid_motion_df_241209.pkl"
+)
+
+
+def _assert_temperature_driven_production_dynamics(spec) -> None:
+    thermal = spec.dynamic_effects.thermal_drift
+    breathing = spec.dynamic_effects.psf_breathing
+
+    assert thermal.enabled is True
+    assert thermal.profile == "et_temperature_table"
+    assert thermal.temperature_profile_path == TESS_TEMPERATURE_PROFILE
+    assert thermal.motion_table_path == ET_THERMAL_MOTION_TABLE
+    assert thermal.time_policy == "normalized_observation_phase"
+    assert thermal.temperature_values_are_et_lens_c is False
+
+    assert breathing.enabled is True
+    assert breathing.profile == "et_temperature_table"
+    assert breathing.temperature_profile_path == TESS_TEMPERATURE_PROFILE
+    assert breathing.time_policy == "normalized_observation_phase"
+    assert breathing.temperature_values_are_et_lens_c is False
+    assert breathing.reference_temperature_c == pytest.approx(-15.0)
+    assert breathing.scale_per_c == pytest.approx(0.1)
+
+    assert "main_rd_reference" not in {thermal.profile, breathing.profile}
 
 
 def test_package_import_is_lightweight() -> None:
@@ -91,6 +118,68 @@ def test_shipped_stamp_presets_fix_local_query_and_coadd_contract() -> None:
     assert spec.catalog.query_options["query_radius_deg"] == pytest.approx(0.07)
     assert spec.psf.mode == "stamp"
     assert production.run_config.workload.include_neighbors is True
+
+
+def test_production_presets_select_temperature_driven_dynamics() -> None:
+    from et_mainsim.presets import load_preset, resource_path
+
+    canonical_payload = json.loads(
+        resource_path("et_full_frame_production.spec.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert canonical_payload["schema_version"] == 2
+    canonical_thermal = canonical_payload["dynamic_effects"]["thermal_drift"]
+    canonical_breathing = canonical_payload["dynamic_effects"][
+        "psf_breathing"
+    ]
+    assert canonical_thermal["profile"] == "et_temperature_table"
+    assert (
+        canonical_thermal["temperature_profile_path"]
+        == TESS_TEMPERATURE_PROFILE
+    )
+    assert canonical_thermal["motion_table_path"] == ET_THERMAL_MOTION_TABLE
+    assert canonical_thermal["time_policy"] == "normalized_observation_phase"
+    assert canonical_thermal["temperature_values_are_et_lens_c"] is False
+    assert canonical_breathing["profile"] == "et_temperature_table"
+    assert (
+        canonical_breathing["temperature_profile_path"]
+        == TESS_TEMPERATURE_PROFILE
+    )
+    assert canonical_breathing["time_policy"] == "normalized_observation_phase"
+    assert canonical_breathing["temperature_values_are_et_lens_c"] is False
+    assert canonical_breathing["reference_temperature_c"] == pytest.approx(
+        -15.0
+    )
+    assert canonical_breathing["scale_per_c"] == pytest.approx(0.1)
+    assert canonical_payload["science_profile"] == {
+        "profile_id": "unclaimed",
+        "composition_id": "unclaimed",
+        "science_realization_id": 0,
+    }
+
+    full_frame = load_preset("et-full-frame-production").simulation_spec
+    stamp = load_preset("et-stamp-production").simulation_spec
+
+    _assert_temperature_driven_production_dynamics(full_frame)
+    _assert_temperature_driven_production_dynamics(stamp)
+    assert full_frame.science_profile.profile_id == "unclaimed"
+    assert full_frame.science_profile.composition_id == "unclaimed"
+    assert stamp.science_profile.profile_id == "unclaimed"
+    assert stamp.science_profile.composition_id == "unclaimed"
+
+    assert (
+        full_frame.dynamic_effects.thermal_drift.temperature_profile_path
+        == full_frame.dynamic_effects.psf_breathing.temperature_profile_path
+        == stamp.dynamic_effects.thermal_drift.temperature_profile_path
+        == stamp.dynamic_effects.psf_breathing.temperature_profile_path
+        == TESS_TEMPERATURE_PROFILE
+    )
+    assert (
+        full_frame.dynamic_effects.thermal_drift.motion_table_path
+        == stamp.dynamic_effects.thermal_drift.motion_table_path
+        == ET_THERMAL_MOTION_TABLE
+    )
 
 
 def test_shipped_legacy_presets_are_exact_full_effect_contracts() -> None:
