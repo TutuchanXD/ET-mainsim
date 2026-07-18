@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,14 @@ assert 'ray' not in sys.modules
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_project_requires_schema_v2_photsim7_release() -> None:
+    payload = tomllib.loads(
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+
+    assert "photsim7>=0.2,<0.3" in payload["project"]["dependencies"]
 
 
 def test_shipped_full_frame_presets_are_typed_and_complete() -> None:
@@ -165,8 +174,10 @@ def test_production_presets_select_temperature_driven_dynamics() -> None:
     _assert_temperature_driven_production_dynamics(stamp)
     assert full_frame.science_profile.profile_id == "unclaimed"
     assert full_frame.science_profile.composition_id == "unclaimed"
+    assert full_frame.science_profile.science_realization_id == 0
     assert stamp.science_profile.profile_id == "unclaimed"
     assert stamp.science_profile.composition_id == "unclaimed"
+    assert stamp.science_profile.science_realization_id == 0
 
     assert (
         full_frame.dynamic_effects.thermal_drift.temperature_profile_path
