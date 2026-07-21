@@ -5,6 +5,7 @@ import os
 import re
 import tomllib
 from dataclasses import asdict, dataclass, field
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -18,6 +19,16 @@ _WORKFLOW_KINDS = {
     "et-stamp": "stamp",
     "legacy-sim": "legacy",
 }
+_SHARED_EXPOSURE_DIRECT_PRODUCT_KEYS = frozenset(
+    {
+        "final_stamp",
+        "electron_stamp",
+        "adu_stamp_pre_adc",
+        "dn_stamp",
+        "cosmic_events.mask",
+    }
+)
+_SHARED_EXPOSURE_COMPONENT_PREFIX = "electron_components."
 _ENV_PATTERN = re.compile(
     r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
 )
@@ -176,16 +187,121 @@ class WorkerAssignment:
 
 
 @dataclass(frozen=True)
+class SharedExposureStampsConfig:
+    enabled: bool = False
+    target_source_ids: tuple[int, ...] = field(default_factory=tuple)
+    stamp_rows: int = 100
+    stamp_cols: int = 300
+    frames_per_shard: int = 32
+    product_keys: tuple[str, ...] = ("final_stamp",)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("enabled must be a boolean")
+        if not isinstance(self.target_source_ids, (list, tuple)):
+            raise ValueError("target_source_ids must be a sequence")
+        limits = (-(2**63), 2**63 - 1)
+        target_source_ids: list[int] = []
+        for value in self.target_source_ids:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Integral)
+                or int(value) < limits[0]
+                or int(value) > limits[1]
+            ):
+                raise ValueError(
+                    "target_source_ids must contain signed 64-bit integers"
+                )
+            target_source_ids.append(int(value))
+        if len(set(target_source_ids)) != len(target_source_ids):
+            raise ValueError("target_source_ids must be unique")
+
+        dimensions: dict[str, int] = {}
+        for field_name in ("stamp_rows", "stamp_cols", "frames_per_shard"):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Integral)
+                or int(value) <= 0
+            ):
+                raise ValueError(f"{field_name} must be a positive integer")
+            dimensions[field_name] = int(value)
+
+        if not isinstance(self.product_keys, (list, tuple)):
+            raise ValueError("product_keys must be a sequence")
+        product_keys: list[str] = []
+        for value in self.product_keys:
+            if not isinstance(value, str) or not value:
+                raise ValueError("product_keys must contain non-empty strings")
+            if value != value.strip():
+                raise ValueError("product_keys must not contain surrounding whitespace")
+            if value not in _SHARED_EXPOSURE_DIRECT_PRODUCT_KEYS:
+                component_name = (
+                    value[len(_SHARED_EXPOSURE_COMPONENT_PREFIX) :]
+                    if value.startswith(_SHARED_EXPOSURE_COMPONENT_PREFIX)
+                    else ""
+                )
+                if (
+                    not component_name
+                    or component_name != component_name.strip()
+                    or "." in component_name
+                ):
+                    raise ValueError(
+                        f"unsupported shared-exposure product key {value!r}"
+                    )
+            product_keys.append(value)
+        if len(set(product_keys)) != len(product_keys):
+            raise ValueError("product_keys must be unique")
+        if "final_stamp" not in product_keys:
+            raise ValueError("product_keys must include 'final_stamp'")
+        if self.enabled and not target_source_ids:
+            raise ValueError("enabled shared-exposure stamps require target_source_ids")
+
+        object.__setattr__(self, "target_source_ids", tuple(target_source_ids))
+        object.__setattr__(self, "stamp_rows", dimensions["stamp_rows"])
+        object.__setattr__(self, "stamp_cols", dimensions["stamp_cols"])
+        object.__setattr__(self, "frames_per_shard", dimensions["frames_per_shard"])
+        object.__setattr__(self, "product_keys", tuple(product_keys))
+
+    @property
+    def stamp_shape(self) -> tuple[int, int]:
+        return self.stamp_rows, self.stamp_cols
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "target_source_ids": list(self.target_source_ids),
+            "stamp_rows": self.stamp_rows,
+            "stamp_cols": self.stamp_cols,
+            "frames_per_shard": self.frames_per_shard,
+            "product_keys": list(self.product_keys),
+        }
+
+
+@dataclass(frozen=True)
 class FullFrameWorkload:
     kind: str = "full-frame"
+    shared_exposure_stamps: SharedExposureStampsConfig = field(
+        default_factory=SharedExposureStampsConfig
+    )
 
     def __post_init__(self) -> None:
         if str(self.kind).strip().lower() != "full-frame":
             raise ValueError("full-frame workload kind must be 'full-frame'")
+        if not isinstance(
+            self.shared_exposure_stamps,
+            SharedExposureStampsConfig,
+        ):
+            raise ValueError(
+                "shared_exposure_stamps must be a SharedExposureStampsConfig"
+            )
         object.__setattr__(self, "kind", "full-frame")
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            "kind": self.kind,
+            "shared_exposure_stamps": self.shared_exposure_stamps.to_dict(),
+        }
 
 
 @dataclass(frozen=True)
@@ -215,9 +331,7 @@ class StampWorkload:
         if input_mode == "table" and not input_table:
             raise ValueError("stamp table input_mode requires input_table")
         if input_mode == "table" and bool(self.include_neighbors):
-            raise ValueError(
-                "stamp table input_mode requires include_neighbors=false"
-            )
+            raise ValueError("stamp table input_mode requires include_neighbors=false")
         if input_mode == "catalog" and input_table:
             raise ValueError("stamp catalog input_mode cannot set input_table")
         if input_mode != "table" and variability_table:
@@ -233,7 +347,9 @@ class StampWorkload:
             raise ValueError("target_limit must be non-negative")
         if not bool(self.save_raw) and not bool(self.save_coadd):
             raise ValueError("stamp workload must save raw, coadd, or both")
-        target_ids = tuple(dict.fromkeys(int(value) for value in self.target_source_ids))
+        target_ids = tuple(
+            dict.fromkeys(int(value) for value in self.target_source_ids)
+        )
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "input_mode", input_mode)
         object.__setattr__(self, "input_table", input_table)
@@ -323,9 +439,7 @@ class RunConfig:
         workflow = str(self.workflow).strip()
         expected_kind = _WORKFLOW_KINDS.get(workflow)
         if expected_kind is None:
-            raise ValueError(
-                f"workflow must be one of {sorted(_WORKFLOW_KINDS)}"
-            )
+            raise ValueError(f"workflow must be one of {sorted(_WORKFLOW_KINDS)}")
         if self.workload.kind != expected_kind:
             raise ValueError(
                 f"workload kind {self.workload.kind!r} does not match workflow "
@@ -368,9 +482,7 @@ class RunConfig:
             raise ValueError("workflow must be non-empty")
         expected_kind = _WORKFLOW_KINDS.get(workflow)
         if expected_kind is None:
-            raise ValueError(
-                f"workflow must be one of {sorted(_WORKFLOW_KINDS)}"
-            )
+            raise ValueError(f"workflow must be one of {sorted(_WORKFLOW_KINDS)}")
 
         path_payload = dict(payload.get("paths", {}))
         execution_payload = dict(payload.get("execution", {}))
@@ -398,8 +510,25 @@ class RunConfig:
             set(workload_payload) - set(workload_type.__dataclass_fields__)
         )
         if workload_unknown:
-            raise ValueError(
-                f"Unknown workload fields: {', '.join(workload_unknown)}"
+            raise ValueError(f"Unknown workload fields: {', '.join(workload_unknown)}")
+        if (
+            workload_type is FullFrameWorkload
+            and "shared_exposure_stamps" in workload_payload
+        ):
+            shared_payload = workload_payload["shared_exposure_stamps"]
+            if not isinstance(shared_payload, Mapping):
+                raise ValueError("shared_exposure_stamps must be a mapping")
+            shared_unknown = sorted(
+                set(shared_payload)
+                - set(SharedExposureStampsConfig.__dataclass_fields__)
+            )
+            if shared_unknown:
+                raise ValueError(
+                    "Unknown shared_exposure_stamps fields: "
+                    + ", ".join(shared_unknown)
+                )
+            workload_payload["shared_exposure_stamps"] = SharedExposureStampsConfig(
+                **dict(shared_payload)
             )
         workload_payload.setdefault("kind", kind)
         return cls(
@@ -566,6 +695,7 @@ __all__ = [
     "ResolvedRunPaths",
     "RunConfig",
     "RunPaths",
+    "SharedExposureStampsConfig",
     "StampWorkload",
     "WorkloadConfig",
     "WorkerAssignment",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError, replace
+
 import pytest
 
 
@@ -276,3 +278,241 @@ def test_local_ray_resources_reject_fractional_values(field_name, value) -> None
 
     with pytest.raises(ValueError, match=f"{field_name} must be an integer"):
         ExecutionConfig(backend="local-ray", **{field_name: value})
+
+
+def test_full_frame_shared_exposure_defaults_are_frozen_and_identity_bearing() -> None:
+    from et_mainsim.config import (
+        FullFrameWorkload,
+        RunConfig,
+        SharedExposureStampsConfig,
+    )
+
+    config = RunConfig.from_toml(BASE_TOML)
+
+    assert isinstance(config.workload, FullFrameWorkload)
+    shared = config.workload.shared_exposure_stamps
+    assert isinstance(shared, SharedExposureStampsConfig)
+    assert shared.enabled is False
+    assert shared.target_source_ids == ()
+    assert shared.stamp_rows == 100
+    assert shared.stamp_cols == 300
+    assert shared.stamp_shape == (100, 300)
+    assert shared.frames_per_shard == 32
+    assert shared.product_keys == ("final_stamp",)
+    assert config.workload.to_dict() == {
+        "kind": "full-frame",
+        "shared_exposure_stamps": {
+            "enabled": False,
+            "target_source_ids": [],
+            "stamp_rows": 100,
+            "stamp_cols": 300,
+            "frames_per_shard": 32,
+            "product_keys": ["final_stamp"],
+        },
+    }
+    with pytest.raises(FrozenInstanceError):
+        shared.enabled = True
+
+
+def test_full_frame_shared_exposure_parses_nested_contract_without_reordering() -> None:
+    from et_mainsim.config import RunConfig
+
+    text = (
+        BASE_TOML
+        + """
+
+[workload]
+kind = "full-frame"
+
+[workload.shared_exposure_stamps]
+enabled = true
+target_source_ids = [9003, 17, -4]
+stamp_rows = 100
+stamp_cols = 300
+frames_per_shard = 8
+product_keys = [
+  "final_stamp",
+  "electron_stamp",
+  "electron_components.stellar_mean",
+]
+"""
+    )
+
+    config = RunConfig.from_toml(text)
+    shared = config.workload.shared_exposure_stamps
+
+    assert shared.enabled is True
+    assert shared.target_source_ids == (9003, 17, -4)
+    assert shared.frames_per_shard == 8
+    assert shared.product_keys == (
+        "final_stamp",
+        "electron_stamp",
+        "electron_components.stellar_mean",
+    )
+    assert config.to_dict()["workload"]["shared_exposure_stamps"] == {
+        "enabled": True,
+        "target_source_ids": [9003, 17, -4],
+        "stamp_rows": 100,
+        "stamp_cols": 300,
+        "frames_per_shard": 8,
+        "product_keys": [
+            "final_stamp",
+            "electron_stamp",
+            "electron_components.stellar_mean",
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"enabled": 1}, "enabled must be a boolean"),
+        ({"target_source_ids": "12"}, "target_source_ids must be a sequence"),
+        ({"target_source_ids": [True]}, "signed 64-bit integers"),
+        ({"target_source_ids": [1.5]}, "signed 64-bit integers"),
+        ({"target_source_ids": [2**63]}, "signed 64-bit integers"),
+        ({"target_source_ids": [11, 11]}, "target_source_ids must be unique"),
+        ({"stamp_rows": True}, "stamp_rows must be a positive integer"),
+        ({"frames_per_shard": True}, "frames_per_shard must be a positive integer"),
+        ({"frames_per_shard": 0}, "frames_per_shard must be a positive integer"),
+        ({"stamp_rows": 1.5}, "stamp_rows must be a positive integer"),
+        ({"stamp_rows": 0}, "stamp_rows must be a positive integer"),
+        ({"stamp_cols": -1}, "stamp_cols must be a positive integer"),
+        ({"product_keys": "final_stamp"}, "product_keys must be a sequence"),
+        ({"product_keys": [1, "final_stamp"]}, "non-empty strings"),
+        ({"product_keys": [" final_stamp"]}, "surrounding whitespace"),
+        (
+            {"product_keys": ["final_stamp", "final_stamp"]},
+            "product_keys must be unique",
+        ),
+        ({"product_keys": ["electron_stamp"]}, "must include 'final_stamp'"),
+        (
+            {"product_keys": ["final_stamp", "unsupported"]},
+            "unsupported shared-exposure product key",
+        ),
+        (
+            {"product_keys": ["final_stamp", "electron_components."]},
+            "unsupported shared-exposure product key",
+        ),
+        (
+            {"product_keys": ["final_stamp", "electron_components.stellar.mean"]},
+            "unsupported shared-exposure product key",
+        ),
+        (
+            {"product_keys": ["final_stamp", "electron_components. stellar"]},
+            "unsupported shared-exposure product key",
+        ),
+        ({"enabled": True}, "enabled shared-exposure stamps require"),
+    ],
+)
+def test_shared_exposure_contract_rejects_ambiguous_values(overrides, message) -> None:
+    from et_mainsim.config import SharedExposureStampsConfig
+
+    with pytest.raises(ValueError, match=message):
+        SharedExposureStampsConfig(**overrides)
+
+
+def test_shared_exposure_contract_accepts_every_upstream_product_key_form() -> None:
+    from et_mainsim.config import SharedExposureStampsConfig
+
+    product_keys = (
+        "final_stamp",
+        "electron_stamp",
+        "adu_stamp_pre_adc",
+        "dn_stamp",
+        "cosmic_events.mask",
+        "electron_components.stellar_mean",
+    )
+
+    assert SharedExposureStampsConfig(product_keys=product_keys).product_keys == (
+        product_keys
+    )
+
+
+@pytest.mark.parametrize(
+    ("shared_payload", "message"),
+    [
+        ([], "shared_exposure_stamps must be a mapping"),
+        ({"future_field": 1}, "Unknown shared_exposure_stamps fields: future_field"),
+    ],
+)
+def test_run_config_rejects_invalid_nested_shared_exposure_mapping(
+    shared_payload,
+    message,
+) -> None:
+    from et_mainsim.config import RunConfig
+
+    payload = {
+        "schema_id": "et_mainsim.execution_config",
+        "schema_version": 1,
+        "workflow": "et-full-frame",
+        "run_id": "nested-invalid",
+        "workload": {
+            "kind": "full-frame",
+            "shared_exposure_stamps": shared_payload,
+        },
+    }
+
+    with pytest.raises(ValueError, match=message):
+        RunConfig.from_mapping(payload)
+
+
+def test_shared_exposure_nested_contract_participates_in_resume_identity(
+    tmp_path,
+) -> None:
+    from et_mainsim.config import RunConfig
+    from et_mainsim.manifest import ManifestIdentityError, RunManifestStore
+
+    base = RunConfig.from_toml(BASE_TOML)
+    shared = replace(
+        base.workload.shared_exposure_stamps,
+        enabled=True,
+        target_source_ids=(101, 202),
+        product_keys=("final_stamp", "electron_stamp"),
+    )
+    workload = replace(base.workload, shared_exposure_stamps=shared).to_dict()
+    store = RunManifestStore(tmp_path / "run_manifest.json")
+    store.create(
+        workflow=base.workflow,
+        preset="unit",
+        run_id=base.run_id,
+        simulation_spec={"schema": "unit"},
+        execution=base.execution.to_dict(),
+        workload=workload,
+        frame_plan={"requested": [0]},
+        provenance={},
+    )
+
+    store.ensure_identity(
+        workflow=base.workflow,
+        run_id=base.run_id,
+        simulation_spec={"schema": "unit"},
+        execution=base.execution.to_dict(),
+        workload=workload,
+    )
+
+    changed_targets = replace(
+        base.workload,
+        shared_exposure_stamps=replace(shared, target_source_ids=(101, 303)),
+    ).to_dict()
+    with pytest.raises(ManifestIdentityError, match="workload identity"):
+        store.ensure_identity(
+            workflow=base.workflow,
+            run_id=base.run_id,
+            simulation_spec={"schema": "unit"},
+            execution=base.execution.to_dict(),
+            workload=changed_targets,
+        )
+
+    changed_batching = replace(
+        base.workload,
+        shared_exposure_stamps=replace(shared, frames_per_shard=64),
+    ).to_dict()
+    with pytest.raises(ManifestIdentityError, match="workload identity"):
+        store.ensure_identity(
+            workflow=base.workflow,
+            run_id=base.run_id,
+            simulation_spec={"schema": "unit"},
+            execution=base.execution.to_dict(),
+            workload=changed_batching,
+        )
