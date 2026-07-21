@@ -61,6 +61,44 @@ this contract does not add parallax or radial-velocity propagation. Changing
 the target epoch changes the catalog request/cache identity and the run's
 scientific identity.
 
+## Stage 2 Geometry And Selection Identity
+
+The production catalog uses an explicit `physical_et_focalplane` geometry
+declaration. It fixes ICRS coordinates to epoch J2000.0, records the focal-plane
+registry directory with a content hash, projects each source through that exact
+registry, and selects the PSF node nearest in radial field angle. An asset that
+has moved without preserving its content identity, a registry-content change,
+or an unverifiable declaration fails closed.
+
+Packaged detector-coordinate inputs use a version-2
+`reference_field_nonphysical` declaration only when their reference angle,
+polar angle, 4.83 arcsec/pix scale, and axis signs are explicitly present. This
+mode supports deterministic smoke/reference work but carries no physical
+sky-to-detector claim. Coordinate-derived and explicit-reference sources are
+therefore never inferred from a mutable `source_type` label alone.
+
+Production accepts the ET PSF bundle
+`psf/et/241006/D280mm-focus` with its frozen SHA-256 in the scientific spec.
+Photsim7 verifies that identity before deserialization and emits geometry-bound
+PSF selection truth. A custom bundle may be byte-integrity verified, but it does
+not receive the owner-accepted science-conformance claim merely by supplying
+its own hash.
+
+The full-effects production profile uses the native ET attitude bank at
+`jitter/et/native/legacy_science_v1_et_attitude_xyz_100x3x300_v1.npy`, with
+shape `[100, 3, 300]`. Its array and strict manifest are both hash-verified
+before use. Per-cadence model selection is derived from the shared Photsim7
+`simulation_context.v2`: `run_seed`, `science_realization_id`,
+`spacecraft_id`, and absolute raw-frame index. The stamp chain consumes the
+same context contract, so execution topology and crop/window identity do not
+change the selected model.
+
+The Stage 2 selection-identity sub-gate is complete; the complete science
+alignment gate is not. Deterministic PSF crop/captured-flux goldens,
+shared-exposure full-frame/stamp image parity, standalone selection sidecars,
+and preregistered ensemble tolerances remain open. See
+[Stage 2 geometry, PSF, and jitter selection truth](stage2_selection_truth.md).
+
 ## Commands
 
 ```bash
@@ -112,7 +150,10 @@ Effect files exist only when dynamic effects are enabled; worker request and log
 directories exist only for the subprocess backend. Frame summaries preserve
 Photsim7 fields and add an `et_mainsim` namespace for rank, source count,
 elapsed time, device, and peak CUDA memory. The canonical frame-product sidecar
-remains `photsim7.single_cadence_frame_products.v1`.
+remains `photsim7.single_cadence_frame_products.v1`. Geometry/PSF selection is
+currently retained through service/frame provenance and jitter selection
+through provenance plus the merged RNG trace; dedicated durable selection
+sidecars are not yet the completed product contract.
 
 ## Resume and Failure Semantics
 

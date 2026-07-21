@@ -100,6 +100,21 @@ def test_shipped_full_frame_presets_are_typed_and_complete() -> None:
     assert spec.catalog.input_magnitude_system == "Gaia_G"
     assert spec.catalog.photon_magnitude_system == "ET"
     assert spec.catalog.target_epoch_jyear == pytest.approx(2000.0)
+    assert spec.dynamic_effects.psd_motion.native_jitter_bank_path == (
+        "jitter/et/native/"
+        "legacy_science_v1_et_attitude_xyz_100x3x300_v1.npy"
+    )
+    assert spec.dynamic_effects.psd_motion.native_jitter_bank_manifest_path == (
+        "jitter/et/native/"
+        "legacy_science_v1_et_attitude_xyz_100x3x300_v1.manifest.json"
+    )
+    assert spec.dynamic_effects.psd_motion.native_jitter_bank_sha256 == (
+        "696a986c82902ad18f136f284a30b2ce506998d3e900ea2601a3e6af001cc4d0"
+    )
+    assert (
+        spec.dynamic_effects.psd_motion.native_jitter_bank_manifest_sha256
+        == "267453c0cc5355f7edfaff76164c56ea38052a866bb967bb124c920394bf7274"
+    )
     assert production.run_config.execution.backend == "local-subprocess"
     assert production.run_config.execution.device == "cuda"
 
@@ -211,6 +226,15 @@ def test_shipped_legacy_presets_are_exact_full_effect_contracts() -> None:
     assert smoke.simulation_spec.detector.shape == (9, 9)
     assert smoke.simulation_spec.psf.n_jitter_integrated_psf_models == 100
     assert smoke.simulation_spec.psf.n_jitter_frames_per_model == 300
+    for loaded in (smoke, production):
+        psd = loaded.simulation_spec.dynamic_effects.psd_motion
+        assert psd.profile == "et_attitude_xyz"
+        assert psd.native_jitter_bank_sha256 == (
+            "696a986c82902ad18f136f284a30b2ce506998d3e900ea2601a3e6af001cc4d0"
+        )
+        assert psd.native_jitter_bank_manifest_sha256 == (
+            "267453c0cc5355f7edfaff76164c56ea38052a866bb967bb124c920394bf7274"
+        )
     assert isinstance(smoke.run_config.workload, LegacyWorkload)
     assert smoke.run_config.execution.backend == "local-ray"
 

@@ -25,6 +25,11 @@ The old `config/et_100_det_inputs_1h.xlsx` was deleted. Current defaults are
 typed Photsim7 specs; ET-mainsim run TOML contains only workload and execution
 policy.
 
+Production and full-effects defaults now use 100 jitter-integrated PSF models
+with 300 samples per model. The authoritative native ET input has shape
+`[model, spacecraft_xyz, sample] = [100, 3, 300]`; older larger-bank
+descriptions are migration history, not runnable defaults.
+
 ## Artifact Policy
 
 New runs use `run_manifest.json` and versioned Photsim7 product schemas. Old
@@ -43,6 +48,38 @@ application.
 
 Cross-version resume is intentionally unsupported. Use a new run ID when the
 scientific spec, workload, catalog identity, or execution identity changes.
+
+## Geometry, PSF, And Jitter Selection Truth
+
+Stage 2 removes implicit geometry inference from the maintained science paths:
+
+- coordinate mode is ICRS at epoch J2000.0, binds the focal-plane registry by
+  content hash, projects through that registry, and uses the nearest radial
+  PSF-node angle;
+- no-coordinate mode requires an explicit PSF ID and a version-2
+  `reference_field_nonphysical` declaration with the reference angle,
+  orientation, 4.83 arcsec/pix scale, and axis signs;
+- ET stamp table input records these choices and asset identities in
+  `et_mainsim.stamp_source_input_truth.v2`;
+- the accepted PSF bundle and native jitter-bank array/manifest are verified
+  against owner-side hashes before deserialization/load;
+- full-frame and stamp use the same Photsim7 `simulation_context.v2` and jitter
+  selector scope, so the same logical cadence is independent of worker/GPU,
+  output path, request order, and stamp window.
+
+The native bank is
+`jitter/et/native/legacy_science_v1_et_attitude_xyz_100x3x300_v1.npy`, with
+array SHA-256
+`696a986c82902ad18f136f284a30b2ce506998d3e900ea2601a3e6af001cc4d0`.
+Its manifest SHA-256 is
+`267453c0cc5355f7edfaff76164c56ea38052a866bb967bb124c920394bf7274`.
+
+This migration closes the geometry/PSF/JI selection-identity sub-gate only. It
+does not yet certify full-frame/stamp crop equivalence or complete science
+alignment: PSF normalization/captured-flux goldens, standalone durable
+selection sidecars, shared-exposure crop, ensemble tolerances, and final
+science-metric gates remain open. See
+[Stage 2 geometry, PSF, and jitter selection truth](stage2_selection_truth.md).
 
 ## Coordinates And Magnitudes
 

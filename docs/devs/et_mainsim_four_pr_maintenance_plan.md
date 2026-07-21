@@ -232,7 +232,7 @@ et-mainsim run et-full-frame --preset smoke --device cpu
 | Photon/noise | stellar photon noise, background, scattered light, dark current, readout noise |
 | Gain | scripted gain, whole-pixel normal gain, whole-pixel sinusoidal gain |
 | Motion | ET PSD low-frequency drift, TESS roll drift, DVA, thermal drift, momentum dump |
-| PSF | high-frequency jitter-integrated PSF, 3%/3-day PSF breathing |
+| PSF | frozen native ET 100 x 3 x 300 jitter bank; TESS-temperature-driven PSF breathing |
 | Pixel response | inter-pixel, intra-pixel, pixel-phase response |
 | Reduction | coadding, Kepler optimal aperture and OA helper variants |
 
