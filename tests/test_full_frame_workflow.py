@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import pickle
 from dataclasses import replace
@@ -205,6 +206,9 @@ def test_tiny_cpu_worker_writes_readable_photsim7_artifacts(tmp_path) -> None:
 
     data_root = tmp_path / "data"
     bundle_name = _write_test_psf_bundle(data_root)
+    bundle_sha256 = hashlib.sha256(
+        (data_root / bundle_name / "sim_psf_images.pkl").read_bytes()
+    ).hexdigest()
     base = make_et_main_detector_spec(shape=(5, 7), run_seed=17)
     spec = replace(
         base,
@@ -226,6 +230,7 @@ def test_tiny_cpu_worker_writes_readable_photsim7_artifacts(tmp_path) -> None:
         psf=replace(
             base.psf,
             bundle_name=bundle_name,
+            bundle_sha256=bundle_sha256,
             field_id=0,
             field_id_policy=None,
             use_jitter_integrated_psf=False,

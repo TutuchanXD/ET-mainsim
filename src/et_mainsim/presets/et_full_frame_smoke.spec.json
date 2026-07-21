@@ -1,6 +1,6 @@
 {
   "schema_id": "photsim7.simulation_spec",
-  "schema_version": 1,
+  "schema_version": 3,
   "observation": {
     "simulation_name": "ET",
     "observing_start_date": "2024-01-01T00:00:00",
@@ -67,7 +67,7 @@
     "registry_data_dir": "",
     "cache_path": "",
     "query_options": {
-      "reference_field_angle_deg": 8.722300477798274,
+      "reference_field_angle_deg": 0.0,
       "reference_field_polar_angle_rad": -2.3455742725230206
     },
     "inject_transits": false,
@@ -86,6 +86,7 @@
   "cosmic_rays": {"enabled": false},
   "psf": {
     "bundle_name": "psf/et/241006/D280mm-focus",
+    "bundle_sha256": "9b01d7d890c1a92829ea7ab52fab349a019417dcff7754888620bd6c99c7f1ec",
     "mode": "full_frame",
     "field_id": 0,
     "field_id_policy": "explicit",
@@ -112,5 +113,10 @@
     "save_preview_images": true
   },
   "rng": {"run_seed": 20260714},
+  "science_profile": {
+    "profile_id": "unclaimed",
+    "composition_id": "unclaimed",
+    "science_realization_id": 0
+  },
   "unmodeled_config": {}
 }

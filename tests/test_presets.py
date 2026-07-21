@@ -59,12 +59,12 @@ assert 'ray' not in sys.modules
     assert result.returncode == 0, result.stderr
 
 
-def test_project_requires_schema_v2_photsim7_release() -> None:
+def test_project_requires_stage2_selection_truth_photsim7_release() -> None:
     payload = tomllib.loads(
         (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )
 
-    assert "photsim7>=0.2,<0.3" in payload["project"]["dependencies"]
+    assert "photsim7>=0.2.1,<0.3" in payload["project"]["dependencies"]
 
 
 def test_shipped_full_frame_presets_are_typed_and_complete() -> None:
@@ -84,6 +84,9 @@ def test_shipped_full_frame_presets_are_typed_and_complete() -> None:
     assert smoke.simulation_spec.observation.resolved_n_frames == 1
     assert smoke.simulation_spec.psf.field_id == 0
     assert smoke.simulation_spec.psf.field_id_policy == "explicit"
+    assert smoke.simulation_spec.catalog.query_options[
+        "reference_field_angle_deg"
+    ] == pytest.approx(0.0)
     assert smoke.run_config.execution.backend == "in-process"
     assert smoke.run_config.execution.device == "cpu"
 
@@ -97,6 +100,21 @@ def test_shipped_full_frame_presets_are_typed_and_complete() -> None:
     assert spec.catalog.input_magnitude_system == "Gaia_G"
     assert spec.catalog.photon_magnitude_system == "ET"
     assert spec.catalog.target_epoch_jyear == pytest.approx(2000.0)
+    assert spec.dynamic_effects.psd_motion.native_jitter_bank_path == (
+        "jitter/et/native/"
+        "legacy_science_v1_et_attitude_xyz_100x3x300_v1.npy"
+    )
+    assert spec.dynamic_effects.psd_motion.native_jitter_bank_manifest_path == (
+        "jitter/et/native/"
+        "legacy_science_v1_et_attitude_xyz_100x3x300_v1.manifest.json"
+    )
+    assert spec.dynamic_effects.psd_motion.native_jitter_bank_sha256 == (
+        "696a986c82902ad18f136f284a30b2ce506998d3e900ea2601a3e6af001cc4d0"
+    )
+    assert (
+        spec.dynamic_effects.psd_motion.native_jitter_bank_manifest_sha256
+        == "267453c0cc5355f7edfaff76164c56ea38052a866bb967bb124c920394bf7274"
+    )
     assert production.run_config.execution.backend == "local-subprocess"
     assert production.run_config.execution.device == "cuda"
 
@@ -137,7 +155,7 @@ def test_production_presets_select_temperature_driven_dynamics() -> None:
             encoding="utf-8"
         )
     )
-    assert canonical_payload["schema_version"] == 2
+    assert canonical_payload["schema_version"] == 3
     canonical_thermal = canonical_payload["dynamic_effects"]["thermal_drift"]
     canonical_breathing = canonical_payload["dynamic_effects"][
         "psf_breathing"
@@ -206,15 +224,25 @@ def test_shipped_legacy_presets_are_exact_full_effect_contracts() -> None:
     production = load_preset("legacy-sim-full-effects-production")
 
     assert smoke.simulation_spec.detector.shape == (9, 9)
-    assert smoke.simulation_spec.psf.n_jitter_integrated_psf_models == 1
+    assert smoke.simulation_spec.psf.n_jitter_integrated_psf_models == 100
+    assert smoke.simulation_spec.psf.n_jitter_frames_per_model == 300
+    for loaded in (smoke, production):
+        psd = loaded.simulation_spec.dynamic_effects.psd_motion
+        assert psd.profile == "et_attitude_xyz"
+        assert psd.native_jitter_bank_sha256 == (
+            "696a986c82902ad18f136f284a30b2ce506998d3e900ea2601a3e6af001cc4d0"
+        )
+        assert psd.native_jitter_bank_manifest_sha256 == (
+            "267453c0cc5355f7edfaff76164c56ea38052a866bb967bb124c920394bf7274"
+        )
     assert isinstance(smoke.run_config.workload, LegacyWorkload)
     assert smoke.run_config.execution.backend == "local-ray"
 
     spec = production.simulation_spec
     assert spec.detector.shape == (101, 101)
     assert spec.observation.resolved_n_frames == 360
-    assert spec.psf.n_jitter_integrated_psf_models == 300
-    assert spec.psf.n_jitter_frames_per_model == 600
+    assert spec.psf.n_jitter_integrated_psf_models == 100
+    assert spec.psf.n_jitter_frames_per_model == 300
     assert production.run_config.workload.stars_per_run == 100
     assert production.run_config.workload.store_images is False
 

@@ -195,8 +195,8 @@ def _load_science(descriptor: PresetDescriptor, package_files: Any) -> tuple[Any
             shape=(9, 9),
             compute_device="cpu",
             observing_duration=20 * u.s,
-            n_jitter_integrated_psf_models=1,
-            n_jitter_frames_per_model=4,
+            n_jitter_integrated_psf_models=100,
+            n_jitter_frames_per_model=300,
             background_stars_max_mag=17.0,
         )
     else:
@@ -204,8 +204,8 @@ def _load_science(descriptor: PresetDescriptor, package_files: Any) -> tuple[Any
             shape=(101, 101),
             compute_device="cuda",
             observing_duration=3600 * u.s,
-            n_jitter_integrated_psf_models=300,
-            n_jitter_frames_per_model=600,
+            n_jitter_integrated_psf_models=100,
+            n_jitter_frames_per_model=300,
             background_stars_max_mag=17.0,
         )
     return contract.spec, contract

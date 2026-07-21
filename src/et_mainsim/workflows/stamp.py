@@ -273,11 +273,20 @@ def _resolve_table_path(value: str, *, cwd: Path) -> Path:
 
 
 def _table_spec(spec: Any) -> Any:
+    target_epoch_jyear = float(spec.catalog.target_epoch_jyear)
+    if not np.isclose(target_epoch_jyear, 2000.0, rtol=0.0, atol=1.0e-12):
+        raise ValueError(
+            "stamp table mode requires canonical ICRS/J2000 epoch 2000.0; "
+            f"found {target_epoch_jyear!r}"
+        )
     reference_options = {
-        name: value
-        for name, value in spec.catalog.query_options.items()
-        if name
-        in {"reference_field_angle_deg", "reference_field_polar_angle_rad"}
+        "reference_field_angle_deg": 12.0,
+        "reference_field_polar_angle_rad": float(np.pi / 4.0),
+        "reference_pixel_scale_arcsec_per_pix": float(
+            spec.detector.pixel_scale.to_value("arcsec / pix")
+        ),
+        "reference_x_axis_sign": 1.0,
+        "reference_y_axis_sign": 1.0,
     }
     return replace(
         spec,
@@ -418,6 +427,29 @@ def preflight(plan: StampRunPlan) -> None:
         raise FileNotFoundError(f"Catalog source does not exist: {catalog.source_path}")
 
 
+def _target_reference_field_options(
+    plan: StampRunPlan,
+    target: StampTarget,
+) -> dict[str, float]:
+    if target.location_mode != "explicit_psf":
+        raise ValueError(
+            "reference-field options are only valid for explicit-PSF targets"
+        )
+    if target.psf_node_angle_deg is None:
+        raise ValueError(
+            f"explicit-PSF target {target.source_id} is missing its PSF node angle"
+        )
+    return {
+        "reference_field_angle_deg": float(target.psf_node_angle_deg),
+        "reference_field_polar_angle_rad": float(np.pi / 4.0),
+        "reference_pixel_scale_arcsec_per_pix": float(
+            plan.spec.detector.pixel_scale.to_value("arcsec / pix")
+        ),
+        "reference_x_axis_sign": 1.0,
+        "reference_y_axis_sign": 1.0,
+    }
+
+
 def _table_catalog(
     plan: StampRunPlan,
     target: StampTarget,
@@ -425,6 +457,11 @@ def _table_catalog(
     *,
     source_input_truth: Mapping[str, Any] | None = None,
 ) -> Any:
+    from photsim7.geometry_truth import (
+        physical_et_focalplane_declaration,
+        reference_field_nonphysical_declaration,
+    )
+
     rows, cols = (int(value) for value in plan.spec.detector.shape)
     center_x = (cols - 1) / 2.0
     center_y = (rows - 1) / 2.0
@@ -433,19 +470,24 @@ def _table_catalog(
         "y0": np.asarray([0.0], dtype=np.float64),
         "frame_xpix": np.asarray([center_x], dtype=np.float64),
         "frame_ypix": np.asarray([center_y], dtype=np.float64),
+        # The legacy star-table carrier requires RA/Dec even for explicitly
+        # non-physical reference-field rows.  Only the versioned geometry
+        # declaration below is authoritative for projector selection.
         "ra": np.asarray(
             [
                 target.ra_deg
                 if target.ra_deg is not None
                 else plan.spec.catalog.target_ra_deg or 0.0
-            ]
+            ],
+            dtype=np.float64,
         ),
         "dec": np.asarray(
             [
                 target.dec_deg
                 if target.dec_deg is not None
                 else plan.spec.catalog.target_dec_deg or 0.0
-            ]
+            ],
+            dtype=np.float64,
         ),
         "source_id": np.asarray([target.source_id], dtype=np.int64),
         "gaia_g_mag": np.asarray([target.gaia_g_mag], dtype=np.float64),
@@ -455,6 +497,44 @@ def _table_catalog(
         "detector_ypix_shifted": np.asarray([center_y], dtype=np.float64),
         "detector_id": str(plan.spec.detector.detector_id),
     }
+    if target.location_mode == "sky_icrs_j2000":
+        if target.ra_deg is None or target.dec_deg is None:
+            raise ValueError(
+                f"coordinate target {target.source_id} is missing canonical ICRS coordinates"
+            )
+        registry_identity = (
+            None
+            if source_input_truth is None
+            else source_input_truth.get("focalplane_registry_identity")
+        )
+        if plan.paths.focalplane_registry is None or registry_identity is None:
+            raise ValueError(
+                f"coordinate target {target.source_id} is missing frozen focal-plane registry identity"
+            )
+        coordinate_epoch_jyear = float(plan.spec.catalog.target_epoch_jyear)
+        star_data.update(
+            {
+                "ra": np.asarray([target.ra_deg], dtype=np.float64),
+                "dec": np.asarray([target.dec_deg], dtype=np.float64),
+                "icrs_ra_deg": np.asarray([target.ra_deg], dtype=np.float64),
+                "icrs_dec_deg": np.asarray([target.dec_deg], dtype=np.float64),
+                "target_epoch": np.asarray(
+                    [coordinate_epoch_jyear],
+                    dtype=np.float64,
+                ),
+            }
+        )
+        geometry_declaration = physical_et_focalplane_declaration(
+            coordinate_frame="icrs",
+            coordinate_epoch_jyear=coordinate_epoch_jyear,
+            registry_data_dir=plan.paths.focalplane_registry,
+            focalplane_registry_identity=registry_identity,
+        )
+    else:
+        reference_options = _target_reference_field_options(plan, target)
+        geometry_declaration = reference_field_nonphysical_declaration(
+            **reference_options
+        )
     if target.field_x_deg is not None:
         star_data["field_x_deg"] = np.asarray(
             [target.field_x_deg], dtype=np.float64
@@ -481,6 +561,7 @@ def _table_catalog(
             },
             "scene_policy": "independent_target_only_no_neighbors",
             "source_input_truth": dict(source_input_truth or {}),
+            "geometry": geometry_declaration,
         },
     )
 
@@ -524,6 +605,7 @@ def _load_psf_bundle_index(plan: StampRunPlan, api: Any) -> _PsfBundleIndex:
         n_subpixels=int(plan.spec.detector.n_subpixels),
         pad_to_detector_shape=False,
         base_data_dir=str(plan.paths.data_root),
+        expected_sha256=plan.spec.psf.bundle_sha256,
     )
     images = bundle.get("images")
     angles = np.asarray(bundle.get("angles"), dtype=np.float64)
@@ -542,6 +624,7 @@ def _load_psf_bundle_index(plan: StampRunPlan, api: Any) -> _PsfBundleIndex:
         node_angles[field_id] = angle
     provenance: dict[str, Any] = {
         "bundle_name": bundle_name,
+        "expected_sha256": plan.spec.psf.bundle_sha256,
         "available_field_ids": sorted(node_angles),
         "node_angles_deg": {
             str(key): value for key, value in sorted(node_angles.items())
@@ -608,6 +691,9 @@ def _source_input_truth(
         "coordinate_frame": (
             "ICRS_J2000" if target.location_mode == "sky_icrs_j2000" else None
         ),
+        "coordinate_epoch_jyear": (
+            2000.0 if target.location_mode == "sky_icrs_j2000" else None
+        ),
         "ra_deg": target.ra_deg,
         "dec_deg": target.dec_deg,
         "detector_xpix": target.detector_xpix,
@@ -634,15 +720,17 @@ def _source_input_truth(
         else variability_provenance.get("file_identity")
     )
     return {
-        "schema_id": "et_mainsim.stamp_source_input_truth",
-        "schema_version": 1,
+        "schema_id": "et_mainsim.stamp_source_input_truth.v2",
+        "schema_version": 2,
         "source_id": target.source_id,
         "gaia_g_mag": target.gaia_g_mag,
         "magnitude_system": "Gaia_G_Vega",
         "target_table_identity": target_provenance["file_identity"],
         "target_table_meta": target_provenance.get("table_meta", {}),
-        "focalplane_registry_identity": target_provenance.get(
-            "focalplane_registry_identity"
+        "focalplane_registry_identity": (
+            target_provenance.get("focalplane_registry_identity")
+            if target.location_mode == "sky_icrs_j2000"
+            else None
         ),
         "location": location,
         "psf": psf,
@@ -1171,26 +1259,76 @@ def _target_spec(
     *,
     target: StampTarget | None,
     psf_id: int | None,
+    source_input_truth: Mapping[str, Any] | None = None,
 ) -> Any:
+    actual_bundle_sha256 = _source_input_psf_bundle_sha256(source_input_truth)
+    bundle_sha256 = plan.spec.psf.bundle_sha256
+    if (
+        bundle_sha256 is not None
+        and actual_bundle_sha256 is not None
+        and actual_bundle_sha256 != bundle_sha256
+    ):
+        raise ValueError(
+            "PSF bundle sha256 differs from the accepted SimulationSpec "
+            f"identity: expected {bundle_sha256}, got {actual_bundle_sha256}"
+        )
     if target is not None and target.location_mode == "sky_icrs_j2000":
         return replace(
             plan.spec,
             psf=replace(
                 plan.spec.psf,
+                bundle_sha256=bundle_sha256,
                 field_id="nearest",
                 field_id_policy="nearest",
             ),
         )
     if psf_id is None:
         return plan.spec
+    if target is None:
+        raise ValueError("table explicit-PSF selection requires target metadata")
+    reference_options = _target_reference_field_options(plan, target)
     return replace(
         plan.spec,
+        catalog=replace(
+            plan.spec.catalog,
+            query_options=reference_options,
+        ),
         psf=replace(
             plan.spec.psf,
+            bundle_sha256=bundle_sha256,
             field_id=int(psf_id),
             field_id_policy=None,
         ),
     )
+
+
+def _source_input_psf_bundle_sha256(
+    source_input_truth: Mapping[str, Any] | None,
+) -> str | None:
+    if not source_input_truth:
+        return None
+    psf = source_input_truth.get("psf")
+    bundle = psf.get("bundle") if isinstance(psf, Mapping) else None
+    identity = (
+        bundle.get("file_identity")
+        if isinstance(bundle, Mapping)
+        else None
+    )
+    if identity is None:
+        return None
+    if not isinstance(identity, Mapping):
+        raise ValueError("PSF bundle file_identity must be a mapping")
+    raw_sha256 = identity.get("sha256")
+    sha256 = str(raw_sha256).strip().lower()
+    if len(sha256) != 64:
+        raise ValueError("PSF bundle sha256 must contain 64 hexadecimal characters")
+    try:
+        int(sha256, 16)
+    except ValueError as exc:
+        raise ValueError(
+            "PSF bundle sha256 must contain 64 hexadecimal characters"
+        ) from exc
+    return sha256
 
 
 def _open_writer(
@@ -1269,7 +1407,12 @@ def _render_target(
     if plan.paths.data_root is None:
         raise ValueError("data_root is required")
 
-    spec = _target_spec(plan, target=target, psf_id=psf_id)
+    spec = _target_spec(
+        plan,
+        target=target,
+        psf_id=psf_id,
+        source_input_truth=source_input_truth,
+    )
     registry = api.DataRegistry(data_root=plan.paths.data_root)
     services = api.build_stamp_services(
         spec,

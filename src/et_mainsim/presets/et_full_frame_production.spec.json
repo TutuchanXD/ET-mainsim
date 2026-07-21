@@ -1,6 +1,6 @@
 {
   "schema_id": "photsim7.simulation_spec",
-  "schema_version": 2,
+  "schema_version": 3,
   "observation": {
     "simulation_name": "ET",
     "observing_start_date": "2024-01-01T00:00:00",
@@ -104,13 +104,14 @@
   },
   "psf": {
     "bundle_name": "psf/et/241006/D280mm-focus",
+    "bundle_sha256": "9b01d7d890c1a92829ea7ab52fab349a019417dcff7754888620bd6c99c7f1ec",
     "mode": "full_frame",
     "field_id": "nearest",
     "field_id_policy": "nearest",
     "use_jitter_integrated_psf": true,
     "jitter_bank_mode": "single_reference",
-    "n_jitter_integrated_psf_models": 300,
-    "n_jitter_frames_per_model": 600,
+    "n_jitter_integrated_psf_models": 100,
+    "n_jitter_frames_per_model": 300,
     "compute_device": "cuda",
     "float_precision": 32,
     "image_gen_batch_size": 15000,
@@ -127,7 +128,11 @@
       "tess_xy_amplitude_multiplier": 1.0,
       "split_hz": 0.1,
       "max_frequency_samples": 20000,
-      "chunk_size": 1024
+      "chunk_size": 1024,
+      "native_jitter_bank_path": "jitter/et/native/legacy_science_v1_et_attitude_xyz_100x3x300_v1.npy",
+      "native_jitter_bank_manifest_path": "jitter/et/native/legacy_science_v1_et_attitude_xyz_100x3x300_v1.manifest.json",
+      "native_jitter_bank_sha256": "696a986c82902ad18f136f284a30b2ce506998d3e900ea2601a3e6af001cc4d0",
+      "native_jitter_bank_manifest_sha256": "267453c0cc5355f7edfaff76164c56ea38052a866bb967bb124c920394bf7274"
     },
     "dva": {
       "enabled": true,
