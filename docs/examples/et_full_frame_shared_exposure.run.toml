@@ -1,0 +1,35 @@
+schema_id = "et_mainsim.execution_config"
+schema_version = 1
+workflow = "et-full-frame"
+run_id = "et-full-frame-shared-exposure-example"
+
+[paths]
+output_root = ""
+data_root = ""
+catalog_path = ""
+focalplane_registry = ""
+catalog_cache = ""
+
+[workload]
+kind = "full-frame"
+
+[workload.shared_exposure_stamps]
+enabled = true
+target_source_ids = [1]
+stamp_rows = 100
+stamp_cols = 300
+frames_per_shard = 32
+product_keys = ["final_stamp", "electron_stamp"]
+
+[execution]
+backend = "in-process"
+device = "cpu"
+gpu_ids = []
+workers_per_device = 1
+resume = true
+overwrite = false
+force_catalog_cache = false
+preview_count = 0
+progress = false
+save_cosmic_mask = false
+save_stellar_mean = false
