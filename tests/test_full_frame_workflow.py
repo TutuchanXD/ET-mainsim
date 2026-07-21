@@ -327,6 +327,39 @@ def test_direct_overwrite_worker_refuses_an_existing_shared_bundle(tmp_path) -> 
     assert unrelated.read_text(encoding="utf-8") == "keep"
 
 
+@pytest.mark.parametrize("bundle_kind", ["directory", "dangling-symlink"])
+def test_direct_fresh_worker_refuses_existing_shared_bundle_without_parent(
+    tmp_path, bundle_kind
+) -> None:
+    from et_mainsim.workflows.full_frame import run_worker
+
+    request, api = _selection_ready_worker_request(tmp_path, n_frames=1)
+    request = _enable_shared_exposure(request)
+    run_worker(request, science_api=api)
+    for path in _artifact_paths_for_test(request.run_dir, 0):
+        path.unlink()
+    shutil.rmtree(request.run_dir / "selection_truth")
+    shared_root = request.run_dir / "shared_exposure"
+    if bundle_kind == "dangling-symlink":
+        shutil.rmtree(shared_root)
+        shared_root.symlink_to(
+            request.run_dir / "missing-shared-exposure",
+            target_is_directory=True,
+        )
+
+    fresh_request = replace(
+        request,
+        execution=replace(
+            request.execution,
+            resume=False,
+            overwrite=False,
+        ),
+    )
+
+    with pytest.raises(FileExistsError, match="resume or overwrite"):
+        run_worker(fresh_request, science_api=api)
+
+
 def test_shared_exposure_batches_preserve_rank_stride_order_and_full_hash(
     tmp_path,
 ) -> None:

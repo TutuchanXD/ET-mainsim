@@ -1398,12 +1398,22 @@ def run_worker(
     request.run_dir.mkdir(parents=True, exist_ok=True)
 
     shared = request.shared_exposure_stamps
+    shared_root = _shared_exposure_root(request.run_dir)
+    if (
+        shared.enabled
+        and not request.execution.resume
+        and not request.execution.overwrite
+        and os.path.lexists(shared_root)
+    ):
+        raise FileExistsError(
+            "shared-exposure bundle already exists; use resume or overwrite: "
+            f"{shared_root}"
+        )
     if (
         shared.enabled
         and request.execution.overwrite
         and not request.shared_exposure_overwrite_prepared
     ):
-        shared_root = _shared_exposure_root(request.run_dir)
         try:
             shared_root.mkdir()
         except FileExistsError as exc:
@@ -1754,8 +1764,7 @@ def run_worker(
         for frame_index in to_render:
             if request.execution.overwrite:
                 absolute_raw_frame_index = (
-                    _ET_FULL_FRAME_ABSOLUTE_RAW_FRAME_START_INDEX
-                    + int(frame_index)
+                    _ET_FULL_FRAME_ABSOLUTE_RAW_FRAME_START_INDEX + int(frame_index)
                 )
                 cadence_path = (
                     request.run_dir

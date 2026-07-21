@@ -154,6 +154,30 @@ def test_target_plan_fails_closed_on_invalid_requested_ids(
         )
 
 
+def test_target_plan_fails_closed_on_duplicate_geometry_source_ids() -> None:
+    from et_mainsim.shared_exposure import (
+        SharedExposureContractError,
+        build_shared_exposure_target_plan,
+    )
+
+    duplicate_geometry = _geometry()
+    # Exercise this function's own fail-closed boundary rather than relying on
+    # the upstream dataclass constructor to preserve its invariant forever.
+    object.__setattr__(
+        duplicate_geometry,
+        "source_ids",
+        np.array([101, 101, 303], dtype=np.int64),
+    )
+
+    with pytest.raises(SharedExposureContractError, match="geometry.*duplicate"):
+        build_shared_exposure_target_plan(
+            duplicate_geometry,
+            (101,),
+            detector_shape=(10, 12),
+            stamp_shape=(3, 5),
+        )
+
+
 @pytest.mark.parametrize(
     ("detector_shape", "stamp_shape"),
     [

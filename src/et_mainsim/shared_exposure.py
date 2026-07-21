@@ -463,9 +463,16 @@ def build_shared_exposure_target_plan(
         next(iter(unique_detector_ids)), field_name="geometry detector_id"
     )
 
+    geometry_source_ids = tuple(
+        _strict_source_id(source_id, field_name="geometry source_ids item")
+        for source_id in geometry.source_ids.tolist()
+    )
+    if len(set(geometry_source_ids)) != len(geometry_source_ids):
+        raise SharedExposureContractError(
+            "geometry source_ids must not contain duplicate source IDs"
+        )
     source_lookup = {
-        int(source_id): index
-        for index, source_id in enumerate(geometry.source_ids.tolist())
+        source_id: index for index, source_id in enumerate(geometry_source_ids)
     }
     missing = [source_id for source_id in requested if source_id not in source_lookup]
     if missing:
