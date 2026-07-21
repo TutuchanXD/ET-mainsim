@@ -14,6 +14,9 @@ from astropy.table import Table
 
 
 _COLUMN_TOKEN = re.compile(r"[^a-z0-9]+")
+_DECIMAL_INTEGER = re.compile(r"[+-]?[0-9]+")
+_INT64_MAX = int(np.iinfo(np.int64).max)
+_MAX_EXACT_FLOAT_INTEGER = 2**53
 _ALIASES = {
     "source_id": {"source_id", "gaia_source_id", "id"},
     "gaia_g_mag": {
@@ -102,16 +105,43 @@ def _missing(value: Any) -> bool:
 def _integer(value: Any, *, field_name: str, row_index: int) -> int:
     if isinstance(value, (bool, np.bool_)):
         raise ValueError(f"row {row_index} {field_name} must be an integer")
-    try:
+
+    if isinstance(value, (int, np.integer)):
         converted = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if _DECIMAL_INTEGER.fullmatch(text) is None:
+            raise ValueError(f"row {row_index} {field_name} must be an integer")
+        converted = int(text, 10)
+    elif isinstance(value, (float, np.floating)):
         numeric = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
+        if not math.isfinite(numeric) or not numeric.is_integer():
+            raise ValueError(
+                f"row {row_index} {field_name} must be a non-negative integer"
+            )
+        if abs(numeric) > _MAX_EXACT_FLOAT_INTEGER:
+            raise ValueError(
+                f"row {row_index} {field_name} float must be an integer with "
+                f"absolute value no greater than {_MAX_EXACT_FLOAT_INTEGER}"
+            )
+        converted = int(numeric)
+    else:
+        try:
+            converted = int(value)
+            is_exact = bool(value == converted)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"row {row_index} {field_name} must be an integer"
+            ) from exc
+        if not is_exact:
+            raise ValueError(
+                f"row {row_index} {field_name} must be a non-negative integer"
+            )
+
+    if converted < 0 or converted > _INT64_MAX:
         raise ValueError(
-            f"row {row_index} {field_name} must be an integer"
-        ) from exc
-    if not math.isfinite(numeric) or numeric != converted or converted < 0:
-        raise ValueError(
-            f"row {row_index} {field_name} must be a non-negative integer"
+            f"row {row_index} {field_name} must be a non-negative integer "
+            "within signed int64 range"
         )
     return converted
 

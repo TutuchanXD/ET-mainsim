@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 import sys
 
+import numpy as np
 import pytest
 from astropy.table import Table
 
@@ -61,6 +62,97 @@ def test_stamp_target_table_accepts_documented_aliases_and_coordinates(tmp_path)
         "psf_node_angle_deg": None,
         "psf_angle_delta_deg": None,
     }
+
+
+def test_stamp_target_table_preserves_gaia_source_id_decimal_string(
+    tmp_path,
+) -> None:
+    from et_mainsim.stamp_inputs import load_stamp_target_table
+
+    source_id = 2_100_787_084_231_447_424
+    path = tmp_path / "target.ecsv"
+    Table(
+        {
+            "source_id": [str(source_id)],
+            "gaia_g_mag": [13.2],
+            "psf_id": [5],
+        }
+    ).write(path, format="ascii.ecsv")
+
+    loaded = load_stamp_target_table(path, detector_shape=(9, 11))
+
+    assert loaded.targets[0].source_id == source_id
+    assert type(loaded.targets[0].source_id) is int
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        2_100_787_084_231_447_424,
+        np.int64(2_100_787_084_231_447_424),
+        "2100787084231447424",
+        "  +2100787084231447424  ",
+        9_000_000_000_000_000_000,
+        np.int64(9_000_000_000_000_000_000),
+        np.iinfo(np.int64).max,
+    ],
+)
+def test_integer_preserves_exact_source_ids_as_python_int(value) -> None:
+    from et_mainsim.stamp_inputs import _integer
+
+    source_id = _integer(value, field_name="source_id", row_index=3)
+
+    assert source_id == int(value)
+    assert type(source_id) is int
+
+
+@pytest.mark.parametrize("value", [float(2**53), np.float64(2**53)])
+def test_integer_accepts_exact_float_safety_boundary(value) -> None:
+    from et_mainsim.stamp_inputs import _integer
+
+    assert _integer(value, field_name="source_id", row_index=3) == 2**53
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        float(2**53 + 2),
+        np.float64(2**53 + 2),
+        float(2_100_787_084_231_447_424),
+        np.float64(2_100_787_084_231_447_424),
+    ],
+)
+def test_integer_rejects_source_id_float_above_exact_safety_boundary(value) -> None:
+    from et_mainsim.stamp_inputs import _integer
+
+    with pytest.raises(ValueError, match="integer"):
+        _integer(value, field_name="source_id", row_index=3)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        np.bool_(False),
+        -1,
+        np.int64(-1),
+        "-1",
+        1.5,
+        np.float64(1.5),
+        "1.5",
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        np.iinfo(np.int64).max + 1,
+        np.uint64(np.iinfo(np.int64).max) + np.uint64(1),
+        str(np.iinfo(np.int64).max + 1),
+    ],
+)
+def test_integer_rejects_invalid_or_out_of_int64_source_id(value) -> None:
+    from et_mainsim.stamp_inputs import _integer
+
+    with pytest.raises(ValueError, match="integer"):
+        _integer(value, field_name="source_id", row_index=3)
 
 
 def test_stamp_target_table_preserves_curve_and_ecsv_semantics_note(tmp_path) -> None:
