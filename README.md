@@ -106,6 +106,12 @@ workload and execution identity, paths, attempt history, provenance, product
 locations, completion summary, or failure. Identity drift fails closed.
 
 - Full frame resumes only validated NPY + summary + schema items.
+  An optional `[workload.shared_exposure_stamps]` section can persist ordered
+  100 x 300 target crops from the same parent exposure. It renders each
+  cadence once per fresh render or deterministic reconstruction, regardless of
+  target/product count. It adds no stamp-specific RNG draws and treats the
+  parent, batched product shards, and per-frame completion marker as one
+  fail-closed resume bundle.
 - Stamp resumes HDF5 shard items and skips only a fully validated target.
   Direct-table identity includes the resolved path, byte size, and SHA-256;
   variability truth is also content-validated before a target is skipped.
@@ -113,6 +119,13 @@ locations, completion summary, or failure. Identity drift fails closed.
 - Legacy skips only an entirely complete workload; partial pickle/OA output is
   rejected and requires `--overwrite` or a new run ID.
 - `--dry-run` creates no output and initializes no catalog, PSF, CUDA, or Ray.
+
+Shared-exposure full-frame stamps are configured by signed 64-bit source IDs,
+shape, and product keys. Their immutable target plan comes from authoritative
+Photsim7 full-frame pixel geometry; edge windows are zero padded. The HDF5
+products are deterministic crops, not independent stamp simulations and not a
+claim of transferred source truth. See [full frame shared-exposure
+products](docs/full_frame_workflow.md#shared-exposure-stamp-products).
 
 ## Slurm And Tools
 

@@ -59,15 +59,47 @@ assert 'ray' not in sys.modules
     assert result.returncode == 0, result.stderr
 
 
-def test_project_requires_stage2_selection_truth_photsim7_release() -> None:
-    payload = tomllib.loads(
-        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    )
+def test_project_requires_shared_exposure_photsim7_release() -> None:
+    payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "photsim7>=0.2.1,<0.3" in payload["project"]["dependencies"]
+    assert "photsim7>=0.2.2,<0.3" in payload["project"]["dependencies"]
+
+
+def test_required_photsim7_runtime_capabilities_are_importable() -> None:
+    from et_mainsim.workflows.full_frame import _science_api
+
+    api = _science_api()
+    required = {
+        "ItemStatus",
+        "SharedExposureShardReader",
+        "SharedExposureShardWriter",
+        "SharedExposureTargetIdentity",
+        "StampWindow",
+        "cadence_selection_truth_relative_path",
+        "read_cadence_selection_truth",
+        "resolve_full_frame_source_pixel_geometry",
+        "run_single_cadence_full_frame",
+        "shared_exposure_crop_v1",
+    }
+
+    assert required.issubset(vars(api))
+
+
+def test_documented_shared_exposure_run_config_is_loadable() -> None:
+    from et_mainsim.config import RunConfig
+
+    path = REPO_ROOT / "docs/examples/et_full_frame_shared_exposure.run.toml"
+    config = RunConfig.from_toml(path.read_text(encoding="utf-8"), source=str(path))
+
+    shared = config.workload.shared_exposure_stamps
+    assert shared.enabled is True
+    assert shared.target_source_ids == (1,)
+    assert shared.stamp_shape == (100, 300)
+    assert shared.product_keys == ("final_stamp", "electron_stamp")
 
 
 def test_shipped_full_frame_presets_are_typed_and_complete() -> None:
+    from et_mainsim.config import FullFrameWorkload, SharedExposureStampsConfig
     from et_mainsim.presets import list_presets, load_preset
 
     descriptors = list_presets(workflow="et-full-frame")
@@ -89,6 +121,18 @@ def test_shipped_full_frame_presets_are_typed_and_complete() -> None:
     ] == pytest.approx(0.0)
     assert smoke.run_config.execution.backend == "in-process"
     assert smoke.run_config.execution.device == "cpu"
+    for loaded in (smoke, production):
+        assert isinstance(loaded.run_config.workload, FullFrameWorkload)
+        shared = loaded.run_config.workload.shared_exposure_stamps
+        assert isinstance(shared, SharedExposureStampsConfig)
+        assert shared.to_dict() == {
+            "enabled": False,
+            "target_source_ids": [],
+            "stamp_rows": 100,
+            "stamp_cols": 300,
+            "frames_per_shard": 32,
+            "product_keys": ["final_stamp"],
+        }
 
     spec = production.simulation_spec
     assert spec.detector.shape == (9120, 8900)
@@ -101,12 +145,10 @@ def test_shipped_full_frame_presets_are_typed_and_complete() -> None:
     assert spec.catalog.photon_magnitude_system == "ET"
     assert spec.catalog.target_epoch_jyear == pytest.approx(2000.0)
     assert spec.dynamic_effects.psd_motion.native_jitter_bank_path == (
-        "jitter/et/native/"
-        "legacy_science_v1_et_attitude_xyz_100x3x300_v1.npy"
+        "jitter/et/native/legacy_science_v1_et_attitude_xyz_100x3x300_v1.npy"
     )
     assert spec.dynamic_effects.psd_motion.native_jitter_bank_manifest_path == (
-        "jitter/et/native/"
-        "legacy_science_v1_et_attitude_xyz_100x3x300_v1.manifest.json"
+        "jitter/et/native/legacy_science_v1_et_attitude_xyz_100x3x300_v1.manifest.json"
     )
     assert spec.dynamic_effects.psd_motion.native_jitter_bank_sha256 == (
         "696a986c82902ad18f136f284a30b2ce506998d3e900ea2601a3e6af001cc4d0"
@@ -151,33 +193,21 @@ def test_production_presets_select_temperature_driven_dynamics() -> None:
     from et_mainsim.presets import load_preset, resource_path
 
     canonical_payload = json.loads(
-        resource_path("et_full_frame_production.spec.json").read_text(
-            encoding="utf-8"
-        )
+        resource_path("et_full_frame_production.spec.json").read_text(encoding="utf-8")
     )
     assert canonical_payload["schema_version"] == 3
     canonical_thermal = canonical_payload["dynamic_effects"]["thermal_drift"]
-    canonical_breathing = canonical_payload["dynamic_effects"][
-        "psf_breathing"
-    ]
+    canonical_breathing = canonical_payload["dynamic_effects"]["psf_breathing"]
     assert canonical_thermal["profile"] == "et_temperature_table"
-    assert (
-        canonical_thermal["temperature_profile_path"]
-        == TESS_TEMPERATURE_PROFILE
-    )
+    assert canonical_thermal["temperature_profile_path"] == TESS_TEMPERATURE_PROFILE
     assert canonical_thermal["motion_table_path"] == ET_THERMAL_MOTION_TABLE
     assert canonical_thermal["time_policy"] == "normalized_observation_phase"
     assert canonical_thermal["temperature_values_are_et_lens_c"] is False
     assert canonical_breathing["profile"] == "et_temperature_table"
-    assert (
-        canonical_breathing["temperature_profile_path"]
-        == TESS_TEMPERATURE_PROFILE
-    )
+    assert canonical_breathing["temperature_profile_path"] == TESS_TEMPERATURE_PROFILE
     assert canonical_breathing["time_policy"] == "normalized_observation_phase"
     assert canonical_breathing["temperature_values_are_et_lens_c"] is False
-    assert canonical_breathing["reference_temperature_c"] == pytest.approx(
-        -15.0
-    )
+    assert canonical_breathing["reference_temperature_c"] == pytest.approx(-15.0)
     assert canonical_breathing["scale_per_c"] == pytest.approx(0.1)
     assert canonical_payload["science_profile"] == {
         "profile_id": "unclaimed",

@@ -74,11 +74,13 @@ array SHA-256
 Its manifest SHA-256 is
 `267453c0cc5355f7edfaff76164c56ea38052a866bb967bb124c920394bf7274`.
 
-This migration closes the geometry/PSF/JI selection-identity sub-gate only. It
-does not yet certify full-frame/stamp crop equivalence or complete science
-alignment: PSF normalization/captured-flux goldens, standalone durable
-selection sidecars, shared-exposure crop, ensemble tolerances, and final
-science-metric gates remain open. See
+The ordered migration PR stack includes deterministic pixel goldens,
+standalone durable selection sidecars, and the shared-exposure crop/shard
+workflow. Historical selection-evidence v1 remains the pre-delivery snapshot
+that it records; the implementation stack does not turn it into a full-stage
+runtime claim. These are engineering acceptance gates, not a claim of complete
+legacy science alignment. Cross-backend/ensemble tolerances, AT-SD25, and the
+final science-metric gates remain open. See
 [Stage 2 geometry, PSF, and jitter selection truth](stage2_selection_truth.md).
 
 ## Coordinates And Magnitudes
