@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -28,6 +29,15 @@ from et_mainsim.stamp_inputs import (
     load_stamp_target_table,
     load_stamp_variability_table,
 )
+
+
+_TARGET_ARTIFACT_SCHEMA_VERSION = 2
+_SELECTION_ARTIFACT_SCHEMA_ID = (
+    "et_mainsim.stamp_selection_truth_artifacts.v1"
+)
+_SELECTION_INDEX_SCHEMA_ID = "et_mainsim.selection_truth_index.v1"
+_ET_STAMP_SPACECRAFT_ID = "et"
+_ET_STAMP_ABSOLUTE_RAW_FRAME_START_INDEX = 0
 
 
 @dataclass(frozen=True)
@@ -241,6 +251,10 @@ def _science_api() -> SimpleNamespace:
     from photsim7.psf_bundle_paths import resolve_psf_bundle_filename
     from photsim7.stamp_pipeline import run_stamp_coadd
     from photsim7.stamp_products import write_stamp_product_schema
+    from photsim7.selection_artifacts import (
+        cadence_selection_truth_relative_path,
+        read_cadence_selection_truth,
+    )
 
     return SimpleNamespace(
         PreparedStarCatalog=PreparedStarCatalog,
@@ -256,6 +270,10 @@ def _science_api() -> SimpleNamespace:
         resolve_psf_bundle_filename=resolve_psf_bundle_filename,
         run_stamp_coadd=run_stamp_coadd,
         write_stamp_product_schema=write_stamp_product_schema,
+        cadence_selection_truth_relative_path=(
+            cadence_selection_truth_relative_path
+        ),
+        read_cadence_selection_truth=read_cadence_selection_truth,
     )
 
 
@@ -973,9 +991,474 @@ def _source_variability_truth_path(plan: StampRunPlan, target_id: int) -> Path:
     return _target_dir(plan, target_id) / "source_variability_truth.ecsv"
 
 
+def _selection_index_record(
+    *,
+    local_frame_index: int,
+    absolute_raw_frame_index: int,
+    content_sha256: str,
+) -> bytes:
+    payload = {
+        "absolute_raw_frame_index": int(absolute_raw_frame_index),
+        "content_sha256": str(content_sha256),
+        "local_frame_index": int(local_frame_index),
+    }
+    return (
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _selection_identity_payload(identity: Any, *, target_dir: Path) -> dict[str, Any]:
+    relative = Path(str(identity.relative_path))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError("selection artifact path must stay below target_dir")
+    expected = (target_dir / relative).resolve(strict=False)
+    if Path(identity.path).resolve(strict=False) != expected:
+        raise RuntimeError(
+            "selection artifact identity is not rooted at the target directory"
+        )
+    content_sha256 = str(identity.content_sha256)
+    if len(content_sha256) != 64 or any(
+        value not in "0123456789abcdef" for value in content_sha256
+    ):
+        raise RuntimeError("selection artifact content_sha256 is invalid")
+    return {
+        "schema_id": str(identity.schema_id),
+        "schema_version": int(identity.schema_version),
+        "relative_path": relative.as_posix(),
+        "content_sha256": content_sha256,
+    }
+
+
+class _SelectionTruthAccumulator:
+    def __init__(
+        self,
+        *,
+        target_dir: Path,
+        frame_indices: tuple[int, ...],
+        spacecraft_id: str,
+        science_realization_id: int,
+        absolute_raw_frame_start_index: int,
+    ) -> None:
+        if not frame_indices:
+            raise ValueError("selection truth requires at least one raw frame")
+        self.target_dir = Path(target_dir)
+        self.frame_indices = tuple(int(value) for value in frame_indices)
+        self.expected_spacecraft_id = str(spacecraft_id)
+        self.expected_science_realization_id = int(science_realization_id)
+        self.expected_absolute_raw_frame_start_index = int(
+            absolute_raw_frame_start_index
+        )
+        self.count = 0
+        self.absolute_raw_frame_start_index: int | None = None
+        self.geometry: dict[str, Any] | None = None
+        self.psf: dict[str, Any] | None = None
+        self.cadence_schema_id: str | None = None
+        self.cadence_schema_version: int | None = None
+        self.science_conformance_claim: bool | None = None
+        self.unavailable_marker: dict[str, Any] | None = None
+        self.digest = hashlib.sha256()
+
+    def add(self, raw_result: Any) -> None:
+        if self.count >= len(self.frame_indices):
+            raise RuntimeError("received more selection sidecars than raw frames")
+        expected_local = self.frame_indices[self.count]
+        product_frame_index = int(
+            raw_result.stamp_products.frame_index
+        )
+        if product_frame_index != expected_local:
+            raise RuntimeError(
+                "selection results are not ordered by the raw frame plan"
+            )
+        truth = getattr(raw_result, "selection_truth", None)
+        artifacts = getattr(raw_result, "selection_artifacts", None)
+        if truth is None or artifacts is None:
+            if truth is not None or artifacts is not None:
+                raise RuntimeError(
+                    "selection truth and durable artifacts must be present "
+                    "together"
+                )
+            marker = getattr(
+                getattr(raw_result, "stamp_products", None),
+                "selection_truth",
+                None,
+            )
+            if (
+                not isinstance(marker, Mapping)
+                or marker.get("verification_status") != "unavailable"
+                or marker.get("science_conformance_claim") is not False
+            ):
+                raise RuntimeError(
+                    "missing selection truth must carry an explicit "
+                    "non-conformant unavailable marker"
+                )
+            if self.geometry is not None:
+                raise RuntimeError(
+                    "selection truth availability changed by cadence"
+                )
+            normalized = {
+                "missing_components": sorted(
+                    str(value)
+                    for value in marker.get("missing_components", ())
+                ),
+                "requested_science_profile_id": str(
+                    marker.get("requested_science_profile_id", "")
+                ),
+                "science_conformance_claim_scope": str(
+                    marker.get("science_conformance_claim_scope", "")
+                ),
+            }
+            if self.unavailable_marker is None:
+                self.unavailable_marker = normalized
+            elif self.unavailable_marker != normalized:
+                raise RuntimeError(
+                    "unavailable selection marker changed by cadence"
+                )
+            self.count += 1
+            return
+        if self.unavailable_marker is not None:
+            raise RuntimeError("selection truth availability changed by cadence")
+        local_frame_index = int(truth.local_frame_index)
+        if local_frame_index != expected_local:
+            raise RuntimeError(
+                "selection sidecars are not ordered by the raw frame plan"
+            )
+        absolute_raw_frame_index = int(truth.absolute_raw_frame_index)
+        raw_start = absolute_raw_frame_index - local_frame_index
+        if str(truth.spacecraft_id) != self.expected_spacecraft_id:
+            raise RuntimeError("selection truth spacecraft conflicts with plan")
+        if (
+            int(truth.science_realization_id)
+            != self.expected_science_realization_id
+        ):
+            raise RuntimeError(
+                "selection truth science realization conflicts with plan"
+            )
+        if raw_start != self.expected_absolute_raw_frame_start_index:
+            raise RuntimeError(
+                "selection truth absolute raw-frame origin conflicts with plan"
+            )
+        if self.absolute_raw_frame_start_index is None:
+            self.absolute_raw_frame_start_index = raw_start
+        elif self.absolute_raw_frame_start_index != raw_start:
+            raise RuntimeError(
+                "selection sidecars use inconsistent absolute frame origins"
+            )
+
+        geometry = _selection_identity_payload(
+            artifacts.geometry,
+            target_dir=self.target_dir,
+        )
+        psf = _selection_identity_payload(
+            artifacts.psf,
+            target_dir=self.target_dir,
+        )
+        cadence = _selection_identity_payload(
+            artifacts.cadence,
+            target_dir=self.target_dir,
+        )
+        if geometry["content_sha256"] != (
+            truth.source_geometry_truth.content_sha256
+        ):
+            raise RuntimeError("geometry sidecar identity conflicts with truth")
+        if psf["content_sha256"] != truth.psf_selection_truth.content_sha256:
+            raise RuntimeError("PSF sidecar identity conflicts with truth")
+        if cadence["content_sha256"] != truth.content_sha256:
+            raise RuntimeError("cadence sidecar identity conflicts with truth")
+        if self.geometry is None:
+            self.geometry = geometry
+            self.psf = psf
+            self.cadence_schema_id = cadence["schema_id"]
+            self.cadence_schema_version = cadence["schema_version"]
+            self.science_conformance_claim = bool(
+                truth.science_conformance_claim
+            )
+        elif self.geometry != geometry or self.psf != psf:
+            raise RuntimeError(
+                "static geometry or PSF selection identity changed by cadence"
+            )
+        elif (
+            self.cadence_schema_id != cadence["schema_id"]
+            or self.cadence_schema_version != cadence["schema_version"]
+            or self.science_conformance_claim
+            is not bool(truth.science_conformance_claim)
+        ):
+            raise RuntimeError("cadence selection contract changed by cadence")
+
+        expected_relative = (
+            Path("selection_truth")
+            / "cadence"
+            / f"frame_{absolute_raw_frame_index:09d}.json"
+        ).as_posix()
+        if cadence["relative_path"] != expected_relative:
+            raise RuntimeError("cadence sidecar path conflicts with frame identity")
+        self.digest.update(
+            _selection_index_record(
+                local_frame_index=local_frame_index,
+                absolute_raw_frame_index=absolute_raw_frame_index,
+                content_sha256=truth.content_sha256,
+            )
+        )
+        self.count += 1
+
+    def to_manifest(self) -> dict[str, Any]:
+        if self.count != len(self.frame_indices):
+            raise RuntimeError("selection truth is missing raw frames")
+        if self.unavailable_marker is not None:
+            return {
+                "schema_id": _SELECTION_ARTIFACT_SCHEMA_ID,
+                "schema_version": 1,
+                "verification_status": "unavailable",
+                "science_conformance_claim": False,
+                "artifact_root": None,
+                "cadence_count": self.count,
+                **dict(self.unavailable_marker),
+            }
+        if (
+            self.geometry is None
+            or self.psf is None
+            or self.absolute_raw_frame_start_index is None
+            or self.cadence_schema_id is None
+            or self.cadence_schema_version is None
+            or self.science_conformance_claim is None
+        ):
+            raise RuntimeError("selection truth accumulator is incomplete")
+        return {
+            "schema_id": _SELECTION_ARTIFACT_SCHEMA_ID,
+            "schema_version": 1,
+            "verification_status": "persisted_and_verified",
+            "science_conformance_claim": self.science_conformance_claim,
+            "missing_components": [],
+            "artifact_root": ".",
+            "source_geometry_truth": dict(self.geometry),
+            "psf_selection_truth": dict(self.psf),
+            "cadence_selection_truth": {
+                "schema_id": self.cadence_schema_id,
+                "schema_version": self.cadence_schema_version,
+                "relative_directory": "selection_truth/cadence",
+                "filename_template": (
+                    "frame_{absolute_raw_frame_index:09d}.json"
+                ),
+                "count": self.count,
+                "absolute_raw_frame_start_index": (
+                    self.absolute_raw_frame_start_index
+                ),
+                "spacecraft_id": self.expected_spacecraft_id,
+                "science_realization_id": (
+                    self.expected_science_realization_id
+                ),
+                "index_digest_schema_id": _SELECTION_INDEX_SCHEMA_ID,
+                "index_content_sha256": self.digest.hexdigest(),
+            },
+        }
+
+
+def _selection_identity_from_manifest(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} identity must be a mapping")
+    result = dict(value)
+    expected_keys = {
+        "schema_id",
+        "schema_version",
+        "relative_path",
+        "content_sha256",
+    }
+    if set(result) != expected_keys:
+        raise ValueError(f"{label} identity keys are invalid")
+    relative = Path(str(result["relative_path"]))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"{label} path must stay below target_dir")
+    digest = str(result["content_sha256"])
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError(f"{label} content_sha256 is invalid")
+    result["relative_path"] = relative.as_posix()
+    result["content_sha256"] = digest
+    result["schema_version"] = int(result["schema_version"])
+    return result
+
+
+def _validate_selection_sidecars(
+    plan: StampRunPlan,
+    target_id: int,
+    payload: Mapping[str, Any],
+    *,
+    api: Any,
+) -> bool:
+    selection = payload.get("selection_truth")
+    if not isinstance(selection, Mapping):
+        return False
+    if selection.get("schema_id") != _SELECTION_ARTIFACT_SCHEMA_ID:
+        return False
+    if int(selection.get("schema_version", 0)) != 1:
+        return False
+    raw_ids, _ = _expected_ids(plan)
+    verification_status = selection.get("verification_status")
+    if verification_status == "unavailable":
+        if set(selection) != {
+            "schema_id",
+            "schema_version",
+            "verification_status",
+            "science_conformance_claim",
+            "science_conformance_claim_scope",
+            "requested_science_profile_id",
+            "missing_components",
+            "artifact_root",
+            "cadence_count",
+        }:
+            return False
+        return bool(
+            selection.get("science_conformance_claim") is False
+            and selection.get("artifact_root") is None
+            and int(selection.get("cadence_count", -1)) == len(raw_ids)
+            and selection.get("missing_components")
+            == ["jitter_model_selection_truth"]
+            and not bool(plan.spec.psf.use_jitter_integrated_psf)
+            and selection.get("requested_science_profile_id")
+            == plan.spec.science_profile.profile_id
+            and selection.get("science_conformance_claim_scope")
+            == "geometry_psf_and_jitter_selection_truth_only"
+        )
+    if verification_status != "persisted_and_verified":
+        return False
+    if set(selection) != {
+        "schema_id",
+        "schema_version",
+        "verification_status",
+        "science_conformance_claim",
+        "missing_components",
+        "artifact_root",
+        "source_geometry_truth",
+        "psf_selection_truth",
+        "cadence_selection_truth",
+    }:
+        return False
+    if not isinstance(selection.get("science_conformance_claim"), bool):
+        return False
+    if selection.get("missing_components") != []:
+        return False
+    if selection.get("artifact_root") != ".":
+        return False
+    geometry = _selection_identity_from_manifest(
+        selection["source_geometry_truth"],
+        label="source geometry truth",
+    )
+    psf = _selection_identity_from_manifest(
+        selection["psf_selection_truth"],
+        label="PSF selection truth",
+    )
+    cadence = selection["cadence_selection_truth"]
+    if not isinstance(cadence, Mapping):
+        return False
+    if set(cadence) != {
+        "schema_id",
+        "schema_version",
+        "relative_directory",
+        "filename_template",
+        "count",
+        "absolute_raw_frame_start_index",
+        "spacecraft_id",
+        "science_realization_id",
+        "index_digest_schema_id",
+        "index_content_sha256",
+    }:
+        return False
+    if cadence.get("schema_id") != "photsim7.cadence_selection_truth.v1":
+        return False
+    if int(cadence.get("schema_version", 0)) != 1:
+        return False
+    if cadence.get("relative_directory") != "selection_truth/cadence":
+        return False
+    if cadence.get("filename_template") != (
+        "frame_{absolute_raw_frame_index:09d}.json"
+    ):
+        return False
+    if cadence.get("index_digest_schema_id") != _SELECTION_INDEX_SCHEMA_ID:
+        return False
+    if int(cadence.get("count", -1)) != len(raw_ids):
+        return False
+    raw_start = int(cadence["absolute_raw_frame_start_index"])
+    if raw_start != _ET_STAMP_ABSOLUTE_RAW_FRAME_START_INDEX:
+        return False
+    spacecraft_id = str(cadence["spacecraft_id"])
+    if spacecraft_id != _ET_STAMP_SPACECRAFT_ID:
+        return False
+    science_realization_id = int(cadence["science_realization_id"])
+    if science_realization_id != (
+        plan.spec.science_profile.science_realization_id
+    ):
+        return False
+    expected_digest = str(cadence["index_content_sha256"])
+    if len(expected_digest) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in expected_digest
+    ):
+        return False
+
+    target_dir = _target_dir(plan, target_id)
+    digest = hashlib.sha256()
+    for local_frame_index in raw_ids:
+        absolute_raw_frame_index = raw_start + local_frame_index
+        relative = api.cadence_selection_truth_relative_path(
+            absolute_raw_frame_index
+        )
+        truth = api.read_cadence_selection_truth(
+            target_dir / relative,
+            artifact_root=target_dir,
+        )
+        if truth.local_frame_index != local_frame_index:
+            return False
+        if truth.absolute_raw_frame_index != absolute_raw_frame_index:
+            return False
+        if truth.detector_id != str(plan.spec.detector.detector_id):
+            return False
+        if truth.spacecraft_id != spacecraft_id:
+            return False
+        if truth.science_realization_id != science_realization_id:
+            return False
+        if (
+            truth.science_conformance_claim
+            is not selection["science_conformance_claim"]
+        ):
+            return False
+        geometry_reference = truth.geometry_reference
+        psf_reference = truth.psf_reference
+        for field_name in (
+            "schema_id",
+            "schema_version",
+            "relative_path",
+            "content_sha256",
+        ):
+            if geometry[field_name] != geometry_reference[field_name]:
+                return False
+            if psf[field_name] != psf_reference[field_name]:
+                return False
+        digest.update(
+            _selection_index_record(
+                local_frame_index=local_frame_index,
+                absolute_raw_frame_index=absolute_raw_frame_index,
+                content_sha256=truth.content_sha256,
+            )
+        )
+    return digest.hexdigest() == expected_digest
+
+
 def _read_target_artifacts(
     plan: StampRunPlan,
     target_id: int,
+    *,
+    api: Any,
 ) -> dict[str, Any] | None:
     path = _target_artifact_manifest_path(plan, target_id)
     if not path.is_file():
@@ -985,7 +1468,9 @@ def _read_target_artifacts(
             payload = json.load(handle)
         if payload.get("schema_id") != "et_mainsim.stamp_target_artifacts":
             return None
-        if int(payload.get("schema_version", 0)) != 1:
+        if int(payload.get("schema_version", 0)) != (
+            _TARGET_ARTIFACT_SCHEMA_VERSION
+        ):
             return None
         if int(payload.get("target_source_id", -1)) != int(target_id):
             return None
@@ -1037,6 +1522,13 @@ def _read_target_artifacts(
         ):
             return None
         if any(int(value) < 0 for value in table["psf_field_id"]):
+            return None
+        if not _validate_selection_sidecars(
+            plan,
+            target_id,
+            payload,
+            api=api,
+        ):
             return None
         return payload
     except (KeyError, OSError, TypeError, ValueError):
@@ -1115,7 +1607,9 @@ def target_is_complete(plan: StampRunPlan, target_id: int, *, api: Any) -> bool:
                 for coadd_id in coadd_ids
             )
         )
-    checks.append(_read_target_artifacts(plan, target_id) is not None)
+    checks.append(
+        _read_target_artifacts(plan, target_id, api=api) is not None
+    )
     return bool(checks) and all(checks)
 
 
@@ -1391,7 +1885,7 @@ def _render_target(
     target_dir = _target_dir(plan, target_id)
     if target_is_complete(plan, target_id, api=api):
         if plan.run_config.execution.resume:
-            artifacts = _read_target_artifacts(plan, target_id)
+            artifacts = _read_target_artifacts(plan, target_id, api=api)
             return {
                 "target_id": target_id,
                 "status": "skipped",
@@ -1425,6 +1919,17 @@ def _render_target(
     raw_path = target_dir / "raw.h5"
     coadd_path = target_dir / "coadd.h5"
     truth_rows: list[dict[str, Any]] = []
+    selection_truth = _SelectionTruthAccumulator(
+        target_dir=target_dir,
+        frame_indices=raw_ids,
+        spacecraft_id=_ET_STAMP_SPACECRAFT_ID,
+        science_realization_id=(
+            spec.science_profile.science_realization_id
+        ),
+        absolute_raw_frame_start_index=(
+            _ET_STAMP_ABSOLUTE_RAW_FRAME_START_INDEX
+        ),
+    )
     try:
         for coadd_index in coadd_ids:
             result = api.run_stamp_coadd(
@@ -1440,6 +1945,7 @@ def _render_target(
                     "run_id": plan.run_config.run_id,
                     "workflow": "et-stamp",
                 },
+                run_dir=target_dir,
             )
             first_raw = result.raw_results[0].stamp_products
             first_raw_array = _to_numpy(first_raw.final_stamp.array)
@@ -1479,6 +1985,7 @@ def _render_target(
                 )
 
             for raw_result in result.raw_results:
+                selection_truth.add(raw_result)
                 products = raw_result.stamp_products
                 frame_id = int(products.frame_index)
                 truth_rows.append(
@@ -1559,10 +2066,11 @@ def _render_target(
 
         target_artifacts = {
             "schema_id": "et_mainsim.stamp_target_artifacts",
-            "schema_version": 1,
+            "schema_version": _TARGET_ARTIFACT_SCHEMA_VERSION,
             "target_source_id": target_id,
             "source_input_truth": dict(source_input_truth),
             "source_variability_truth_identity": truth_identity,
+            "selection_truth": selection_truth.to_manifest(),
             "runtime_psf": {
                 "selected_field_ids": selected_field_ids.tolist(),
                 "provenance": dict(services.psf_result.provenance),
@@ -1742,8 +2250,28 @@ def _catalog_manifest(prepared: PreparedStampInputs, plan: StampRunPlan) -> dict
     }
 
 
+def _stamp_product_contract() -> dict[str, Any]:
+    return {
+        "target_artifact_schema_id": "et_mainsim.stamp_target_artifacts",
+        "target_artifact_schema_version": _TARGET_ARTIFACT_SCHEMA_VERSION,
+        "selection_artifact_schema_id": _SELECTION_ARTIFACT_SCHEMA_ID,
+        "selection_artifact_schema_version": 1,
+        "selection_index_schema_id": _SELECTION_INDEX_SCHEMA_ID,
+        "source_geometry_truth_schema_id": (
+            "photsim7.source_geometry_truth.v1"
+        ),
+        "psf_selection_truth_schema_id": (
+            "photsim7.psf_selection_truth.v2"
+        ),
+        "cadence_selection_truth_schema_id": (
+            "photsim7.cadence_selection_truth.v1"
+        ),
+    }
+
+
 def _workload_identity(plan: StampRunPlan) -> dict[str, Any]:
     payload = plan.workload.to_dict()
+    payload["product_contract"] = _stamp_product_contract()
     if plan.workload.input_mode != "table":
         return payload
     if plan.input_table_path is None:

@@ -25,6 +25,11 @@ from et_mainsim.presets import resource_path
 from et_mainsim.provenance import collect_provenance
 
 
+_SELECTION_TRUTH_SCOPE = "geometry_psf_and_jitter_selection_truth_only"
+_ET_FULL_FRAME_SPACECRAFT_ID = "et"
+_ET_FULL_FRAME_ABSOLUTE_RAW_FRAME_START_INDEX = 0
+
+
 @dataclass(frozen=True)
 class WorkerRequest:
     spec: Any
@@ -123,7 +128,7 @@ class FullFrameRunPlan:
             "catalog_cache": str(self.catalog_cache),
             "paths": self.paths.to_dict(),
             "execution": self.run_config.execution.to_dict(),
-            "workload": self.run_config.workload.to_dict(),
+            "workload": _full_frame_workload_identity(self),
             "frame_plan": {
                 "requested": list(self.frame_indices),
                 "count": len(self.frame_indices),
@@ -140,6 +145,10 @@ def _science_api() -> SimpleNamespace:
         FullFrameArtifactWriter,
     )
     from photsim7.full_frame_pipeline import run_single_cadence_full_frame
+    from photsim7.selection_artifacts import (
+        cadence_selection_truth_relative_path,
+        read_cadence_selection_truth,
+    )
     from photsim7.simulation_services import (
         build_catalog_from_spec,
         build_full_frame_services,
@@ -154,6 +163,10 @@ def _science_api() -> SimpleNamespace:
         build_catalog_from_spec=build_catalog_from_spec,
         build_full_frame_services=build_full_frame_services,
         run_single_cadence_full_frame=run_single_cadence_full_frame,
+        cadence_selection_truth_relative_path=(
+            cadence_selection_truth_relative_path
+        ),
+        read_cadence_selection_truth=read_cadence_selection_truth,
     )
 
 
@@ -182,13 +195,213 @@ def _artifact_paths(run_dir: Path, frame_index: int) -> tuple[Path, Path, Path]:
     )
 
 
+def _selection_artifact_identity(value: Any, *, label: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} selection artifact identity must be a mapping")
+    result = dict(value)
+    if set(result) != {
+        "relative_path",
+        "schema_id",
+        "schema_version",
+        "content_sha256",
+    }:
+        raise ValueError(f"{label} selection artifact identity keys are invalid")
+    relative = Path(str(result["relative_path"]))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"{label} selection artifact path escapes run_dir")
+    digest = str(result["content_sha256"])
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError(f"{label} selection artifact hash is invalid")
+    schema_id = str(result["schema_id"])
+    if not schema_id or schema_id != schema_id.strip():
+        raise ValueError(f"{label} selection artifact schema_id is invalid")
+    schema_version = int(result["schema_version"])
+    if schema_version < 1:
+        raise ValueError(f"{label} selection artifact schema version is invalid")
+    return {
+        "relative_path": relative.as_posix(),
+        "schema_id": schema_id,
+        "schema_version": schema_version,
+        "content_sha256": digest,
+    }
+
+
+def _unavailable_selection_is_complete(
+    selection: Mapping[str, Any],
+    *,
+    expected_spec: Any,
+) -> bool:
+    if set(selection) != {
+        "schema_id",
+        "schema_version",
+        "verification_status",
+        "science_conformance_claim",
+        "science_conformance_claim_scope",
+        "requested_science_profile_id",
+        "missing_components",
+    }:
+        return False
+    return bool(
+        selection.get("schema_id")
+        == "photsim7.cadence_selection_truth.v1"
+        and int(selection.get("schema_version", 0)) == 1
+        and selection.get("verification_status") == "unavailable"
+        and selection.get("science_conformance_claim") is False
+        and selection.get("science_conformance_claim_scope")
+        == _SELECTION_TRUTH_SCOPE
+        and selection.get("requested_science_profile_id")
+        == expected_spec.science_profile.profile_id
+        and selection.get("missing_components")
+        == ["jitter_model_selection_truth"]
+        and not bool(expected_spec.psf.use_jitter_integrated_psf)
+    )
+
+
+def _persisted_selection_is_complete(
+    run_dir: Path,
+    frame_index: int,
+    selection: Mapping[str, Any],
+    *,
+    expected_spec: Any,
+    api: Any,
+) -> bool:
+    if set(selection) != {
+        "schema_id",
+        "schema_version",
+        "verification_status",
+        "science_conformance_claim",
+        "science_conformance_claim_scope",
+        "requested_science_profile_id",
+        "content_sha256",
+        "source_geometry_truth",
+        "psf_selection_truth",
+        "jitter_model_selection_truth",
+        "missing_components",
+        "artifact",
+    }:
+        return False
+    if (
+        selection.get("schema_id")
+        != "photsim7.cadence_selection_truth.v1"
+        or int(selection.get("schema_version", 0)) != 1
+        or selection.get("verification_status") != "persisted_and_verified"
+        or selection.get("science_conformance_claim_scope")
+        != _SELECTION_TRUTH_SCOPE
+        or selection.get("requested_science_profile_id")
+        != expected_spec.science_profile.profile_id
+        or selection.get("missing_components") != []
+        or not isinstance(selection.get("science_conformance_claim"), bool)
+    ):
+        return False
+    artifacts = selection.get("artifact")
+    if not isinstance(artifacts, Mapping) or set(artifacts) != {
+        "geometry",
+        "psf",
+        "cadence",
+    }:
+        return False
+    geometry_artifact = _selection_artifact_identity(
+        artifacts["geometry"],
+        label="geometry",
+    )
+    psf_artifact = _selection_artifact_identity(
+        artifacts["psf"],
+        label="PSF",
+    )
+    cadence_artifact = _selection_artifact_identity(
+        artifacts["cadence"],
+        label="cadence",
+    )
+    absolute_raw_frame_index = (
+        _ET_FULL_FRAME_ABSOLUTE_RAW_FRAME_START_INDEX + int(frame_index)
+    )
+    cadence_relative = api.cadence_selection_truth_relative_path(
+        absolute_raw_frame_index
+    ).as_posix()
+    if cadence_artifact["relative_path"] != cadence_relative:
+        return False
+    content_sha256 = str(selection.get("content_sha256", ""))
+    if cadence_artifact["content_sha256"] != content_sha256:
+        return False
+    truth = api.read_cadence_selection_truth(
+        run_dir / cadence_relative,
+        artifact_root=run_dir,
+        expected_sha256=content_sha256,
+    )
+    if (
+        truth.detector_id != str(expected_spec.detector.detector_id)
+        or truth.local_frame_index != int(frame_index)
+        or truth.absolute_raw_frame_index != absolute_raw_frame_index
+        or truth.spacecraft_id != _ET_FULL_FRAME_SPACECRAFT_ID
+        or truth.science_realization_id
+        != int(expected_spec.science_profile.science_realization_id)
+        or truth.science_conformance_claim
+        is not selection["science_conformance_claim"]
+    ):
+        return False
+    if selection["source_geometry_truth"] != truth.geometry_reference:
+        return False
+    if selection["psf_selection_truth"] != truth.psf_reference:
+        return False
+    if (
+        selection["jitter_model_selection_truth"]
+        != truth.jitter_model_selection_truth.to_json_dict()
+    ):
+        return False
+    for artifact, reference in (
+        (geometry_artifact, truth.geometry_reference),
+        (psf_artifact, truth.psf_reference),
+    ):
+        for field_name in (
+            "relative_path",
+            "schema_id",
+            "schema_version",
+            "content_sha256",
+        ):
+            if artifact[field_name] != reference[field_name]:
+                return False
+    return bool(
+        cadence_artifact["schema_id"] == truth.schema_id
+        and cadence_artifact["schema_version"] == truth.schema_version
+        and cadence_artifact["content_sha256"] == truth.content_sha256
+    )
+
+
+def _selection_is_complete(
+    run_dir: Path,
+    frame_index: int,
+    schema: Mapping[str, Any],
+    *,
+    expected_spec: Any,
+) -> bool:
+    selection = schema.get("selection_truth")
+    if not isinstance(selection, Mapping):
+        return False
+    if selection.get("verification_status") == "unavailable":
+        return _unavailable_selection_is_complete(
+            selection,
+            expected_spec=expected_spec,
+        )
+    return _persisted_selection_is_complete(
+        run_dir,
+        frame_index,
+        selection,
+        expected_spec=expected_spec,
+        api=_science_api(),
+    )
+
+
 def frame_is_complete(
     run_dir: Path | str,
     frame_index: int,
     *,
     expected_shape: tuple[int, int],
+    expected_spec: Any,
 ) -> bool:
-    frame_path, summary_path, schema_path = _artifact_paths(Path(run_dir), frame_index)
+    run_dir = Path(run_dir)
+    frame_path, summary_path, schema_path = _artifact_paths(run_dir, frame_index)
     if not all(path.is_file() for path in (frame_path, summary_path, schema_path)):
         return False
     try:
@@ -204,6 +417,8 @@ def frame_is_complete(
         schema = read_frame_product_schema(schema_path)
         if int(schema.get("frame_index", -1)) != int(frame_index):
             return False
+        if schema.get("detector_id") != str(expected_spec.detector.detector_id):
+            return False
         array = np.load(frame_path, mmap_mode="r", allow_pickle=False)
         if tuple(array.shape) != tuple(expected_shape):
             return False
@@ -212,13 +427,32 @@ def frame_is_complete(
             return False
         if str(final_schema.get("dtype")) != str(array.dtype):
             return False
+        if not _selection_is_complete(
+            run_dir,
+            frame_index,
+            schema,
+            expected_spec=expected_spec,
+        ):
+            return False
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return False
     return True
 
 
 def _has_partial_artifacts(run_dir: Path, frame_index: int) -> bool:
-    return any(path.exists() for path in _artifact_paths(run_dir, frame_index))
+    absolute_raw_frame_index = (
+        _ET_FULL_FRAME_ABSOLUTE_RAW_FRAME_START_INDEX + int(frame_index)
+    )
+    cadence_path = (
+        run_dir
+        / "selection_truth"
+        / "cadence"
+        / f"frame_{absolute_raw_frame_index:09d}.json"
+    )
+    return any(
+        path.exists()
+        for path in (*_artifact_paths(run_dir, frame_index), cadence_path)
+    )
 
 
 def _record_frame_metrics(
@@ -310,6 +544,7 @@ def run_worker(
             request.run_dir,
             frame_index,
             expected_shape=expected_shape,
+            expected_spec=request.spec,
         )
         if request.execution.resume and complete:
             skipped.append(frame_index)
@@ -478,6 +713,7 @@ def run_worker(
             request.run_dir,
             frame_index,
             expected_shape=expected_shape,
+            expected_spec=request.spec,
         ):
             raise RuntimeError(
                 f"Photsim7 artifacts for frame {frame_index} failed readback validation"
@@ -743,6 +979,38 @@ def _manifest_execution(plan: FullFrameRunPlan) -> dict[str, Any]:
     }
 
 
+def _full_frame_product_contract() -> dict[str, Any]:
+    from photsim7.frame_products import (
+        FRAME_PRODUCT_SCHEMA_ID,
+        FRAME_PRODUCT_SCHEMA_VERSION,
+    )
+    from photsim7.geometry_truth import SOURCE_GEOMETRY_TRUTH_SCHEMA_ID
+    from photsim7.psf.selection_truth import PSF_SELECTION_TRUTH_SCHEMA_ID
+    from photsim7.selection_artifacts import (
+        CADENCE_SELECTION_TRUTH_SCHEMA_ID,
+        CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
+    )
+
+    return {
+        "frame_product_schema_id": FRAME_PRODUCT_SCHEMA_ID,
+        "frame_product_schema_version": FRAME_PRODUCT_SCHEMA_VERSION,
+        "source_geometry_truth_schema_id": SOURCE_GEOMETRY_TRUTH_SCHEMA_ID,
+        "psf_selection_truth_schema_id": PSF_SELECTION_TRUTH_SCHEMA_ID,
+        "cadence_selection_truth_schema_id": (
+            CADENCE_SELECTION_TRUTH_SCHEMA_ID
+        ),
+        "cadence_selection_truth_schema_version": (
+            CADENCE_SELECTION_TRUTH_SCHEMA_VERSION
+        ),
+    }
+
+
+def _full_frame_workload_identity(plan: FullFrameRunPlan) -> dict[str, Any]:
+    payload = plan.run_config.workload.to_dict()
+    payload["product_contract"] = _full_frame_product_contract()
+    return payload
+
+
 def run_full_frame(
     plan: FullFrameRunPlan,
     *,
@@ -763,13 +1031,14 @@ def run_full_frame(
     plan.run_dir.mkdir(parents=True, exist_ok=True)
     execution_payload = _manifest_execution(plan)
     spec_payload = plan.spec.to_json_dict()
+    workload_payload = _full_frame_workload_identity(plan)
     if store.path.exists():
         store.ensure_identity(
             workflow="et-full-frame",
             run_id=plan.run_config.run_id,
             simulation_spec=spec_payload,
             execution=execution_payload,
-            workload=plan.run_config.workload.to_dict(),
+            workload=workload_payload,
         )
     else:
         from photsim7.frame_products import (
@@ -783,7 +1052,7 @@ def run_full_frame(
             run_id=plan.run_config.run_id,
             simulation_spec=spec_payload,
             execution=execution_payload,
-            workload=plan.run_config.workload.to_dict(),
+            workload=workload_payload,
             frame_plan={
                 "requested": list(plan.frame_indices),
                 "count": len(plan.frame_indices),
@@ -795,6 +1064,7 @@ def run_full_frame(
                 "frame_summaries": str(plan.run_dir / "frame_summaries"),
                 "frame_product_schema_id": FRAME_PRODUCT_SCHEMA_ID,
                 "frame_product_schema_version": FRAME_PRODUCT_SCHEMA_VERSION,
+                "selection_truth": _full_frame_product_contract(),
             },
         )
     try:
@@ -846,6 +1116,7 @@ def run_full_frame(
                 plan.run_dir,
                 frame_index,
                 expected_shape=tuple(plan.spec.detector.shape),
+                expected_spec=plan.spec,
             )
         ]
         if incomplete:

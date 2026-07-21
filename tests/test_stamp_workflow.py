@@ -704,6 +704,96 @@ def _write_test_psf_bundle(data_root):
     return bundle_name, bundle_sha256
 
 
+def _selection_sidecar_plan(tmp_path):
+    plan = _variable_table_plan(
+        tmp_path,
+        target_body=(
+            "source_id,gaia_g_mag,psf_id,curve_id\n10,12.0,0,sn\n"
+        ),
+    )
+    bundle_name, bundle_sha256 = _write_test_psf_bundle(
+        plan.paths.data_root
+    )
+    return replace(
+        plan,
+        spec=replace(
+            plan.spec,
+            detector=replace(plan.spec.detector, n_subpixels=3),
+            psf=replace(
+                plan.spec.psf,
+                bundle_name=bundle_name,
+                bundle_sha256=bundle_sha256,
+            ),
+        ),
+    )
+
+
+def _complete_selection_api(api):
+    from photsim7.dynamic_effects import EffectTimeseries, build_frame_timing
+    from photsim7.jitter_bank import (
+        CANONICAL_JITTER_BANK_EVIDENCE_ID,
+        CANONICAL_JITTER_BANK_LOGICAL_ID,
+        NATIVE_JITTER_BANK_LOADER_ID,
+    )
+    from photsim7.jitter_bank_authority import (
+        CANONICAL_JITTER_BANK_MANIFEST_SHA256,
+        CANONICAL_JITTER_BANK_SHA256,
+    )
+    from photsim7.jitter_selection_truth import JitterModelSelector
+
+    original_build_services = api.build_stamp_services
+
+    def build_services(spec, *args, **kwargs):
+        services = original_build_services(spec, *args, **kwargs)
+        selector = JitterModelSelector(
+            seed_tree=services.seed_tree,
+            bank_identity={
+                "logical_bank_id": CANONICAL_JITTER_BANK_LOGICAL_ID,
+                "bank_evidence_id": CANONICAL_JITTER_BANK_EVIDENCE_ID,
+                "array_sha256": CANONICAL_JITTER_BANK_SHA256,
+                "expected_array_sha256": CANONICAL_JITTER_BANK_SHA256,
+                "manifest_sha256": CANONICAL_JITTER_BANK_MANIFEST_SHA256,
+                "expected_manifest_sha256": (
+                    CANONICAL_JITTER_BANK_MANIFEST_SHA256
+                ),
+                "verification_status": (
+                    "array_and_manifest_sha256_verified_before_load"
+                ),
+                "loader": NATIVE_JITTER_BANK_LOADER_ID,
+            },
+            n_models=100,
+            science_realization_id=(
+                spec.science_profile.science_realization_id
+            ),
+            spacecraft_id=services.context.spacecraft_id,
+            absolute_raw_frame_start_index=(
+                services.context.absolute_raw_frame_start_index
+            ),
+        )
+        effects = EffectTimeseries(
+            timing=build_frame_timing(
+                n_frames=spec.observation.resolved_n_frames,
+                integration_s=services.frame_exposure.to_value(u.s),
+                sampling_interval_s=(
+                    spec.observation.sampling_interval.to_value(u.s)
+                ),
+            ),
+            source_geometry=services.source_geometry,
+            jitter_integrated_psf_offsets=np.zeros((100, 2, 1)),
+            jitter_model_selector=selector,
+        )
+        return replace(
+            services,
+            full_frame_services=replace(
+                services.full_frame_services,
+                effect_timeseries=effects,
+            ),
+        )
+
+    api.build_stamp_services = build_services
+    return api
+
+
 def test_stamp_run_writes_readable_raw_coadd_truth_and_resumes(tmp_path) -> None:
     from et_mainsim.presets import load_preset
     from et_mainsim.workflows.stamp import build_run_plan, run_stamp
@@ -937,6 +1027,327 @@ def test_variable_table_run_persists_numeric_truth_provenance_and_digest(
         json.dumps(target_artifact_payload), encoding="utf-8"
     )
     assert not target_is_complete(plan, 10, api=_science_api())
+
+
+def test_stamp_target_persists_closed_selection_sidecar_manifest(
+    tmp_path,
+) -> None:
+    from et_mainsim.workflows.stamp import _science_api, run_stamp
+    from photsim7.selection_artifacts import read_cadence_selection_truth
+
+    plan = _selection_sidecar_plan(tmp_path)
+    api = _complete_selection_api(_science_api())
+    original_run_coadd = api.run_stamp_coadd
+    target_dir = plan.run_dir / "stamps" / "target_10"
+    observed_roots = []
+
+    def run_coadd(*args, **kwargs):
+        observed_roots.append(kwargs.get("run_dir"))
+        return original_run_coadd(*args, **kwargs)
+
+    api.run_stamp_coadd = run_coadd
+    manifest = run_stamp(plan, science_api=api)
+
+    assert observed_roots == [target_dir]
+    artifacts = manifest["completion"]["targets"][0]["artifacts"]
+    assert artifacts["schema_version"] == 2
+    selection = artifacts["selection_truth"]
+    assert selection["schema_id"] == (
+        "et_mainsim.stamp_selection_truth_artifacts.v1"
+    )
+    assert selection["schema_version"] == 1
+    assert selection["verification_status"] == "persisted_and_verified"
+    assert selection["missing_components"] == []
+    assert selection["artifact_root"] == "."
+    geometry = selection["source_geometry_truth"]
+    psf = selection["psf_selection_truth"]
+    cadence = selection["cadence_selection_truth"]
+    assert len(geometry["content_sha256"]) == 64
+    assert len(psf["content_sha256"]) == 64
+    assert (target_dir / geometry["relative_path"]).is_file()
+    assert (target_dir / psf["relative_path"]).is_file()
+    assert cadence == {
+        "schema_id": "photsim7.cadence_selection_truth.v1",
+        "schema_version": 1,
+        "relative_directory": "selection_truth/cadence",
+        "filename_template": "frame_{absolute_raw_frame_index:09d}.json",
+        "count": 2,
+        "absolute_raw_frame_start_index": 0,
+        "spacecraft_id": "et",
+        "science_realization_id": 0,
+        "index_digest_schema_id": "et_mainsim.selection_truth_index.v1",
+        "index_content_sha256": cadence["index_content_sha256"],
+    }
+    assert len(cadence["index_content_sha256"]) == 64
+    for frame_index in (0, 1):
+        path = (
+            target_dir
+            / cadence["relative_directory"]
+            / cadence["filename_template"].format(
+                absolute_raw_frame_index=frame_index
+            )
+        )
+        restored = read_cadence_selection_truth(
+            path,
+            artifact_root=target_dir,
+        )
+        assert restored.local_frame_index == frame_index
+        assert restored.source_geometry_truth.content_sha256 == (
+            geometry["content_sha256"]
+        )
+        assert restored.psf_selection_truth.content_sha256 == (
+            psf["content_sha256"]
+        )
+
+
+def test_unavailable_selection_truth_still_requires_raw_frame_order(
+    tmp_path,
+) -> None:
+    from et_mainsim.workflows.stamp import _SelectionTruthAccumulator
+
+    accumulator = _SelectionTruthAccumulator(
+        target_dir=tmp_path,
+        frame_indices=(0,),
+        spacecraft_id="et",
+        science_realization_id=0,
+        absolute_raw_frame_start_index=0,
+    )
+    raw_result = SimpleNamespace(
+        selection_truth=None,
+        selection_artifacts=None,
+        stamp_products=SimpleNamespace(
+            frame_index=1,
+            selection_truth={
+                "verification_status": "unavailable",
+                "science_conformance_claim": False,
+            },
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="ordered by the raw frame plan"):
+        accumulator.add(raw_result)
+
+
+def test_stamp_completion_and_resume_fail_closed_on_selection_sidecars(
+    tmp_path,
+) -> None:
+    from et_mainsim.workflows.stamp import (
+        _science_api,
+        run_stamp,
+        target_is_complete,
+    )
+    from photsim7.selection_artifacts import SelectionArtifactConflictError
+
+    plan = _selection_sidecar_plan(tmp_path)
+    api = _complete_selection_api(_science_api())
+    run_stamp(plan, science_api=api)
+    target_dir = plan.run_dir / "stamps" / "target_10"
+    manifest_path = target_dir / "target_artifacts.json"
+    original_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cadence = original_manifest["selection_truth"][
+        "cadence_selection_truth"
+    ]
+    cadence_path = (
+        target_dir
+        / cadence["relative_directory"]
+        / cadence["filename_template"].format(
+            absolute_raw_frame_index=1
+        )
+    )
+
+    missing_selection = dict(original_manifest)
+    missing_selection.pop("selection_truth")
+    manifest_path.write_text(json.dumps(missing_selection), encoding="utf-8")
+    assert not target_is_complete(plan, 10, api=api)
+
+    bad_index = json.loads(json.dumps(original_manifest))
+    bad_index["selection_truth"]["cadence_selection_truth"][
+        "index_content_sha256"
+    ] = "0" * 64
+    manifest_path.write_text(json.dumps(bad_index), encoding="utf-8")
+    assert not target_is_complete(plan, 10, api=api)
+
+    manifest_path.write_text(json.dumps(original_manifest), encoding="utf-8")
+    cadence_path.unlink()
+    assert not target_is_complete(plan, 10, api=api)
+    repaired = run_stamp(plan, science_api=api)
+    assert repaired["completion"]["rendered_targets"] == 1
+    assert cadence_path.is_file()
+    assert target_is_complete(plan, 10, api=api)
+
+    cadence_path.write_text("corrupt competing bytes\n", encoding="utf-8")
+    assert not target_is_complete(plan, 10, api=api)
+    with pytest.raises(SelectionArtifactConflictError, match="conflict"):
+        run_stamp(plan, science_api=api)
+
+
+def test_selection_resume_binds_spacecraft_and_science_realization(tmp_path):
+    from et_mainsim.workflows.stamp import (
+        _selection_index_record,
+        _validate_selection_sidecars,
+    )
+
+    plan = _selection_sidecar_plan(tmp_path)
+    geometry = {
+        "schema_id": "photsim7.source_geometry_truth.v1",
+        "schema_version": 1,
+        "relative_path": f"selection_truth/geometry/geometry_{'a' * 64}.json",
+        "content_sha256": "a" * 64,
+    }
+    psf = {
+        "schema_id": "photsim7.psf_selection_truth.v2",
+        "schema_version": 2,
+        "relative_path": f"selection_truth/psf/psf_{'b' * 64}.json",
+        "content_sha256": "b" * 64,
+    }
+
+    def self_consistent_payload(
+        spacecraft_id,
+        science_realization_id,
+        *,
+        manifest_claim=True,
+        truth_claim=True,
+    ):
+        truths = {}
+        digest = hashlib.sha256()
+        for frame_index in (0, 1):
+            content_sha256 = hashlib.sha256(
+                (
+                    f"{spacecraft_id}:{science_realization_id}:"
+                    f"{frame_index}"
+                ).encode("utf-8")
+            ).hexdigest()
+            truths[frame_index] = SimpleNamespace(
+                local_frame_index=frame_index,
+                absolute_raw_frame_index=frame_index,
+                detector_id=plan.spec.detector.detector_id,
+                spacecraft_id=spacecraft_id,
+                science_realization_id=science_realization_id,
+                science_conformance_claim=truth_claim,
+                geometry_reference=geometry,
+                psf_reference=psf,
+                content_sha256=content_sha256,
+            )
+            digest.update(
+                _selection_index_record(
+                    local_frame_index=frame_index,
+                    absolute_raw_frame_index=frame_index,
+                    content_sha256=content_sha256,
+                )
+            )
+        selection = {
+            "schema_id": "et_mainsim.stamp_selection_truth_artifacts.v1",
+            "schema_version": 1,
+            "verification_status": "persisted_and_verified",
+            "science_conformance_claim": manifest_claim,
+            "missing_components": [],
+            "artifact_root": ".",
+            "source_geometry_truth": geometry,
+            "psf_selection_truth": psf,
+            "cadence_selection_truth": {
+                "schema_id": "photsim7.cadence_selection_truth.v1",
+                "schema_version": 1,
+                "relative_directory": "selection_truth/cadence",
+                "filename_template": (
+                    "frame_{absolute_raw_frame_index:09d}.json"
+                ),
+                "count": 2,
+                "absolute_raw_frame_start_index": 0,
+                "spacecraft_id": spacecraft_id,
+                "science_realization_id": science_realization_id,
+                "index_digest_schema_id": (
+                    "et_mainsim.selection_truth_index.v1"
+                ),
+                "index_content_sha256": digest.hexdigest(),
+            },
+        }
+        api = SimpleNamespace(
+            cadence_selection_truth_relative_path=lambda frame: (
+                f"selection_truth/cadence/frame_{frame:09d}.json"
+            ),
+            read_cadence_selection_truth=lambda path, **_kwargs: truths[
+                int(str(path).rsplit("_", 1)[1].split(".", 1)[0])
+            ],
+        )
+        return {"selection_truth": selection}, api
+
+    expected_realization = plan.spec.science_profile.science_realization_id
+    payload, api = self_consistent_payload("et", expected_realization)
+    assert _validate_selection_sidecars(
+        plan,
+        10,
+        payload,
+        api=api,
+    )
+
+    mismatched_claim, mismatched_claim_api = self_consistent_payload(
+        "et",
+        expected_realization,
+        manifest_claim=True,
+        truth_claim=False,
+    )
+    assert not _validate_selection_sidecars(
+        plan,
+        10,
+        mismatched_claim,
+        api=mismatched_claim_api,
+    )
+
+    for spacecraft_id, realization_id in (
+        ("other-spacecraft", expected_realization),
+        ("et", expected_realization + 1),
+    ):
+        transplanted, transplanted_api = self_consistent_payload(
+            spacecraft_id,
+            realization_id,
+        )
+        assert not _validate_selection_sidecars(
+            plan,
+            10,
+            transplanted,
+            api=transplanted_api,
+        )
+
+
+def test_stamp_run_identity_requires_current_product_contract(tmp_path):
+    from et_mainsim.manifest import ManifestIdentityError
+    from et_mainsim.workflows.stamp import _science_api, run_stamp
+
+    plan = _selection_sidecar_plan(tmp_path)
+    api = _complete_selection_api(_science_api())
+    run_stamp(plan, science_api=api)
+    manifest_path = plan.run_dir / "run_manifest.json"
+    original = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert original["workload"]["product_contract"] == {
+        "target_artifact_schema_id": "et_mainsim.stamp_target_artifacts",
+        "target_artifact_schema_version": 2,
+        "selection_artifact_schema_id": (
+            "et_mainsim.stamp_selection_truth_artifacts.v1"
+        ),
+        "selection_artifact_schema_version": 1,
+        "selection_index_schema_id": "et_mainsim.selection_truth_index.v1",
+        "source_geometry_truth_schema_id": (
+            "photsim7.source_geometry_truth.v1"
+        ),
+        "psf_selection_truth_schema_id": (
+            "photsim7.psf_selection_truth.v2"
+        ),
+        "cadence_selection_truth_schema_id": (
+            "photsim7.cadence_selection_truth.v1"
+        ),
+    }
+
+    for mutation in ("missing", "old-version"):
+        stale = json.loads(json.dumps(original))
+        if mutation == "missing":
+            stale["workload"].pop("product_contract")
+        else:
+            stale["workload"]["product_contract"][
+                "target_artifact_schema_version"
+            ] = 1
+        manifest_path.write_text(json.dumps(stale), encoding="utf-8")
+        with pytest.raises(ManifestIdentityError, match="workload identity"):
+            run_stamp(plan, science_api=api)
 
 
 def test_variable_table_local_subprocess_worker_preserves_input_contract(
