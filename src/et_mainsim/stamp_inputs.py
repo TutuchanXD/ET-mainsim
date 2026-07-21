@@ -239,7 +239,7 @@ def focalplane_registry_identity(path: Path | str) -> dict[str, Any]:
         from et_coord import semantic_registry_identity
     except ImportError as exc:
         raise RuntimeError(
-            "coordinate targets require et_coord semantic registry identity"
+            "coordinate targets require et-coord>=0.1.1 semantic registry identity"
         ) from exc
     return semantic_registry_identity(source)
 

@@ -65,6 +65,12 @@ def test_project_requires_shared_exposure_photsim7_release() -> None:
     assert "photsim7>=0.2.3,<0.3" in payload["project"]["dependencies"]
 
 
+def test_project_requires_semantic_registry_identity_release() -> None:
+    payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "et-coord>=0.1.1,<0.2" in payload["project"]["dependencies"]
+
+
 def test_required_photsim7_runtime_capabilities_are_importable() -> None:
     from et_mainsim.workflows.full_frame import _science_api
 

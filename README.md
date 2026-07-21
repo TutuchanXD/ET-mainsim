@@ -21,8 +21,12 @@ existing `etbase` environment:
 ```bash
 conda activate etbase
 python -m pip install -e /home/cxgao/ET/Photsim7
+python -m pip install -e /home/cxgao/ET/et_focalplane
 python -m pip install -e /home/cxgao/ET/ET-mainsim
 ```
+
+Coordinate-table stamp inputs require `et-coord>=0.1.1`, the first release
+containing the semantic focal-plane registry identity API.
 
 The package import is lightweight and does not initialize Torch, Ray, CUDA,
 catalogs, or external assets.
