@@ -330,6 +330,12 @@ def _persisted_selection_is_complete(
         artifact_root=run_dir,
         expected_sha256=content_sha256,
     )
+    try:
+        truth.jitter_model_selection_truth.rng_trace_payload(
+            expected_spec.rng.to_seed_tree()
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
     if (
         truth.detector_id != str(expected_spec.detector.detector_id)
         or truth.local_frame_index != int(frame_index)
@@ -627,6 +633,18 @@ def run_worker(
 
     rendered: list[int] = []
     for frame_index in to_render:
+        if request.execution.overwrite:
+            absolute_raw_frame_index = (
+                _ET_FULL_FRAME_ABSOLUTE_RAW_FRAME_START_INDEX
+                + int(frame_index)
+            )
+            cadence_path = (
+                request.run_dir
+                / api.cadence_selection_truth_relative_path(
+                    absolute_raw_frame_index
+                )
+            )
+            cadence_path.unlink(missing_ok=True)
         frame_started = time.perf_counter()
         options = api.FullFrameArtifactOptions(
             save_frame_summaries=True,

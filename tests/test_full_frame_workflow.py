@@ -648,6 +648,24 @@ def test_full_frame_resume_recovers_missing_and_orphan_sidecars_but_conflicts(
     with pytest.raises(SelectionArtifactConflictError, match="conflict"):
         run_worker(request, science_api=api)
 
+    overwrite_request = replace(
+        request,
+        execution=replace(
+            request.execution,
+            resume=False,
+            overwrite=True,
+        ),
+        frame_indices=(0,),
+    )
+    overwritten = run_worker(overwrite_request, science_api=api)
+    assert overwritten.rendered == (0,)
+    assert frame_is_complete(
+        request.run_dir,
+        0,
+        expected_shape=tuple(request.spec.detector.shape),
+        expected_spec=request.spec,
+    )
+
 
 def test_full_frame_completion_rejects_self_consistent_identity_transplant(
     tmp_path,
@@ -690,19 +708,34 @@ def test_full_frame_completion_rejects_self_consistent_identity_transplant(
         "loader": NATIVE_JITTER_BANK_LOADER_ID,
     }
     expected_realization = request.spec.science_profile.science_realization_id
-    for label, spacecraft_id, realization_id in (
-        ("spacecraft", "transplanted-spacecraft", expected_realization),
-        ("realization", "et", expected_realization + 1),
+    for label, spacecraft_id, realization_id, run_seed in (
+        (
+            "spacecraft",
+            "transplanted-spacecraft",
+            expected_realization,
+            request.spec.rng.run_seed,
+        ),
+        (
+            "realization",
+            "et",
+            expected_realization + 1,
+            request.spec.rng.run_seed,
+        ),
+        (
+            "run-seed",
+            "et",
+            expected_realization,
+            request.spec.rng.run_seed + 1,
+        ),
     ):
         transplanted_root = tmp_path / label
         shutil.copytree(request.run_dir, transplanted_root)
         shutil.rmtree(transplanted_root / "selection_truth")
         selector = JitterModelSelector(
-            seed_tree=api.build_full_frame_services(
-                request.spec,
-                catalog=api.StarCatalogCache.read(request.catalog_cache),
-                data_registry=api.DataRegistry(data_root=request.data_root),
-            ).seed_tree,
+            seed_tree=replace(
+                request.spec.rng,
+                run_seed=run_seed,
+            ).to_seed_tree(),
             bank_identity=bank_identity,
             n_models=100,
             science_realization_id=realization_id,

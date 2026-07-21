@@ -1057,6 +1057,12 @@ def test_stamp_target_persists_closed_selection_sidecar_manifest(
     )
     assert selection["schema_version"] == 1
     assert selection["verification_status"] == "persisted_and_verified"
+    assert selection["requested_science_profile_id"] == (
+        plan.spec.science_profile.profile_id
+    )
+    assert selection["science_conformance_claim_scope"] == (
+        "geometry_psf_and_jitter_selection_truth_only"
+    )
     assert selection["missing_components"] == []
     assert selection["artifact_root"] == "."
     geometry = selection["source_geometry_truth"]
@@ -1110,6 +1116,7 @@ def test_unavailable_selection_truth_still_requires_raw_frame_order(
         frame_indices=(0,),
         spacecraft_id="et",
         science_realization_id=0,
+        requested_science_profile_id="unclaimed",
         absolute_raw_frame_start_index=0,
     )
     raw_result = SimpleNamespace(
@@ -1224,6 +1231,9 @@ def test_selection_resume_binds_spacecraft_and_science_realization(tmp_path):
                 spacecraft_id=spacecraft_id,
                 science_realization_id=science_realization_id,
                 science_conformance_claim=truth_claim,
+                jitter_model_selection_truth=SimpleNamespace(
+                    rng_trace_payload=lambda _seed_tree: {}
+                ),
                 geometry_reference=geometry,
                 psf_reference=psf,
                 content_sha256=content_sha256,
@@ -1240,6 +1250,12 @@ def test_selection_resume_binds_spacecraft_and_science_realization(tmp_path):
             "schema_version": 1,
             "verification_status": "persisted_and_verified",
             "science_conformance_claim": manifest_claim,
+            "science_conformance_claim_scope": (
+                "geometry_psf_and_jitter_selection_truth_only"
+            ),
+            "requested_science_profile_id": (
+                plan.spec.science_profile.profile_id
+            ),
             "missing_components": [],
             "artifact_root": ".",
             "source_geometry_truth": geometry,
@@ -1307,6 +1323,80 @@ def test_selection_resume_binds_spacecraft_and_science_realization(tmp_path):
             transplanted,
             api=transplanted_api,
         )
+
+
+def test_stamp_completion_rejects_selection_sidecars_from_different_run_seed(
+    tmp_path,
+) -> None:
+    from et_mainsim.workflows.stamp import (
+        _science_api,
+        run_stamp,
+        target_is_complete,
+    )
+
+    plan = _selection_sidecar_plan(tmp_path)
+    api = _complete_selection_api(_science_api())
+    run_stamp(plan, science_api=api)
+
+    assert target_is_complete(plan, 10, api=api)
+    foreign_seed_plan = replace(
+        plan,
+        spec=replace(
+            plan.spec,
+            rng=replace(
+                plan.spec.rng,
+                run_seed=plan.spec.rng.run_seed + 1,
+            ),
+        ),
+    )
+    assert not target_is_complete(foreign_seed_plan, 10, api=api)
+
+
+def test_stamp_completion_rejects_selection_manifest_identity_changes(
+    tmp_path,
+) -> None:
+    from et_mainsim.workflows.stamp import (
+        _science_api,
+        run_stamp,
+        target_is_complete,
+    )
+
+    plan = _selection_sidecar_plan(tmp_path)
+    api = _complete_selection_api(_science_api())
+    run_stamp(plan, science_api=api)
+
+    manifest_path = (
+        plan.run_dir / "stamps" / "target_10" / "target_artifacts.json"
+    )
+    original_manifest = json.loads(
+        manifest_path.read_text(encoding="utf-8")
+    )
+    for field_name, conflicting_value in (
+        ("requested_science_profile_id", "foreign-profile"),
+        ("science_conformance_claim_scope", "wrong-scope"),
+    ):
+        conflicting_manifest = json.loads(json.dumps(original_manifest))
+        conflicting_manifest["selection_truth"][field_name] = (
+            conflicting_value
+        )
+        manifest_path.write_text(
+            json.dumps(conflicting_manifest),
+            encoding="utf-8",
+        )
+        assert not target_is_complete(plan, 10, api=api)
+    manifest_path.write_text(json.dumps(original_manifest), encoding="utf-8")
+
+    foreign_profile_plan = replace(
+        plan,
+        spec=replace(
+            plan.spec,
+            science_profile=replace(
+                plan.spec.science_profile,
+                profile_id="foreign-profile",
+            ),
+        ),
+    )
+    assert not target_is_complete(foreign_profile_plan, 10, api=api)
 
 
 def test_stamp_run_identity_requires_current_product_contract(tmp_path):

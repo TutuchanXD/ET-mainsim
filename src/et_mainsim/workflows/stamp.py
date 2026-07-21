@@ -36,6 +36,9 @@ _SELECTION_ARTIFACT_SCHEMA_ID = (
     "et_mainsim.stamp_selection_truth_artifacts.v1"
 )
 _SELECTION_INDEX_SCHEMA_ID = "et_mainsim.selection_truth_index.v1"
+_SELECTION_TRUTH_SCOPE = (
+    "geometry_psf_and_jitter_selection_truth_only"
+)
 _ET_STAMP_SPACECRAFT_ID = "et"
 _ET_STAMP_ABSOLUTE_RAW_FRAME_START_INDEX = 0
 
@@ -1044,6 +1047,7 @@ class _SelectionTruthAccumulator:
         frame_indices: tuple[int, ...],
         spacecraft_id: str,
         science_realization_id: int,
+        requested_science_profile_id: str,
         absolute_raw_frame_start_index: int,
     ) -> None:
         if not frame_indices:
@@ -1052,6 +1056,11 @@ class _SelectionTruthAccumulator:
         self.frame_indices = tuple(int(value) for value in frame_indices)
         self.expected_spacecraft_id = str(spacecraft_id)
         self.expected_science_realization_id = int(science_realization_id)
+        self.expected_requested_science_profile_id = str(
+            requested_science_profile_id
+        )
+        if not self.expected_requested_science_profile_id:
+            raise ValueError("requested science profile ID must not be empty")
         self.expected_absolute_raw_frame_start_index = int(
             absolute_raw_frame_start_index
         )
@@ -1115,6 +1124,15 @@ class _SelectionTruthAccumulator:
                 ),
             }
             if self.unavailable_marker is None:
+                if (
+                    normalized["requested_science_profile_id"]
+                    != self.expected_requested_science_profile_id
+                    or normalized["science_conformance_claim_scope"]
+                    != _SELECTION_TRUTH_SCOPE
+                ):
+                    raise RuntimeError(
+                        "unavailable selection marker conflicts with plan"
+                    )
                 self.unavailable_marker = normalized
             elif self.unavailable_marker != normalized:
                 raise RuntimeError(
@@ -1234,6 +1252,10 @@ class _SelectionTruthAccumulator:
             "schema_version": 1,
             "verification_status": "persisted_and_verified",
             "science_conformance_claim": self.science_conformance_claim,
+            "science_conformance_claim_scope": _SELECTION_TRUTH_SCOPE,
+            "requested_science_profile_id": (
+                self.expected_requested_science_profile_id
+            ),
             "missing_components": [],
             "artifact_root": ".",
             "source_geometry_truth": dict(self.geometry),
@@ -1328,7 +1350,7 @@ def _validate_selection_sidecars(
             and selection.get("requested_science_profile_id")
             == plan.spec.science_profile.profile_id
             and selection.get("science_conformance_claim_scope")
-            == "geometry_psf_and_jitter_selection_truth_only"
+            == _SELECTION_TRUTH_SCOPE
         )
     if verification_status != "persisted_and_verified":
         return False
@@ -1337,6 +1359,8 @@ def _validate_selection_sidecars(
         "schema_version",
         "verification_status",
         "science_conformance_claim",
+        "science_conformance_claim_scope",
+        "requested_science_profile_id",
         "missing_components",
         "artifact_root",
         "source_geometry_truth",
@@ -1345,6 +1369,13 @@ def _validate_selection_sidecars(
     }:
         return False
     if not isinstance(selection.get("science_conformance_claim"), bool):
+        return False
+    if (
+        selection.get("science_conformance_claim_scope")
+        != _SELECTION_TRUTH_SCOPE
+        or selection.get("requested_science_profile_id")
+        != plan.spec.science_profile.profile_id
+    ):
         return False
     if selection.get("missing_components") != []:
         return False
@@ -1408,6 +1439,7 @@ def _validate_selection_sidecars(
 
     target_dir = _target_dir(plan, target_id)
     digest = hashlib.sha256()
+    expected_seed_tree = plan.spec.rng.to_seed_tree()
     for local_frame_index in raw_ids:
         absolute_raw_frame_index = raw_start + local_frame_index
         relative = api.cadence_selection_truth_relative_path(
@@ -1426,6 +1458,12 @@ def _validate_selection_sidecars(
         if truth.spacecraft_id != spacecraft_id:
             return False
         if truth.science_realization_id != science_realization_id:
+            return False
+        try:
+            truth.jitter_model_selection_truth.rng_trace_payload(
+                expected_seed_tree
+            )
+        except (AttributeError, TypeError, ValueError):
             return False
         if (
             truth.science_conformance_claim
@@ -1925,6 +1963,9 @@ def _render_target(
         spacecraft_id=_ET_STAMP_SPACECRAFT_ID,
         science_realization_id=(
             spec.science_profile.science_realization_id
+        ),
+        requested_science_profile_id=(
+            spec.science_profile.profile_id
         ),
         absolute_raw_frame_start_index=(
             _ET_STAMP_ABSOLUTE_RAW_FRAME_START_INDEX
