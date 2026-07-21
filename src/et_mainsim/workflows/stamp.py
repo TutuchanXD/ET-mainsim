@@ -1863,6 +1863,51 @@ def _source_input_psf_bundle_sha256(
     return sha256
 
 
+class _StampWriteBuffer:
+    """Bounded, retry-safe adapter for crash-safe stamp batch writes."""
+
+    __slots__ = ("writer", "batch_size", "_items")
+
+    def __init__(self, writer: Any, *, batch_size: int) -> None:
+        normalized_batch_size = int(batch_size)
+        if normalized_batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.writer = writer
+        self.batch_size = normalized_batch_size
+        self._items: list[tuple[int, int, np.ndarray, int]] = []
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._items)
+
+    def add(
+        self,
+        *,
+        star_id: int,
+        frame_id: int,
+        stamp: np.ndarray,
+        seed: int,
+    ) -> None:
+        # Torch-to-NumPy conversion can share storage.  The buffered payload
+        # must own its bytes until the delayed HDF5 write has completed.
+        owned_stamp = np.array(stamp, copy=True, order="C")
+        self._items.append(
+            (int(star_id), int(frame_id), owned_stamp, int(seed))
+        )
+        if len(self._items) >= self.batch_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._items:
+            return
+        batch = tuple(self._items)
+        # StampShardWriter.write_stamps validates the whole batch before
+        # writing and provides the durable FAILED -> resume contract.  Clear
+        # only after success so a synchronous exception cannot lose entries.
+        self.writer.write_stamps(batch)
+        self._items.clear()
+
+
 def _open_writer(
     *,
     api: Any,
@@ -1954,6 +1999,8 @@ def _render_target(
     raw_ids, coadd_ids = _expected_ids(plan)
     raw_writer = None
     coadd_writer = None
+    raw_write_buffer = None
+    coadd_write_buffer = None
     raw_path = target_dir / "raw.h5"
     coadd_path = target_dir / "coadd.h5"
     truth_rows: list[dict[str, Any]] = []
@@ -2006,6 +2053,11 @@ def _render_target(
                     product_schema=first_raw.to_schema_dict(),
                     source_input_truth=source_input_truth,
                 )
+                if raw_writer is not None:
+                    raw_write_buffer = _StampWriteBuffer(
+                        raw_writer,
+                        batch_size=plan.workload.write_batch_size,
+                    )
             if (
                 plan.workload.save_coadd
                 and coadd_writer is None
@@ -2024,6 +2076,11 @@ def _render_target(
                     product_schema=None,
                     source_input_truth=source_input_truth,
                 )
+                if coadd_writer is not None:
+                    coadd_write_buffer = _StampWriteBuffer(
+                        coadd_writer,
+                        batch_size=plan.workload.write_batch_size,
+                    )
 
             for raw_result in result.raw_results:
                 selection_truth.add(raw_result)
@@ -2049,10 +2106,12 @@ def _render_target(
                 if raw_writer is not None and raw_writer.item_status(
                     target_id, frame_id
                 ) != api.ItemStatus.COMPLETE:
-                    raw_writer.write_stamp(
-                        target_id,
-                        frame_id,
-                        _to_numpy(products.final_stamp.array),
+                    if raw_write_buffer is None:
+                        raise RuntimeError("raw stamp write buffer is unavailable")
+                    raw_write_buffer.add(
+                        star_id=target_id,
+                        frame_id=frame_id,
+                        stamp=_to_numpy(products.final_stamp.array),
                         seed=spec.rng.run_seed,
                     )
                 if plan.workload.save_electron_components:
@@ -2075,16 +2134,24 @@ def _render_target(
             if coadd_writer is not None and coadd_writer.item_status(
                 target_id, coadd_index
             ) != api.ItemStatus.COMPLETE:
-                coadd_writer.write_stamp(
-                    target_id,
-                    coadd_index,
-                    coadd_array,
+                if coadd_write_buffer is None:
+                    raise RuntimeError("coadd stamp write buffer is unavailable")
+                coadd_write_buffer.add(
+                    star_id=target_id,
+                    frame_id=coadd_index,
+                    stamp=coadd_array,
                     seed=spec.rng.run_seed,
                 )
         if raw_writer is not None:
+            if raw_write_buffer is None:
+                raise RuntimeError("raw stamp write buffer is unavailable")
+            raw_write_buffer.flush()
             raw_writer.finalize()
             raw_writer = None
         if coadd_writer is not None:
+            if coadd_write_buffer is None:
+                raise RuntimeError("coadd stamp write buffer is unavailable")
+            coadd_write_buffer.flush()
             coadd_writer.finalize()
             coadd_writer = None
         truth_identity = _write_source_variability_truth(
@@ -2312,6 +2379,10 @@ def _stamp_product_contract() -> dict[str, Any]:
 
 def _workload_identity(plan: StampRunPlan) -> dict[str, Any]:
     payload = plan.workload.to_dict()
+    # HDF5 batch size is an I/O scheduling control.  Excluding it preserves
+    # the existing scientific/product identity and permits a partial shard to
+    # resume with a different memory/performance tuning value.
+    payload.pop("write_batch_size", None)
     payload["product_contract"] = _stamp_product_contract()
     if plan.workload.input_mode != "table":
         return payload
@@ -2397,6 +2468,7 @@ def run_stamp(
                 "force_catalog_cache": (
                     plan.run_config.execution.force_catalog_cache
                 ),
+                "write_batch_size": plan.workload.write_batch_size,
             }
         )
         prepared = prepare_stamp_inputs(plan, science_api=api)

@@ -118,6 +118,12 @@ PSF-selection sidecar is still part of the remaining Stage 2 work.
 `save_raw` and `save_coadd` control both the HDF5 shard and its schema
 directory. Electron-domain component NPZ files remain an independent opt-in.
 
+`write_batch_size` controls the bounded raw/coadd HDF5 write buffer and
+defaults to 32. The last, shorter batch is flushed before shard finalization.
+This is an I/O and memory tuning value, not part of the scientific/product
+identity, so it may be changed when resuming a partial run; each attempt records
+the value it actually used.
+
 Resume validates the final HDF5 shard, logical IDs, frame IDs, completion
 status, all expected schema sidecars, and the variability truth table. Truth
 validation includes exact frame/source coverage, finite non-negative factors,

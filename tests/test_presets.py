@@ -178,6 +178,7 @@ def test_shipped_stamp_presets_fix_local_query_and_coadd_contract() -> None:
     assert smoke.simulation_spec.observation.n_raw_frames_per_coadd == 2
     assert isinstance(smoke.run_config.workload, StampWorkload)
     assert smoke.run_config.workload.stamp_shape == (15, 15)
+    assert smoke.run_config.workload.write_batch_size == 32
 
     spec = production.simulation_spec
     assert spec.detector.shape == (9120, 8900)
@@ -187,6 +188,7 @@ def test_shipped_stamp_presets_fix_local_query_and_coadd_contract() -> None:
     assert spec.catalog.query_options["query_radius_deg"] == pytest.approx(0.07)
     assert spec.psf.mode == "stamp"
     assert production.run_config.workload.include_neighbors is True
+    assert production.run_config.workload.write_batch_size == 32
 
 
 def test_production_presets_select_temperature_driven_dynamics() -> None:

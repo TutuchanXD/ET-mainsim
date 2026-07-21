@@ -318,6 +318,7 @@ class StampWorkload:
     save_raw: bool = True
     save_coadd: bool = True
     save_electron_components: bool = False
+    write_batch_size: int = 32
 
     def __post_init__(self) -> None:
         kind = str(self.kind).strip().lower()
@@ -341,10 +342,17 @@ class StampWorkload:
         rows = int(self.stamp_rows)
         cols = int(self.stamp_cols)
         target_limit = int(self.target_limit)
+        write_batch_size = self.write_batch_size
         if rows <= 0 or cols <= 0:
             raise ValueError("stamp_rows and stamp_cols must be positive")
         if target_limit < 0:
             raise ValueError("target_limit must be non-negative")
+        if (
+            isinstance(write_batch_size, bool)
+            or not isinstance(write_batch_size, Integral)
+            or int(write_batch_size) <= 0
+        ):
+            raise ValueError("write_batch_size must be a positive integer")
         if not bool(self.save_raw) and not bool(self.save_coadd):
             raise ValueError("stamp workload must save raw, coadd, or both")
         target_ids = tuple(
@@ -366,6 +374,7 @@ class StampWorkload:
             "save_electron_components",
             bool(self.save_electron_components),
         )
+        object.__setattr__(self, "write_batch_size", int(write_batch_size))
 
     @property
     def stamp_shape(self) -> tuple[int, int]:
