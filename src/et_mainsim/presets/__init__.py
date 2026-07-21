@@ -152,6 +152,7 @@ def _load_science(descriptor: PresetDescriptor, package_files: Any) -> tuple[Any
         if descriptor.profile == "smoke":
             spec = replace(
                 base,
+                instrument=replace(base.instrument, telescope_count=1),
                 observation=replace(
                     base.observation,
                     observing_duration=20 * u.s,
@@ -175,6 +176,7 @@ def _load_science(descriptor: PresetDescriptor, package_files: Any) -> tuple[Any
             )
             spec = replace(
                 base,
+                instrument=replace(base.instrument, telescope_count=1),
                 observation=replace(
                     base.observation,
                     observing_duration=3600 * u.s,

@@ -62,7 +62,7 @@ assert 'ray' not in sys.modules
 def test_project_requires_shared_exposure_photsim7_release() -> None:
     payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "photsim7>=0.2.2,<0.3" in payload["project"]["dependencies"]
+    assert "photsim7>=0.2.3,<0.3" in payload["project"]["dependencies"]
 
 
 def test_required_photsim7_runtime_capabilities_are_importable() -> None:
@@ -173,6 +173,7 @@ def test_shipped_stamp_presets_fix_local_query_and_coadd_contract() -> None:
     smoke = load_preset("et-stamp-smoke")
     production = load_preset("et-stamp-production")
 
+    assert smoke.simulation_spec.instrument.telescope_count == 1
     assert smoke.simulation_spec.psf.mode == "stamp"
     assert smoke.simulation_spec.observation.resolved_n_frames == 2
     assert smoke.simulation_spec.observation.n_raw_frames_per_coadd == 2
@@ -181,6 +182,7 @@ def test_shipped_stamp_presets_fix_local_query_and_coadd_contract() -> None:
     assert smoke.run_config.workload.write_batch_size == 32
 
     spec = production.simulation_spec
+    assert spec.instrument.telescope_count == 1
     assert spec.detector.shape == (9120, 8900)
     assert spec.detector.n_subpixels == 7
     assert spec.observation.resolved_n_frames == 360

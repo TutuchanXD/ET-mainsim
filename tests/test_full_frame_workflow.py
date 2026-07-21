@@ -96,6 +96,89 @@ def _legacy_single_scope_spec(spec):
     )
 
 
+def test_scope_persistence_reuses_persisted_selection_metadata_in_provenance() -> None:
+    from et_mainsim.workflows.full_frame import _persist_scope_frame_result
+    from photsim7.frame_products import FrameArrayProduct, SingleCadenceFrameProducts
+
+    in_memory_selection = {
+        "schema_id": "photsim7.cadence_selection_truth.v1",
+        "verification_status": "complete_in_memory",
+    }
+    product = SingleCadenceFrameProducts(
+        frame_index=0,
+        detector_id="main_rd",
+        final_frame=FrameArrayProduct(
+            name="final_frame",
+            array=np.zeros((3, 5), dtype=np.uint16),
+            unit="dn",
+            domain="dn",
+        ),
+        frame_summary={"frame_index": 0},
+        selection_truth=in_memory_selection,
+        provenance={
+            "services": {"scope": {"scope_id": 0, "scope_count": 6}},
+            "selection_truth": in_memory_selection,
+        },
+    )
+    truth = SimpleNamespace(
+        schema_id="photsim7.cadence_selection_truth.v1",
+        schema_version=1,
+        science_conformance_claim=True,
+        content_sha256="a" * 64,
+        geometry_reference={"content_sha256": "b" * 64},
+        psf_reference={"content_sha256": "c" * 64},
+        jitter_model_selection_truth=SimpleNamespace(
+            to_json_dict=lambda: {"model_index": 4}
+        ),
+    )
+
+    def identity(label: str, digest: str):
+        return SimpleNamespace(
+            relative_path=f"selection_truth/{label}/{digest}.json",
+            schema_id=f"test.{label}.v1",
+            schema_version=1,
+            content_sha256=digest * 64,
+        )
+
+    artifacts = SimpleNamespace(
+        geometry=identity("geometry", "b"),
+        psf=identity("psf", "c"),
+        cadence=identity("cadence", "a"),
+    )
+
+    class RecordingWriter:
+        written_product = None
+
+        def write_selection_truth(self, value):
+            assert value is truth
+            return artifacts
+
+        def write_frame(self, *args, **kwargs):
+            return None
+
+        def write_frame_product_schema(self, value):
+            self.written_product = value
+
+    writer = RecordingWriter()
+    result = SimpleNamespace(
+        frame_products=product,
+        selection_truth=truth,
+        detector_result=SimpleNamespace(cosmic_metadata=None, bias_metadata=None),
+    )
+    spec = SimpleNamespace(
+        science_profile=SimpleNamespace(profile_id="legacy_science_v1")
+    )
+
+    _persist_scope_frame_result(writer=writer, result=result, spec=spec)
+
+    persisted = writer.written_product.selection_truth
+    assert persisted["verification_status"] == "persisted_and_verified"
+    assert writer.written_product.provenance["selection_truth"] is persisted
+    assert writer.written_product.provenance["services"] == {
+        "scope": {"scope_id": 0, "scope_count": 6}
+    }
+
+
 def test_resume_requires_frame_summary_schema_and_matching_shape(tmp_path) -> None:
     from et_mainsim.workflows.full_frame import frame_is_complete
     from photsim7.spec_factories import make_et_main_detector_spec

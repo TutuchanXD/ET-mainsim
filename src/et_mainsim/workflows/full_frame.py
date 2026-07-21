@@ -935,13 +935,17 @@ def _persist_scope_frame_result(
     selection_truth = getattr(result, "selection_truth", None)
     if selection_truth is not None:
         artifacts = writer.write_selection_truth(selection_truth)
+        persisted_selection = _persisted_selection_metadata(
+            spec,
+            selection_truth,
+            artifacts,
+        )
+        provenance = dict(product.provenance or {})
+        provenance["selection_truth"] = persisted_selection
         product = replace(
             product,
-            selection_truth=_persisted_selection_metadata(
-                spec,
-                selection_truth,
-                artifacts,
-            ),
+            selection_truth=persisted_selection,
+            provenance=provenance,
         )
     detector_result = result.detector_result
     writer.write_frame(

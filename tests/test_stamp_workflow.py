@@ -154,6 +154,52 @@ def test_table_stamp_plan_does_not_require_full_frame_catalog_assets(tmp_path) -
     assert not plan.run_dir.exists()
 
 
+@pytest.mark.parametrize(
+    "preset_name",
+    ["et-stamp-smoke", "et-stamp-production"],
+)
+def test_shipped_stamp_preset_preflights_without_scope_rewrite(
+    tmp_path,
+    preset_name,
+) -> None:
+    from et_mainsim.presets import load_preset
+    from et_mainsim.workflows.stamp import build_run_plan, preflight
+
+    loaded = load_preset(preset_name)
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    table_path = tmp_path / "targets.csv"
+    table_path.write_text("gaia_g_mag,psf_id\n12.0,0\n", encoding="utf-8")
+    config = replace(
+        loaded.run_config,
+        paths=replace(
+            loaded.run_config.paths,
+            output_root=str(tmp_path / "output"),
+            data_root=str(data_root),
+            catalog_path="",
+            focalplane_registry="",
+        ),
+        workload=replace(
+            loaded.run_config.workload,
+            input_mode="table",
+            input_table=str(table_path),
+            variability_table="",
+            include_neighbors=False,
+        ),
+    )
+    plan = build_run_plan(
+        preset_name=preset_name,
+        run_config=config,
+        spec=loaded.simulation_spec,
+        repo_root=tmp_path,
+    )
+
+    preflight(plan)
+
+    assert plan.spec.instrument.telescope_count == 1
+    assert not plan.run_dir.exists()
+
+
 def test_independent_stamp_rejects_six_scope_spec_before_writing_artifacts(
     tmp_path,
 ) -> None:
