@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pickle
+from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -33,8 +34,10 @@ def _plan(tmp_path):
 
 
 class _FakeSimulator:
-    def __init__(self, calls):
+    def __init__(self, calls, contract, manifest_mutator=None):
         self.calls = calls
+        self.contract = contract
+        self.manifest_mutator = manifest_mutator
 
     def __enter__(self):
         return self
@@ -65,32 +68,50 @@ class _FakeSimulator:
             for name, value in payloads.items():
                 with (run_dir / name).open("wb") as handle:
                     pickle.dump(value, handle)
+            manifest = deepcopy(self.contract.to_metadata())
+            if self.manifest_mutator is not None:
+                self.manifest_mutator(manifest)
             (run_dir / "legacy_effect_manifest.json").write_text(
-                json.dumps(
-                    {
-                        "schema_id": "photsim7.legacy_full_effects.v1",
-                        "schema_version": 1,
-                        "effects": [
-                            {"enabled": True} for _ in range(23)
-                        ]
-                        + [{"enabled": False} for _ in range(4)],
-                    }
-                ),
-                encoding="utf-8",
+                json.dumps(manifest), encoding="utf-8"
             )
 
 
-def _fake_api(calls):
+def _fake_api(calls, *, manifest_mutator=None):
     class Runtime:
+        def __init__(self, contract):
+            self.contract = contract
+
         def build_simulator(self, **kwargs):
             calls.append(("build_simulator", kwargs))
-            return _FakeSimulator(calls)
+            return _FakeSimulator(
+                calls,
+                self.contract,
+                manifest_mutator=manifest_mutator,
+            )
 
     return SimpleNamespace(
         DataRegistry=lambda **kwargs: SimpleNamespace(**kwargs),
-        build_runtime=lambda contract, **kwargs: Runtime(),
+        build_runtime=lambda contract, **kwargs: Runtime(contract),
         read_effect_manifest=lambda path: json.loads(path.read_text(encoding="utf-8")),
     )
+
+
+def _rename_thermal_effect(manifest) -> None:
+    thermal = next(
+        effect
+        for effect in manifest["effects"]
+        if effect["effect_id"] == "motion.thermal"
+    )
+    thermal["effect_id"] = "motion.thermal.renamed"
+
+
+def _change_thermal_effect_payload(manifest) -> None:
+    thermal = next(
+        effect
+        for effect in manifest["effects"]
+        if effect["effect_id"] == "motion.thermal"
+    )
+    thermal["parameters"]["profile"] = "tampered-profile"
 
 
 def test_legacy_run_validates_outputs_and_whole_workload_resume(tmp_path) -> None:
@@ -116,6 +137,39 @@ def test_legacy_run_validates_outputs_and_whole_workload_resume(tmp_path) -> Non
     assert second["completion"]["rendered_runs"] == 0
     assert second["completion"]["skipped_runs"] == 1
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "manifest_mutator",
+    [_rename_thermal_effect, _change_thermal_effect_payload],
+    ids=["effect-id", "effect-payload"],
+)
+def test_legacy_output_validation_rejects_effect_contract_drift(
+    tmp_path,
+    manifest_mutator,
+) -> None:
+    from et_mainsim.workflows.legacy import _validate_run
+
+    plan = _plan(tmp_path)
+    plan.legacy_root.mkdir(parents=True)
+    _FakeSimulator(
+        [],
+        plan.contract,
+        manifest_mutator=manifest_mutator,
+    ).run(
+        sim_save_dir=plan.legacy_root,
+        run_count=1,
+        n_stars_per_run=1,
+    )
+
+    summary = _validate_run(
+        plan.legacy_root / "run_0",
+        workload=plan.workload,
+        api=_fake_api([]),
+        expected_effects=plan.contract.to_metadata()["effects"],
+    )
+
+    assert summary is None
 
 
 def test_legacy_resume_fails_closed_on_partial_completed_run(tmp_path) -> None:

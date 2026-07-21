@@ -90,9 +90,7 @@ def test_cli_stamp_table_dry_run_is_read_only_and_query_independent(
     from et_mainsim.cli import main
 
     table = tmp_path / "targets.csv"
-    table.write_text(
-        "gaia_g_mag,psf_id,curve_id\n12.0,0,sn\n", encoding="utf-8"
-    )
+    table.write_text("gaia_g_mag,psf_id,curve_id\n12.0,0,sn\n", encoding="utf-8")
     curves = tmp_path / "curves.csv"
     curves.write_text(
         "curve_id,frame_index,relative_flux\nsn,0,1\nsn,1,2\n",
@@ -151,5 +149,51 @@ def test_cli_legacy_dry_run_exposes_full_effect_workload(tmp_path, capsys) -> No
     assert plan["workflow"] == "legacy-sim"
     assert plan["workload"]["stars_per_run"] == 3
     effects = plan["effect_contract"]["effects"]
-    assert sum(item["enabled"] for item in effects) == 23
-    assert sum(not item["enabled"] for item in effects) == 4
+    effects_by_id = {item["effect_id"]: item for item in effects}
+    expected_enabled = {
+        "scene.target_star",
+        "scene.background_stars",
+        "noise.stellar_photon",
+        "noise.background",
+        "noise.scattered",
+        "noise.dark_current",
+        "noise.readout",
+        "gain.scripted",
+        "gain.whole_pixel_normal",
+        "gain.whole_pixel_sinusoidal",
+        "motion.et_psd_low_frequency",
+        "motion.dva",
+        "motion.thermal",
+        "motion.momentum_dump",
+        "psf.jitter_integrated_high_frequency",
+        "psf.breathing",
+        "pixel_response.inter_pixel",
+        "pixel_response.intra_pixel",
+        "pixel_response.pixel_phase",
+        "reduction.coadding",
+        "reduction.kepler_optimal_aperture",
+        "reduction.oa_helper_variants",
+    }
+    expected_disabled = {
+        "motion.tess_roll_low_frequency",
+        "calibration.flat_field",
+        "filter.pixel_flux",
+        "scene.transit_injection",
+        "detector.cosmic_rays",
+    }
+    assert {
+        effect_id for effect_id, effect in effects_by_id.items() if effect["enabled"]
+    } == expected_enabled
+    assert {
+        effect_id
+        for effect_id, effect in effects_by_id.items()
+        if not effect["enabled"]
+    } == expected_disabled
+    assert set(effects_by_id) == expected_enabled | expected_disabled
+    tess_roll = effects_by_id["motion.tess_roll_low_frequency"]
+    assert tess_roll["parameters"] == {
+        "asset": "",
+        "profile": "et_attitude_xyz",
+        "reason": "profile 'et_attitude_xyz' does not consume a TESS PSD",
+        "xy_amplitude_multiplier": 1.0,
+    }

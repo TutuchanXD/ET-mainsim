@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import pickle
 import shutil
@@ -158,9 +159,7 @@ def rebuild_contract(
         ),
         float_precision=spec.psf.float_precision,
         observing_duration=observing_duration,
-        n_jitter_integrated_psf_models=(
-            spec.psf.n_jitter_integrated_psf_models
-        ),
+        n_jitter_integrated_psf_models=(spec.psf.n_jitter_integrated_psf_models),
         n_jitter_frames_per_model=spec.psf.n_jitter_frames_per_model,
         n_raw_frames_per_coadd=contract.n_raw_frames_per_coadd,
         telescope_count=spec.instrument.telescope_count,
@@ -232,11 +231,38 @@ def _target_et_magnitudes(
     )
 
 
+def _canonical_effect_inventory(effects: Any) -> dict[str, str] | None:
+    if not isinstance(effects, (list, tuple)):
+        return None
+    inventory: dict[str, str] = {}
+    for effect in effects:
+        if not isinstance(effect, Mapping):
+            return None
+        effect_id = effect.get("effect_id")
+        if not isinstance(effect_id, str) or not effect_id.strip():
+            return None
+        if effect_id in inventory:
+            return None
+        try:
+            canonical_payload = json.dumps(
+                effect,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError):
+            return None
+        inventory[effect_id] = canonical_payload
+    return inventory
+
+
 def _validate_run(
     run_dir: Path,
     *,
     workload: LegacyWorkload,
     api: Any,
+    expected_effects: Any,
 ) -> dict[str, Any] | None:
     required = _required_files(workload)
     if not run_dir.is_dir() or not required.issubset(
@@ -249,13 +275,17 @@ def _validate_run(
             for name in required
             if name.endswith(".pkl")
         }
-        manifest = api.read_effect_manifest(
-            run_dir / "legacy_effect_manifest.json"
-        )
+        manifest = api.read_effect_manifest(run_dir / "legacy_effect_manifest.json")
+        actual_inventory = _canonical_effect_inventory(manifest.get("effects"))
+        expected_inventory = _canonical_effect_inventory(expected_effects)
+        if (
+            actual_inventory is None
+            or expected_inventory is None
+            or actual_inventory != expected_inventory
+        ):
+            return None
         enabled = sum(bool(item["enabled"]) for item in manifest["effects"])
         disabled = sum(not bool(item["enabled"]) for item in manifest["effects"])
-        if (enabled, disabled) != (23, 4):
-            return None
         light_curves = np.asarray(values["light_curves.pkl"])
         centroids = np.asarray(values["centroids.pkl"])
         apertures = np.asarray(values["apertures.pkl"])
@@ -292,11 +322,13 @@ def _validate_run(
 
 def _validate_all_runs(plan: LegacyRunPlan, api: Any) -> list[dict[str, Any]] | None:
     summaries = []
+    expected_effects = plan.contract.to_metadata().get("effects")
     for run_index in range(plan.workload.run_count):
         summary = _validate_run(
             plan.legacy_root / f"run_{run_index}",
             workload=plan.workload,
             api=api,
+            expected_effects=expected_effects,
         )
         if summary is None:
             return None
@@ -321,8 +353,7 @@ def _target_rows(plan: LegacyRunPlan) -> list[dict[str, float]]:
         size=workload.stars_per_run,
     )
     return [
-        {"x0": 0.0, "y0": 0.0, "et_mag": float(magnitude)}
-        for magnitude in magnitudes
+        {"x0": 0.0, "y0": 0.0, "et_mag": float(magnitude)} for magnitude in magnitudes
     ]
 
 
@@ -330,9 +361,7 @@ def _target_rows(plan: LegacyRunPlan) -> list[dict[str, float]]:
 def _runtime_environment(plan: LegacyRunPlan) -> Iterator[None]:
     updates = {"ET_DATA_DIR": str(plan.paths.data_root)}
     if plan.run_config.execution.gpu_ids:
-        updates["CUDA_VISIBLE_DEVICES"] = ",".join(
-            plan.run_config.execution.gpu_ids
-        )
+        updates["CUDA_VISIBLE_DEVICES"] = ",".join(plan.run_config.execution.gpu_ids)
     previous = {name: os.environ.get(name) for name in updates}
     os.environ.update(updates)
     try:
