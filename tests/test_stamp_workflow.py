@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
+import hashlib
 import json
 import pickle
 
@@ -368,6 +369,274 @@ def test_coordinate_target_selects_nearest_radial_psf_and_records_mapping(
     assert "focalplane_registry" in prepared.input_identities
 
 
+def test_table_targets_attach_row_local_geometry_declarations(
+    tmp_path, monkeypatch
+) -> None:
+    import et_mainsim.stamp_inputs as stamp_inputs
+    import photsim7.geometry_truth as geometry_truth
+    from et_mainsim.config import RunPaths
+    from et_mainsim.workflows.stamp import _target_spec, prepare_stamp_inputs
+
+    if not hasattr(geometry_truth, "reference_field_nonphysical_declaration"):
+        def expected_reference_declaration(**parameters):
+            return {
+                "schema_id": "photsim7.source_geometry_declaration.v1",
+                "schema_version": 1,
+                "mode": "reference_field_nonphysical",
+                "physical_geometry_claim": False,
+                **parameters,
+            }
+
+        monkeypatch.setattr(
+            geometry_truth,
+            "reference_field_nonphysical_declaration",
+            expected_reference_declaration,
+            raising=False,
+        )
+
+    plan = _variable_table_plan(
+        tmp_path,
+        target_body=(
+            "source_id,gaia_g_mag,ra_deg,dec_deg,psf_id,curve_id\n"
+            "10,12.0,123.0,-20.0,,sn\n"
+            "11,13.0,,,6,\n"
+        ),
+    )
+    registry = tmp_path / "focalplane" / "data"
+    registry.mkdir(parents=True)
+    (registry / "fov.csv").write_text("x\n1\n", encoding="utf-8")
+    plan = replace(
+        plan,
+        paths=replace(plan.paths, focalplane_registry=registry),
+        run_config=replace(
+            plan.run_config,
+            paths=RunPaths(
+                **{
+                    **plan.run_config.paths.__dict__,
+                    "focalplane_registry": str(registry),
+                }
+            ),
+        ),
+    )
+    plan.paths.data_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        stamp_inputs,
+        "_sky_to_focal",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="ok",
+            detector_id="main_rd",
+            xpix=30.0,
+            ypix=31.0,
+            field_x_deg=5.0,
+            field_y_deg=6.0,
+            residual_arcsec=0.02,
+        ),
+    )
+    api = _fake_table_api()
+    api.load_psf_bundle = lambda *args, **kwargs: {
+        "images": {0: object(), 4: object(), 6: object()},
+        "angles": np.array([0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0]),
+    }
+
+    prepared = prepare_stamp_inputs(plan, science_api=api)
+
+    physical_catalog = prepared.catalogs[10]
+    physical = physical_catalog.metadata["geometry"]
+    assert physical["mode"] == "physical_et_focalplane"
+    assert physical["physical_geometry_claim"] is True
+    assert physical["coordinate_frame"] == "icrs"
+    assert physical["coordinate_epoch_jyear"] == pytest.approx(2000.0)
+    assert physical["registry_data_dir"] == str(registry)
+    assert physical["focalplane_registry_identity"] == (
+        prepared.input_identities["focalplane_registry"]
+    )
+    assert len(physical["focalplane_registry_identity"]["sha256"]) == 64
+    np.testing.assert_allclose(
+        physical_catalog.star_data["icrs_ra_deg"], [123.0]
+    )
+    np.testing.assert_allclose(
+        physical_catalog.star_data["icrs_dec_deg"], [-20.0]
+    )
+    np.testing.assert_allclose(
+        physical_catalog.star_data["target_epoch"], [2000.0]
+    )
+
+    explicit_catalog = prepared.catalogs[11]
+    reference = explicit_catalog.metadata["geometry"]
+    assert reference["mode"] == "reference_field_nonphysical"
+    assert reference["physical_geometry_claim"] is False
+    assert reference["reference_field_angle_deg"] == pytest.approx(12.0)
+    assert reference["reference_field_polar_angle_rad"] == pytest.approx(
+        np.pi / 4.0
+    )
+    assert reference["reference_pixel_scale_arcsec_per_pix"] == pytest.approx(
+        4.83
+    )
+    assert reference["reference_x_axis_sign"] == pytest.approx(1.0)
+    assert reference["reference_y_axis_sign"] == pytest.approx(1.0)
+    assert "focalplane_registry_identity" not in reference
+    assert physical is not reference
+    assert prepared.source_input_truth[10]["schema_id"] == (
+        "et_mainsim.stamp_source_input_truth.v2"
+    )
+    assert prepared.source_input_truth[10]["schema_version"] == 2
+    assert (
+        prepared.source_input_truth[10]["focalplane_registry_identity"]
+        == prepared.input_identities["focalplane_registry"]
+    )
+    assert prepared.source_input_truth[10]["location"][
+        "coordinate_epoch_jyear"
+    ] == pytest.approx(2000.0)
+    assert prepared.source_input_truth[11]["focalplane_registry_identity"] is None
+    assert (
+        prepared.source_input_truth[11]["location"]["coordinate_epoch_jyear"]
+        is None
+    )
+
+    coordinate_spec = _target_spec(
+        plan,
+        target=prepared.targets[10],
+        psf_id=prepared.psf_ids[10],
+    )
+    assert coordinate_spec.psf.field_id == "nearest"
+    assert coordinate_spec.psf.field_id_policy == "nearest"
+
+    target_spec = _target_spec(
+        plan,
+        target=prepared.targets[11],
+        psf_id=prepared.psf_ids[11],
+    )
+    assert target_spec.catalog.query_options == {
+        "reference_field_angle_deg": pytest.approx(12.0),
+        "reference_field_polar_angle_rad": pytest.approx(np.pi / 4.0),
+        "reference_pixel_scale_arcsec_per_pix": pytest.approx(4.83),
+        "reference_x_axis_sign": pytest.approx(1.0),
+        "reference_y_axis_sign": pytest.approx(1.0),
+    }
+
+
+def test_table_mode_rejects_non_j2000_epoch_before_preparation(tmp_path) -> None:
+    from et_mainsim.presets import load_preset
+    from et_mainsim.workflows.stamp import build_run_plan
+
+    loaded = load_preset("et-stamp-smoke")
+    table_path = tmp_path / "targets.csv"
+    table_path.write_text("gaia_g_mag,psf_id\n12.0,6\n", encoding="utf-8")
+    config = replace(
+        loaded.run_config,
+        paths=replace(
+            loaded.run_config.paths,
+            output_root=str(tmp_path / "output"),
+            data_root=str(tmp_path / "data"),
+            catalog_path="",
+            focalplane_registry="",
+        ),
+        workload=replace(
+            loaded.run_config.workload,
+            input_mode="table",
+            input_table=str(table_path),
+            include_neighbors=False,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="J2000.*2000"):
+        build_run_plan(
+            preset_name="et-stamp-smoke",
+            run_config=config,
+            spec=loaded.simulation_spec,
+            repo_root=tmp_path,
+            target_epoch_jyear=2016.0,
+        )
+
+
+def test_table_target_spec_uses_independent_accepted_psf_bundle_sha256(
+    tmp_path, monkeypatch
+) -> None:
+    import et_mainsim.workflows.stamp as stamp_workflow
+
+    expected_sha256 = "a" * 64
+    plan = _variable_table_plan(
+        tmp_path,
+        target_body=(
+            "source_id,gaia_g_mag,psf_id,curve_id\n"
+            "10,12.0,0,sn\n"
+        ),
+    )
+    plan = replace(
+        plan,
+        spec=replace(
+            plan.spec,
+            psf=replace(plan.spec.psf, bundle_sha256=expected_sha256),
+        ),
+    )
+    plan.paths.data_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        stamp_workflow,
+        "_psf_bundle_asset_identity",
+        lambda _plan: {
+            "path": "/frozen/sim_psf_images.pkl",
+            "size_bytes": 123,
+            "sha256": expected_sha256,
+        },
+    )
+    prepared = stamp_workflow.prepare_stamp_inputs(
+        plan,
+        science_api=_fake_table_api(),
+    )
+
+    target_spec = stamp_workflow._target_spec(
+        plan,
+        target=prepared.targets[10],
+        psf_id=prepared.psf_ids[10],
+        source_input_truth=prepared.source_input_truth[10],
+    )
+
+    assert target_spec.psf.bundle_sha256 == expected_sha256
+
+
+def test_table_target_spec_rejects_observed_psf_hash_mismatch(
+    tmp_path, monkeypatch
+) -> None:
+    import et_mainsim.workflows.stamp as stamp_workflow
+
+    plan = _variable_table_plan(
+        tmp_path,
+        target_body=(
+            "source_id,gaia_g_mag,psf_id,curve_id\n"
+            "10,12.0,0,sn\n"
+        ),
+    )
+    plan = replace(
+        plan,
+        spec=replace(
+            plan.spec,
+            psf=replace(plan.spec.psf, bundle_sha256="a" * 64),
+        ),
+    )
+    plan.paths.data_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        stamp_workflow,
+        "_psf_bundle_asset_identity",
+        lambda _plan: {
+            "path": "/changed/sim_psf_images.pkl",
+            "size_bytes": 123,
+            "sha256": "b" * 64,
+        },
+    )
+    prepared = stamp_workflow.prepare_stamp_inputs(
+        plan,
+        science_api=_fake_table_api(),
+    )
+
+    with pytest.raises(ValueError, match="accepted SimulationSpec identity"):
+        stamp_workflow._target_spec(
+            plan,
+            target=prepared.targets[10],
+            psf_id=prepared.psf_ids[10],
+            source_input_truth=prepared.source_input_truth[10],
+        )
+
+
 def test_catalog_stamp_inputs_select_requested_targets_from_one_shared_scene(tmp_path) -> None:
     from photsim7.catalog_sources import PreparedStarCatalog
     from et_mainsim.presets import load_preset
@@ -429,7 +698,10 @@ def _write_test_psf_bundle(data_root):
             },
             handle,
         )
-    return bundle_name
+    bundle_sha256 = hashlib.sha256(
+        (bundle_dir / "sim_psf_images.pkl").read_bytes()
+    ).hexdigest()
+    return bundle_name, bundle_sha256
 
 
 def test_stamp_run_writes_readable_raw_coadd_truth_and_resumes(tmp_path) -> None:
@@ -439,11 +711,15 @@ def test_stamp_run_writes_readable_raw_coadd_truth_and_resumes(tmp_path) -> None
 
     loaded = load_preset("et-stamp-smoke")
     data_root = tmp_path / "data"
-    bundle_name = _write_test_psf_bundle(data_root)
+    bundle_name, bundle_sha256 = _write_test_psf_bundle(data_root)
     spec = replace(
         loaded.simulation_spec,
         detector=replace(loaded.simulation_spec.detector, n_subpixels=3),
-        psf=replace(loaded.simulation_spec.psf, bundle_name=bundle_name),
+        psf=replace(
+            loaded.simulation_spec.psf,
+            bundle_name=bundle_name,
+            bundle_sha256=bundle_sha256,
+        ),
         observation=replace(
             loaded.simulation_spec.observation,
             exposure_duration=10 * u.s,
@@ -609,13 +885,17 @@ def test_variable_table_run_persists_numeric_truth_provenance_and_digest(
         ),
     )
     data_root = plan.paths.data_root
-    bundle_name = _write_test_psf_bundle(data_root)
+    bundle_name, bundle_sha256 = _write_test_psf_bundle(data_root)
     plan = replace(
         plan,
         spec=replace(
             plan.spec,
             detector=replace(plan.spec.detector, n_subpixels=3),
-            psf=replace(plan.spec.psf, bundle_name=bundle_name),
+            psf=replace(
+                plan.spec.psf,
+                bundle_name=bundle_name,
+                bundle_sha256=bundle_sha256,
+            ),
         ),
     )
 
@@ -670,7 +950,9 @@ def test_variable_table_local_subprocess_worker_preserves_input_contract(
             "source_id,gaia_g_mag,psf_id,curve_id\n10,12.0,0,sn\n"
         ),
     )
-    bundle_name = _write_test_psf_bundle(plan.paths.data_root)
+    bundle_name, bundle_sha256 = _write_test_psf_bundle(
+        plan.paths.data_root
+    )
     plan = replace(
         plan,
         run_config=replace(
@@ -684,7 +966,11 @@ def test_variable_table_local_subprocess_worker_preserves_input_contract(
         spec=replace(
             plan.spec,
             detector=replace(plan.spec.detector, n_subpixels=3),
-            psf=replace(plan.spec.psf, bundle_name=bundle_name),
+            psf=replace(
+                plan.spec.psf,
+                bundle_name=bundle_name,
+                bundle_sha256=bundle_sha256,
+            ),
         ),
     )
 
@@ -718,13 +1004,17 @@ def test_stamp_resume_rejects_changed_direct_target_table(tmp_path) -> None:
 
     loaded = load_preset("et-stamp-smoke")
     data_root = tmp_path / "data"
-    bundle_name = _write_test_psf_bundle(data_root)
+    bundle_name, bundle_sha256 = _write_test_psf_bundle(data_root)
     table_path = tmp_path / "targets.csv"
     table_path.write_text("gaia_g_mag,psf_id\n12.0,0\n", encoding="utf-8")
     spec = replace(
         loaded.simulation_spec,
         detector=replace(loaded.simulation_spec.detector, n_subpixels=3),
-        psf=replace(loaded.simulation_spec.psf, bundle_name=bundle_name),
+        psf=replace(
+            loaded.simulation_spec.psf,
+            bundle_name=bundle_name,
+            bundle_sha256=bundle_sha256,
+        ),
     )
     config = replace(
         loaded.run_config,
@@ -776,13 +1066,19 @@ def test_stamp_resume_rejects_changed_psf_bundle_content(tmp_path) -> None:
             "source_id,gaia_g_mag,psf_id,curve_id\n10,12.0,0,sn\n"
         ),
     )
-    bundle_name = _write_test_psf_bundle(plan.paths.data_root)
+    bundle_name, bundle_sha256 = _write_test_psf_bundle(
+        plan.paths.data_root
+    )
     plan = replace(
         plan,
         spec=replace(
             plan.spec,
             detector=replace(plan.spec.detector, n_subpixels=3),
-            psf=replace(plan.spec.psf, bundle_name=bundle_name),
+            psf=replace(
+                plan.spec.psf,
+                bundle_name=bundle_name,
+                bundle_sha256=bundle_sha256,
+            ),
         ),
     )
     run_stamp(plan)

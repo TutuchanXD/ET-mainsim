@@ -1,6 +1,6 @@
 {
   "schema_id": "photsim7.simulation_spec",
-  "schema_version": 2,
+  "schema_version": 3,
   "observation": {
     "simulation_name": "ET",
     "observing_start_date": "2024-01-01T00:00:00",
@@ -104,13 +104,14 @@
   },
   "psf": {
     "bundle_name": "psf/et/241006/D280mm-focus",
+    "bundle_sha256": "9b01d7d890c1a92829ea7ab52fab349a019417dcff7754888620bd6c99c7f1ec",
     "mode": "full_frame",
     "field_id": "nearest",
     "field_id_policy": "nearest",
     "use_jitter_integrated_psf": true,
     "jitter_bank_mode": "single_reference",
-    "n_jitter_integrated_psf_models": 300,
-    "n_jitter_frames_per_model": 600,
+    "n_jitter_integrated_psf_models": 100,
+    "n_jitter_frames_per_model": 300,
     "compute_device": "cuda",
     "float_precision": 32,
     "image_gen_batch_size": 15000,
