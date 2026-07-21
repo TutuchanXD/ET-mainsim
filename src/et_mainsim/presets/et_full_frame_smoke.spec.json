@@ -13,7 +13,7 @@
     "frame_start_s": null
   },
   "instrument": {
-    "telescope_count": 1,
+    "telescope_count": 6,
     "aperture_diameter": {"value": 28.0, "unit": "cm"},
     "optical_efficiency": {"value": 58.0, "unit": "%"},
     "quantum_efficiency": {"value": 80.0, "unit": "%"}
@@ -24,7 +24,7 @@
     "shape": [64, 64],
     "pixel_width": {"value": 10.0, "unit": "um"},
     "pixel_scale": {"value": 4.83, "unit": "arcsec / pix"},
-    "n_subpixels": 1
+    "n_subpixels": 7
   },
   "readout": {
     "enable_adc_digitization": true,

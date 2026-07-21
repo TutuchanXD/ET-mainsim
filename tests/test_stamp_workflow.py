@@ -12,6 +12,15 @@ from astropy import units as u
 from astropy.table import Table
 
 
+def _independent_stamp_spec(spec):
+    """Make an intentional single-scope fixture for a local stamp scene."""
+
+    return replace(
+        spec,
+        instrument=replace(spec.instrument, telescope_count=1),
+    )
+
+
 def _table_plan(tmp_path):
     from et_mainsim.config import StampWorkload
     from et_mainsim.presets import load_preset
@@ -42,7 +51,7 @@ def _table_plan(tmp_path):
     return build_run_plan(
         preset_name="et-stamp-smoke",
         run_config=config,
-        spec=loaded.simulation_spec,
+        spec=_independent_stamp_spec(loaded.simulation_spec),
         repo_root=tmp_path,
     )
 
@@ -94,7 +103,7 @@ def _variable_table_plan(tmp_path, *, target_body=None, curve_body=None):
     return build_run_plan(
         preset_name="et-stamp-smoke",
         run_config=config,
-        spec=loaded.simulation_spec,
+        spec=_independent_stamp_spec(loaded.simulation_spec),
         repo_root=tmp_path,
     )
 
@@ -113,6 +122,22 @@ def _fake_table_api():
     )
 
 
+def _stub_semantic_registry_identity(monkeypatch, stamp_inputs, registry) -> None:
+    candidate = {
+        "schema_id": "et_coord.semantic_registry_identity.v1",
+        "schema_version": 1,
+        "freeze_status": "candidate_pending_owner_freeze",
+        "owner_approval_required": True,
+        "registry_data_dir": str(registry),
+        "sha256": "c" * 64,
+    }
+    monkeypatch.setattr(
+        stamp_inputs,
+        "focalplane_registry_identity",
+        lambda _path: candidate,
+    )
+
+
 def test_table_stamp_plan_does_not_require_full_frame_catalog_assets(tmp_path) -> None:
     from et_mainsim.workflows.stamp import preflight
 
@@ -126,6 +151,73 @@ def test_table_stamp_plan_does_not_require_full_frame_catalog_assets(tmp_path) -
     assert plan.paths.focalplane_registry is None
     assert plan.spec.catalog.source_type == "prepared"
     assert plan.to_dict(dry_run=True)["workload"]["input_mode"] == "table"
+    assert not plan.run_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "preset_name",
+    ["et-stamp-smoke", "et-stamp-production"],
+)
+def test_shipped_stamp_preset_preflights_without_scope_rewrite(
+    tmp_path,
+    preset_name,
+) -> None:
+    from et_mainsim.presets import load_preset
+    from et_mainsim.workflows.stamp import build_run_plan, preflight
+
+    loaded = load_preset(preset_name)
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    table_path = tmp_path / "targets.csv"
+    table_path.write_text("gaia_g_mag,psf_id\n12.0,0\n", encoding="utf-8")
+    config = replace(
+        loaded.run_config,
+        paths=replace(
+            loaded.run_config.paths,
+            output_root=str(tmp_path / "output"),
+            data_root=str(data_root),
+            catalog_path="",
+            focalplane_registry="",
+        ),
+        workload=replace(
+            loaded.run_config.workload,
+            input_mode="table",
+            input_table=str(table_path),
+            variability_table="",
+            include_neighbors=False,
+        ),
+    )
+    plan = build_run_plan(
+        preset_name=preset_name,
+        run_config=config,
+        spec=loaded.simulation_spec,
+        repo_root=tmp_path,
+    )
+
+    preflight(plan)
+
+    assert plan.spec.instrument.telescope_count == 1
+    assert not plan.run_dir.exists()
+
+
+def test_independent_stamp_rejects_six_scope_spec_before_writing_artifacts(
+    tmp_path,
+) -> None:
+    from et_mainsim.workflows.stamp import run_stamp
+
+    plan = _table_plan(tmp_path)
+    plan = replace(
+        plan,
+        spec=replace(
+            plan.spec,
+            instrument=replace(plan.spec.instrument, telescope_count=6),
+        ),
+    )
+    plan.paths.data_root.mkdir()
+
+    with pytest.raises(ValueError, match="six-scope same-exposure"):
+        run_stamp(plan)
+
     assert not plan.run_dir.exists()
 
 
@@ -154,7 +246,7 @@ def test_catalog_stamp_preflight_allows_cache_without_query_assets(tmp_path) -> 
     plan = build_run_plan(
         preset_name=loaded.descriptor.name,
         run_config=config,
-        spec=loaded.simulation_spec,
+        spec=_independent_stamp_spec(loaded.simulation_spec),
         repo_root=tmp_path,
     )
 
@@ -353,6 +445,7 @@ def test_coordinate_target_selects_nearest_radial_psf_and_records_mapping(
             residual_arcsec=0.02,
         ),
     )
+    _stub_semantic_registry_identity(monkeypatch, stamp_inputs, registry)
 
     prepared = prepare_stamp_inputs(plan, science_api=_fake_table_api())
 
@@ -432,6 +525,7 @@ def test_table_targets_attach_row_local_geometry_declarations(
             residual_arcsec=0.02,
         ),
     )
+    _stub_semantic_registry_identity(monkeypatch, stamp_inputs, registry)
     api = _fake_table_api()
     api.load_psf_bundle = lambda *args, **kwargs: {
         "images": {0: object(), 4: object(), 6: object()},
@@ -879,7 +973,7 @@ def test_stamp_run_writes_readable_raw_coadd_truth_and_resumes(tmp_path) -> None
     data_root = tmp_path / "data"
     bundle_name, bundle_sha256 = _write_test_psf_bundle(data_root)
     spec = replace(
-        loaded.simulation_spec,
+        _independent_stamp_spec(loaded.simulation_spec),
         detector=replace(loaded.simulation_spec.detector, n_subpixels=3),
         psf=replace(
             loaded.simulation_spec.psf,
@@ -1901,7 +1995,7 @@ def test_stamp_resume_rejects_changed_direct_target_table(tmp_path) -> None:
     table_path = tmp_path / "targets.csv"
     table_path.write_text("gaia_g_mag,psf_id\n12.0,0\n", encoding="utf-8")
     spec = replace(
-        loaded.simulation_spec,
+        _independent_stamp_spec(loaded.simulation_spec),
         detector=replace(loaded.simulation_spec.detector, n_subpixels=3),
         psf=replace(
             loaded.simulation_spec.psf,

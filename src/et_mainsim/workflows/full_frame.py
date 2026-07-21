@@ -26,6 +26,10 @@ from et_mainsim.config import (
 from et_mainsim.manifest import RunManifestStore
 from et_mainsim.presets import resource_path
 from et_mainsim.provenance import collect_provenance
+from et_mainsim.scope_artifacts import (
+    FullFrameScopeArtifactContract,
+    ScopeFrameCompletion,
+)
 
 
 _SELECTION_TRUTH_SCOPE = "geometry_psf_and_jitter_selection_truth_only"
@@ -178,7 +182,10 @@ def _science_api() -> SimpleNamespace:
         FullFrameArtifactOptions,
         FullFrameArtifactWriter,
     )
-    from photsim7.full_frame_pipeline import run_single_cadence_full_frame
+    from photsim7.full_frame_pipeline import (
+        iter_single_cadence_full_frame_scopes,
+        run_single_cadence_full_frame,
+    )
     from photsim7.selection_artifacts import (
         cadence_selection_truth_relative_path,
         read_cadence_selection_truth,
@@ -190,6 +197,7 @@ def _science_api() -> SimpleNamespace:
     from photsim7.simulation_services import (
         build_catalog_from_spec,
         build_full_frame_services,
+        build_multiscope_full_frame_services,
         resolve_full_frame_source_pixel_geometry,
     )
     from photsim7.stamp_products import StampWindow
@@ -207,6 +215,12 @@ def _science_api() -> SimpleNamespace:
         StampWindow=StampWindow,
         build_catalog_from_spec=build_catalog_from_spec,
         build_full_frame_services=build_full_frame_services,
+        build_multiscope_full_frame_services=(
+            build_multiscope_full_frame_services
+        ),
+        iter_single_cadence_full_frame_scopes=(
+            iter_single_cadence_full_frame_scopes
+        ),
         resolve_full_frame_source_pixel_geometry=(
             resolve_full_frame_source_pixel_geometry
         ),
@@ -243,8 +257,60 @@ def _artifact_paths(run_dir: Path, frame_index: int) -> tuple[Path, Path, Path]:
     )
 
 
+def _scope_contract_for_spec(
+    run_dir: Path | str,
+    spec: Any,
+) -> FullFrameScopeArtifactContract:
+    return FullFrameScopeArtifactContract.from_telescope_count(
+        run_dir,
+        telescope_count=int(spec.instrument.telescope_count),
+    )
+
+
+def _schema_scope_id(schema: Mapping[str, Any]) -> int | None:
+    """Return the persisted service scope identity, if this product has one."""
+
+    provenance = schema.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return None
+    services = provenance.get("services")
+    if not isinstance(services, Mapping):
+        return None
+    scope = services.get("scope")
+    if not isinstance(scope, Mapping):
+        return None
+    scope_id = scope.get("scope_id")
+    if isinstance(scope_id, bool) or not isinstance(scope_id, int):
+        return None
+    if int(scope_id) < 0:
+        return None
+    return int(scope_id)
+
+
 def _shared_exposure_root(run_dir: Path) -> Path:
     return run_dir / "shared_exposure"
+
+
+def _shared_exposure_scope_root(
+    run_dir: Path,
+    *,
+    scope_id: int = 0,
+    scope_contract: FullFrameScopeArtifactContract | None = None,
+) -> Path:
+    """Return the scope-local shared-exposure root.
+
+    The legacy single-scope layout remains byte-for-byte path compatible.
+    Six scopes receive an explicit storage namespace so a crop shard can never
+    be mistaken for an image-level combination.
+    """
+
+    normalized_scope_id = int(scope_id)
+    if scope_contract is None or scope_contract.is_single_scope:
+        if normalized_scope_id != 0:
+            raise ValueError("single-scope shared exposure only accepts scope_id=0")
+        return _shared_exposure_root(run_dir)
+    scope_contract.scope_root(normalized_scope_id)
+    return _shared_exposure_root(run_dir) / f"scope_{normalized_scope_id}"
 
 
 def _clear_shared_exposure_bundle_for_overwrite(run_dir: Path) -> None:
@@ -265,16 +331,40 @@ def _shared_exposure_plan_path(run_dir: Path) -> Path:
     return _shared_exposure_root(run_dir) / "target_plan.json"
 
 
-def _shared_exposure_completion_path(run_dir: Path, frame_index: int) -> Path:
+def _shared_exposure_completion_path(
+    run_dir: Path,
+    frame_index: int,
+    *,
+    scope_id: int = 0,
+    scope_contract: FullFrameScopeArtifactContract | None = None,
+) -> Path:
     return (
-        _shared_exposure_root(run_dir)
+        _shared_exposure_scope_root(
+            run_dir,
+            scope_id=scope_id,
+            scope_contract=scope_contract,
+        )
         / "completion"
         / f"frame_{int(frame_index):09d}.json"
     )
 
 
-def _shared_exposure_shard_root(run_dir: Path, rank: int) -> Path:
-    return _shared_exposure_root(run_dir) / "shards" / f"worker_{int(rank):04d}"
+def _shared_exposure_shard_root(
+    run_dir: Path,
+    rank: int,
+    *,
+    scope_id: int = 0,
+    scope_contract: FullFrameScopeArtifactContract | None = None,
+) -> Path:
+    return (
+        _shared_exposure_scope_root(
+            run_dir,
+            scope_id=scope_id,
+            scope_contract=scope_contract,
+        )
+        / "shards"
+        / f"worker_{int(rank):04d}"
+    )
 
 
 @dataclass(frozen=True)
@@ -283,10 +373,17 @@ class _SharedExposureFrameBatch:
     frame_ids: tuple[int, ...]
     content_sha256: str
     root: Path
+    scope_id: int = 0
+    scope_explicit: bool = False
 
     @property
     def case_id(self) -> str:
         worker_rank = self.root.parent.name.removeprefix("worker_")
+        if self.scope_explicit:
+            return (
+                f"full-frame-scope-{self.scope_id}-worker-{worker_rank}-"
+                f"batch-{self.batch_index:06d}"
+            )
         return f"full-frame-worker-{worker_rank}-batch-{self.batch_index:06d}"
 
 
@@ -297,6 +394,7 @@ def _canonical_shared_exposure_batch_key(
     batch_index: int,
     frames_per_shard: int,
     frame_ids: tuple[int, ...],
+    scope_id: int | None = None,
 ) -> tuple[dict[str, Any], str]:
     payload = {
         "schema_id": _SHARED_EXPOSURE_BATCH_KEY_SCHEMA_ID,
@@ -306,6 +404,8 @@ def _canonical_shared_exposure_batch_key(
         "frames_per_shard": int(frames_per_shard),
         "frame_ids": [int(frame_index) for frame_index in frame_ids],
     }
+    if scope_id is not None:
+        payload["scope_id"] = int(scope_id)
     encoded = json.dumps(
         payload,
         allow_nan=False,
@@ -319,9 +419,18 @@ def _canonical_shared_exposure_batch_key(
 def _shared_exposure_frame_batches(
     request: WorkerRequest,
     assigned: tuple[int, ...],
+    *,
+    scope_id: int = 0,
+    scope_contract: FullFrameScopeArtifactContract | None = None,
 ) -> tuple[_SharedExposureFrameBatch, ...]:
     frames_per_shard = request.shared_exposure_stamps.frames_per_shard
-    worker_root = _shared_exposure_shard_root(request.run_dir, request.rank)
+    scope_explicit = scope_contract is not None and not scope_contract.is_single_scope
+    worker_root = _shared_exposure_shard_root(
+        request.run_dir,
+        request.rank,
+        scope_id=scope_id,
+        scope_contract=scope_contract,
+    )
     batches: list[_SharedExposureFrameBatch] = []
     for start in range(0, len(assigned), frames_per_shard):
         frame_ids = assigned[start : start + frames_per_shard]
@@ -332,6 +441,7 @@ def _shared_exposure_frame_batches(
             batch_index=batch_index,
             frames_per_shard=frames_per_shard,
             frame_ids=frame_ids,
+            scope_id=int(scope_id) if scope_explicit else None,
         )
         batches.append(
             _SharedExposureFrameBatch(
@@ -339,6 +449,8 @@ def _shared_exposure_frame_batches(
                 frame_ids=frame_ids,
                 content_sha256=content_sha256,
                 root=(worker_root / f"batch_{batch_index:06d}_{content_sha256}"),
+                scope_id=int(scope_id),
+                scope_explicit=scope_explicit,
             )
         )
     return tuple(batches)
@@ -659,6 +771,8 @@ def frame_is_complete(
     *,
     expected_shape: tuple[int, int],
     expected_spec: Any,
+    expected_scope_id: int = 0,
+    require_scope_identity: bool = False,
 ) -> bool:
     run_dir = Path(run_dir)
     frame_path, summary_path, schema_path = _artifact_paths(run_dir, frame_index)
@@ -678,6 +792,15 @@ def frame_is_complete(
         if int(schema.get("frame_index", -1)) != int(frame_index):
             return False
         if schema.get("detector_id") != str(expected_spec.detector.detector_id):
+            return False
+        observed_scope_id = _schema_scope_id(schema)
+        if require_scope_identity and observed_scope_id != int(expected_scope_id):
+            return False
+        if (
+            not require_scope_identity
+            and observed_scope_id is not None
+            and observed_scope_id != int(expected_scope_id)
+        ):
             return False
         array = np.load(frame_path, mmap_mode="r", allow_pickle=False)
         if tuple(array.shape) != tuple(expected_shape):
@@ -699,6 +822,35 @@ def frame_is_complete(
     return True
 
 
+def frame_completion(
+    run_dir: Path | str,
+    frame_index: int,
+    *,
+    expected_shape: tuple[int, int],
+    expected_spec: Any,
+) -> ScopeFrameCompletion:
+    """Validate every scope product required for one logical cadence.
+
+    Single-scope products retain the pre-scope root layout and accept legacy
+    schemas without a scope provenance block.  A six-scope cadence only
+    completes when every scope-local product carries its matching explicit
+    ``provenance.services.scope.scope_id`` value.
+    """
+
+    contract = _scope_contract_for_spec(run_dir, expected_spec)
+    return contract.frame_completion(
+        frame_index=frame_index,
+        scope_is_complete=lambda paths: frame_is_complete(
+            contract.scope_root(paths.scope_id),
+            frame_index,
+            expected_shape=expected_shape,
+            expected_spec=expected_spec,
+            expected_scope_id=paths.scope_id,
+            require_scope_identity=not contract.is_single_scope,
+        ),
+    )
+
+
 def _has_partial_artifacts(run_dir: Path, frame_index: int) -> bool:
     absolute_raw_frame_index = _ET_FULL_FRAME_ABSOLUTE_RAW_FRAME_START_INDEX + int(
         frame_index
@@ -712,6 +864,302 @@ def _has_partial_artifacts(run_dir: Path, frame_index: int) -> bool:
     return any(
         path.exists() for path in (*_artifact_paths(run_dir, frame_index), cadence_path)
     )
+
+
+def _has_partial_scope_artifacts(
+    contract: FullFrameScopeArtifactContract,
+    frame_index: int,
+) -> bool:
+    return any(
+        _has_partial_artifacts(contract.scope_root(scope_id), frame_index)
+        for scope_id in contract.scope_ids
+    )
+
+
+def _selection_artifact_metadata(artifacts: Any) -> dict[str, dict[str, Any]]:
+    return {
+        name: {
+            "relative_path": identity.relative_path,
+            "schema_id": identity.schema_id,
+            "schema_version": identity.schema_version,
+            "content_sha256": identity.content_sha256,
+        }
+        for name, identity in (
+            ("geometry", artifacts.geometry),
+            ("psf", artifacts.psf),
+            ("cadence", artifacts.cadence),
+        )
+    }
+
+
+def _persisted_selection_metadata(
+    spec: Any,
+    truth: Any,
+    artifacts: Any,
+) -> dict[str, Any]:
+    """Rebuild Photsim7's public persisted-selection metadata contract."""
+
+    return {
+        "schema_id": truth.schema_id,
+        "schema_version": truth.schema_version,
+        "verification_status": "persisted_and_verified",
+        "science_conformance_claim": truth.science_conformance_claim,
+        "science_conformance_claim_scope": _SELECTION_TRUTH_SCOPE,
+        "requested_science_profile_id": spec.science_profile.profile_id,
+        "content_sha256": truth.content_sha256,
+        "source_geometry_truth": truth.geometry_reference,
+        "psf_selection_truth": truth.psf_reference,
+        "jitter_model_selection_truth": (
+            truth.jitter_model_selection_truth.to_json_dict()
+        ),
+        "missing_components": [],
+        "artifact": _selection_artifact_metadata(artifacts),
+    }
+
+
+def _persist_scope_frame_result(
+    *,
+    writer: Any,
+    result: Any,
+    spec: Any,
+) -> None:
+    """Write one iterator result into its scope-local artifact root.
+
+    The iterator intentionally has no writer argument, so this application
+    layer publishes the same public FullFrameArtifactWriter products after it
+    has received one scope result.  This keeps the production path bounded to
+    one rendered full frame at a time.
+    """
+
+    product = result.frame_products
+    selection_truth = getattr(result, "selection_truth", None)
+    if selection_truth is not None:
+        artifacts = writer.write_selection_truth(selection_truth)
+        persisted_selection = _persisted_selection_metadata(
+            spec,
+            selection_truth,
+            artifacts,
+        )
+        provenance = dict(product.provenance or {})
+        provenance["selection_truth"] = persisted_selection
+        product = replace(
+            product,
+            selection_truth=persisted_selection,
+            provenance=provenance,
+        )
+    detector_result = result.detector_result
+    writer.write_frame(
+        product.frame_index,
+        _as_numpy(product.final_frame.array),
+        summary=product.frame_summary,
+        cosmic_events=getattr(detector_result, "cosmic_metadata", None),
+        column_noise_adu=(
+            None
+            if getattr(detector_result, "bias_metadata", None) is None
+            else detector_result.bias_metadata.column_noise_vector_adu
+        ),
+    )
+    writer.write_frame_product_schema(product)
+
+
+def _scope_frame_is_complete(
+    contract: FullFrameScopeArtifactContract,
+    *,
+    scope_id: int,
+    frame_index: int,
+    expected_shape: tuple[int, int],
+    expected_spec: Any,
+) -> bool:
+    return frame_is_complete(
+        contract.scope_root(scope_id),
+        frame_index,
+        expected_shape=expected_shape,
+        expected_spec=expected_spec,
+        expected_scope_id=scope_id,
+        require_scope_identity=not contract.is_single_scope,
+    )
+
+
+def _full_frame_renderer_options(request: WorkerRequest) -> dict[str, Any]:
+    return {
+        "enable_stellar_photon_noise": True,
+        "enable_background_light": True,
+        "enable_scattered_light": bool(
+            request.spec.sky.scattered_light.to_value(u.electron / u.s / u.pix)
+        ),
+        "enable_dark_current": True,
+        "progress": request.execution.progress,
+    }
+
+
+def _render_multiscope_frame(
+    *,
+    request: WorkerRequest,
+    api: Any,
+    services: Any,
+    contract: FullFrameScopeArtifactContract,
+    catalog: Any,
+    frame_index: int,
+    expected_shape: tuple[int, int],
+) -> None:
+    """Render and persist one logical cadence scope-by-scope.
+
+    ``iter_single_cadence_full_frame_scopes`` yields one product at a time;
+    this function writes or validates that scope before requesting the next.
+    It deliberately has no shared-exposure crop handling.
+    """
+
+    if contract.is_single_scope:
+        raise ValueError("multiscope rendering requires a six-scope contract")
+    if request.shared_exposure_stamps.enabled:
+        raise NotImplementedError(
+            "shared-exposure target crops are not implemented for six scopes"
+        )
+
+    if request.execution.overwrite:
+        absolute_raw_frame_index = (
+            _ET_FULL_FRAME_ABSOLUTE_RAW_FRAME_START_INDEX + int(frame_index)
+        )
+        for scope_id in contract.scope_ids:
+            cadence_path = contract.scope_root(scope_id) / api.cadence_selection_truth_relative_path(
+                absolute_raw_frame_index
+            )
+            cadence_path.unlink(missing_ok=True)
+
+    torch = None
+    if request.execution.device == "cuda":
+        import torch as torch_module
+
+        torch = torch_module
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA execution requested but torch reports no CUDA device")
+        torch.cuda.reset_peak_memory_stats()
+
+    iterator = iter(
+        api.iter_single_cadence_full_frame_scopes(
+            request.spec,
+            services=services,
+            frame_index=frame_index,
+            renderer_options=_full_frame_renderer_options(request),
+            worker_rank=request.rank,
+            rng_trace_scope={"run_id": request.run_dir.name},
+        )
+    )
+    for expected_scope_id in contract.scope_ids:
+        scope_started = time.perf_counter()
+        try:
+            scope_id, result = next(iterator)
+        except StopIteration as error:
+            raise RuntimeError(
+                "Photsim7 multiscope iterator ended before every scope was rendered"
+            ) from error
+        if int(scope_id) != expected_scope_id:
+            raise RuntimeError(
+                "Photsim7 multiscope iterator returned scope ids out of canonical "
+                f"order: expected {expected_scope_id}, received {scope_id}"
+            )
+        if torch is not None:
+            torch.cuda.synchronize()
+        pipeline_elapsed_s = time.perf_counter() - scope_started
+        scope_root = contract.scope_root(scope_id)
+        scope_requires_persist = not _scope_frame_is_complete(
+            contract,
+            scope_id=scope_id,
+            frame_index=frame_index,
+            expected_shape=expected_shape,
+            expected_spec=request.spec,
+        )
+        if scope_requires_persist:
+            options = api.FullFrameArtifactOptions(
+                save_frame_summaries=True,
+                save_cosmic_events=True,
+                save_bias=bool(request.spec.artifacts.save_bias_artifacts),
+                save_preview=frame_index < request.execution.preview_count,
+            )
+            writer = api.FullFrameArtifactWriter(scope_root, options=options)
+            _persist_scope_frame_result(
+                writer=writer,
+                result=result,
+                spec=request.spec,
+            )
+            if not _scope_frame_is_complete(
+                contract,
+                scope_id=scope_id,
+                frame_index=frame_index,
+                expected_shape=expected_shape,
+                expected_spec=request.spec,
+            ):
+                raise RuntimeError(
+                    "Photsim7 scope artifacts failed readback validation for "
+                    f"frame {frame_index}, scope {scope_id}"
+                )
+        if scope_requires_persist:
+            if request.execution.save_cosmic_mask:
+                cosmic = getattr(result.detector_result, "cosmic_metadata", None)
+                mask = None if cosmic is None else getattr(cosmic, "mask", None)
+                if mask is not None:
+                    mask_array = _as_numpy(mask)
+                    if mask_array.ndim == 3 and mask_array.shape[0] == 1:
+                        mask_array = mask_array[0]
+                    mask_path = (
+                        scope_root
+                        / "cosmic_events"
+                        / f"frame_{frame_index:06d}_mask.npy"
+                    )
+                    mask_path.parent.mkdir(parents=True, exist_ok=True)
+                    np.save(mask_path, mask_array)
+            if request.execution.save_stellar_mean:
+                stellar_mean = result.renderer_components.get("stellar_mean")
+                if stellar_mean is None:
+                    raise KeyError("Photsim7 did not return stellar_mean")
+                np.save(
+                    scope_root
+                    / "frames"
+                    / f"frame_{frame_index:06d}_stellar_mean_e.npy",
+                    _as_numpy(stellar_mean).astype(np.float32),
+                )
+            peak_cuda_allocated_mb = (
+                None
+                if torch is None
+                else float(torch.cuda.max_memory_allocated() / 1024**2)
+            )
+            peak_cuda_reserved_mb = (
+                None
+                if torch is None
+                else float(torch.cuda.max_memory_reserved() / 1024**2)
+            )
+            _record_frame_metrics(
+                scope_root,
+                frame_index,
+                rank=request.rank,
+                device=request.execution.device,
+                n_stars=int(catalog.n_sources),
+                pipeline_elapsed_s=pipeline_elapsed_s,
+                total_elapsed_s=time.perf_counter() - scope_started,
+                peak_cuda_allocated_mb=peak_cuda_allocated_mb,
+                peak_cuda_reserved_mb=peak_cuda_reserved_mb,
+            )
+        del result
+    try:
+        unexpected_scope_id, _ = next(iterator)
+    except StopIteration:
+        pass
+    else:
+        raise RuntimeError(
+            "Photsim7 multiscope iterator returned an unexpected extra scope "
+            f"{unexpected_scope_id}"
+        )
+    completion = frame_completion(
+        request.run_dir,
+        frame_index,
+        expected_shape=expected_shape,
+        expected_spec=request.spec,
+    )
+    if not completion.is_complete:
+        raise RuntimeError(
+            "Photsim7 scope artifacts failed all-scope readback validation for "
+            f"frame {frame_index}: missing {completion.missing_scope_ids}"
+        )
 
 
 def _record_frame_metrics(
@@ -779,9 +1227,15 @@ def _select_brightest_catalog(catalog: Any, max_stars: int | None, api: Any) -> 
 
 
 def _write_effect_timeseries(run_dir: Path, services: Any, rank: int) -> None:
-    if rank != 0 or getattr(services, "effect_timeseries", None) is None:
+    if rank != 0:
         return
-    timeseries = services.effect_timeseries
+    timeseries = getattr(services, "effect_timeseries", None)
+    if timeseries is None:
+        scope_services = getattr(services, "services", ())
+        if scope_services:
+            timeseries = getattr(scope_services[0], "effect_timeseries", None)
+    if timeseries is None:
+        return
     np.savez_compressed(run_dir / "effects_timeseries.npz", **timeseries.to_arrays())
     _atomic_json(
         run_dir / "effects_timeseries.metadata.json",
@@ -804,7 +1258,7 @@ def _shared_exposure_shard_provenance(
     request: WorkerRequest,
     batch: _SharedExposureFrameBatch,
 ) -> dict[str, Any]:
-    return {
+    provenance: dict[str, Any] = {
         "workflow": "et-full-frame",
         "orchestrator_schema_id": "et_mainsim.shared_exposure_target_plan.v1",
         "target_plan_content_sha256": None,
@@ -815,6 +1269,9 @@ def _shared_exposure_shard_provenance(
         "batch_index": batch.batch_index,
         "frames_per_shard": request.shared_exposure_stamps.frames_per_shard,
     }
+    if batch.scope_explicit:
+        provenance["scope_id"] = batch.scope_id
+    return provenance
 
 
 def _validate_shared_exposure_shard_reader(
@@ -1013,6 +1470,7 @@ def _validate_shared_exposure_marker_for_request(
     plan: Mapping[str, Any],
     frame_index: int,
     shard_paths: Mapping[str, Path],
+    parent_root: Path | None = None,
 ) -> None:
     from et_mainsim.shared_exposure import SharedExposureReferenceDriftError
 
@@ -1020,7 +1478,9 @@ def _validate_shared_exposure_marker_for_request(
         "detector_id": str(request.spec.detector.detector_id),
         "frame_index": int(frame_index),
     }
-    expected_parent = _artifact_paths(request.run_dir, frame_index)[0]
+    if parent_root is None:
+        parent_root = request.run_dir
+    expected_parent = _artifact_paths(parent_root, frame_index)[0]
     expected_plan = _shared_exposure_plan_path(request.run_dir)
     expected_shards = {
         product_key: path.resolve().relative_to(request.run_dir.resolve()).as_posix()
@@ -1066,10 +1526,13 @@ def _build_shared_exposure_completion(
     mode: str,
     shard_paths: Mapping[str, Path],
     storage_guard_cache: Any | None = None,
+    parent_root: Path | None = None,
 ) -> dict[str, Any]:
     from et_mainsim.shared_exposure import build_shared_exposure_frame_completion
 
-    parent_path, _, _ = _artifact_paths(request.run_dir, frame_index)
+    if parent_root is None:
+        parent_root = request.run_dir
+    parent_path, _, _ = _artifact_paths(parent_root, frame_index)
     return build_shared_exposure_frame_completion(
         frame_index=frame_index,
         detector_id=str(request.spec.detector.detector_id),
@@ -1088,13 +1551,20 @@ def _publish_shared_exposure_completion(
     frame_index: int,
     marker: Mapping[str, Any],
     storage_guard_cache: Any | None = None,
+    scope_id: int = 0,
+    scope_contract: FullFrameScopeArtifactContract | None = None,
 ) -> None:
     from et_mainsim.shared_exposure import (
         publish_shared_exposure_frame_completion,
         read_shared_exposure_frame_completion,
     )
 
-    marker_path = _shared_exposure_completion_path(request.run_dir, frame_index)
+    marker_path = _shared_exposure_completion_path(
+        request.run_dir,
+        frame_index,
+        scope_id=scope_id,
+        scope_contract=scope_contract,
+    )
     publish_shared_exposure_frame_completion(
         marker_path,
         marker,
@@ -1210,6 +1680,8 @@ def _finalize_shared_exposure_batch(
     rendered_frames: tuple[int, ...],
     frame_modes: Mapping[int, str],
     storage_guard_cache: Any | None,
+    parent_root: Path | None = None,
+    scope_contract: FullFrameScopeArtifactContract | None = None,
 ) -> None:
     from et_mainsim.shared_exposure import SharedExposureReferenceDriftError
 
@@ -1292,6 +1764,7 @@ def _finalize_shared_exposure_batch(
             mode=frame_modes[frame_index],
             shard_paths=shard_paths,
             storage_guard_cache=storage_guard_cache,
+            parent_root=parent_root,
         )
 
     # Build every immutable completion candidate first.  Exact array readback
@@ -1299,7 +1772,10 @@ def _finalize_shared_exposure_batch(
     # cannot be blessed by the marker.  Publication validates the same guards
     # once more, closing the remaining readback-to-link race.
     for frame_index, expected_fingerprint in expected_parent_fingerprints.items():
-        parent_path, _, _ = _artifact_paths(request.run_dir, frame_index)
+        parent_path, _, _ = _artifact_paths(
+            request.run_dir if parent_root is None else parent_root,
+            frame_index,
+        )
         _assert_shared_exposure_fingerprint(
             expected_fingerprint,
             np.load(parent_path, allow_pickle=False),
@@ -1326,6 +1802,8 @@ def _finalize_shared_exposure_batch(
             frame_index=frame_index,
             marker=marker,
             storage_guard_cache=storage_guard_cache,
+            scope_id=batch.scope_id,
+            scope_contract=scope_contract,
         )
     final_snapshots.clear()
 
@@ -1388,16 +1866,888 @@ def _write_missing_shared_exposure_batch_items(
         writer.write_crop(crop)
 
 
+@dataclass
+class _SharedExposureBatchRuntime:
+    """Mutable resume state for one physical scope and one worker batch."""
+
+    batch: _SharedExposureFrameBatch
+    shard_paths: dict[str, Path]
+    snapshots: dict[str, _SharedExposureShardSnapshot]
+    existing_fingerprints: dict[str, dict[tuple[int, int], dict[str, Any]]]
+    writers: dict[str, Any]
+    validated_complete_items: set[tuple[str, int, int]]
+    expected_parent_fingerprints: dict[int, dict[str, Any]]
+    expected_final_fingerprints: dict[
+        str, dict[tuple[int, int], dict[str, Any]]
+    ]
+    pending_items: list[tuple[int, Any, str, Path, np.ndarray, str, str]]
+    storage_guard_cache: Any
+
+
+def _open_shared_exposure_batch_runtime(
+    *,
+    api: Any,
+    request: WorkerRequest,
+    plan: Mapping[str, Any],
+    windows: Mapping[int, Any],
+    batch: _SharedExposureFrameBatch,
+) -> _SharedExposureBatchRuntime:
+    """Open one scope-local shard batch without changing its contents."""
+
+    from et_mainsim.shared_exposure import SharedExposureStorageGuardCache
+
+    shard_paths = _shared_exposure_batch_shard_paths(
+        batch,
+        plan_content_sha256=plan["content_sha256"],
+        product_keys=request.shared_exposure_stamps.product_keys,
+    )
+    snapshots = _inspect_shared_exposure_shards(
+        api=api,
+        request=request,
+        plan=plan,
+        windows=windows,
+        batch=batch,
+        shard_paths=shard_paths,
+    )
+    existing = _shared_exposure_complete_item_fingerprints(
+        api=api,
+        snapshots=snapshots,
+        frame_indices=batch.frame_ids,
+        target_source_ids=request.shared_exposure_stamps.target_source_ids,
+    )
+    return _SharedExposureBatchRuntime(
+        batch=batch,
+        shard_paths=shard_paths,
+        snapshots=snapshots,
+        existing_fingerprints=existing,
+        writers={},
+        validated_complete_items=set(),
+        expected_parent_fingerprints={},
+        expected_final_fingerprints={
+            product_key: dict(existing.get(product_key, {}))
+            for product_key in request.shared_exposure_stamps.product_keys
+        },
+        pending_items=[],
+        storage_guard_cache=SharedExposureStorageGuardCache(),
+    )
+
+
+def _queue_scope_shared_exposure_crops(
+    *,
+    api: Any,
+    request: WorkerRequest,
+    plan: Mapping[str, Any],
+    windows: Mapping[int, Any],
+    runtime: _SharedExposureBatchRuntime,
+    parent_root: Path,
+    frame_index: int,
+    result: Any,
+) -> None:
+    """Validate and stage exact scope-local crops without new RNG draws."""
+
+    from et_mainsim.shared_exposure import (
+        SharedExposureReferenceDriftError,
+        array_c_order_fingerprint,
+        assert_exact_array_match,
+        assert_exact_parent_crop,
+    )
+
+    batch = runtime.batch
+    parent_path, _, _ = _artifact_paths(parent_root, frame_index)
+    parent_array = np.load(parent_path, allow_pickle=False)
+    assert_exact_array_match(
+        parent_array,
+        _as_numpy(result.frame_products.final_frame.array),
+    )
+    runtime.expected_parent_fingerprints[frame_index] = array_c_order_fingerprint(
+        parent_array
+    )
+
+    frame_products: list[tuple[int, Any, str, Path, np.ndarray, str, str]] = []
+    for target_source_id, window in windows.items():
+        crop = api.shared_exposure_crop_v1(
+            result,
+            window,
+            api.SharedExposureTargetIdentity(
+                target_source_id=target_source_id,
+                detector_id=str(request.spec.detector.detector_id),
+                frame_index=frame_index,
+                scope_id=batch.scope_id,
+            ),
+            product_keys=request.shared_exposure_stamps.product_keys,
+            materialize_numpy=True,
+        )
+        if int(crop.target_identity.scope_id) != batch.scope_id:
+            raise SharedExposureReferenceDriftError(
+                "shared-exposure crop target scope conflicts with its shard batch"
+            )
+        crop_parent = crop.provenance.get("parent", {})
+        if int(crop_parent.get("scope_id", -1)) != batch.scope_id:
+            raise SharedExposureReferenceDriftError(
+                "shared-exposure crop parent scope conflicts with its shard batch"
+            )
+        for product_key, shard_path in runtime.shard_paths.items():
+            product_array, unit, domain = _shared_exposure_crop_product(
+                crop,
+                product_key,
+            )
+            if product_key == "final_stamp":
+                assert_exact_parent_crop(parent_array, product_array, window)
+            snapshot = runtime.snapshots.get(product_key)
+            if snapshot is not None and (
+                snapshot.dtype != product_array.dtype
+                or snapshot.unit != unit
+                or snapshot.domain != domain
+            ):
+                raise SharedExposureReferenceDriftError(
+                    "shared-exposure product contract drift detected for "
+                    f"scope {batch.scope_id}, {product_key}"
+                )
+            item_key = (target_source_id, frame_index)
+            previous = runtime.existing_fingerprints.get(product_key, {}).get(
+                item_key
+            )
+            if previous is not None:
+                _assert_shared_exposure_fingerprint(previous, product_array)
+                runtime.validated_complete_items.add(
+                    (product_key, target_source_id, frame_index)
+                )
+            elif snapshot is not None and snapshot.is_final:
+                raise SharedExposureReferenceDriftError(
+                    "published shared-exposure shard is missing an expected "
+                    f"complete item: scope {batch.scope_id}, {product_key} {item_key}"
+                )
+            runtime.expected_final_fingerprints[product_key][item_key] = (
+                array_c_order_fingerprint(product_array)
+            )
+            frame_products.append(
+                (
+                    target_source_id,
+                    crop,
+                    product_key,
+                    shard_path,
+                    product_array,
+                    unit,
+                    domain,
+                )
+            )
+
+    # Validate all pre-existing COMPLETE siblings before mutating any missing
+    # item.  This is the same fail-closed ordering as the single-scope path.
+    for item in frame_products:
+        target_source_id, _crop, product_key, _path, _array, _unit, _domain = item
+        item_key = (target_source_id, frame_index)
+        if runtime.existing_fingerprints.get(product_key, {}).get(item_key) is None:
+            runtime.pending_items.append(item)
+
+
+def _finalize_scope_shared_exposure_batch(
+    *,
+    api: Any,
+    request: WorkerRequest,
+    plan: Mapping[str, Any],
+    windows: Mapping[int, Any],
+    runtime: _SharedExposureBatchRuntime,
+    rendered_frames: tuple[int, ...],
+    frame_modes: Mapping[int, str],
+    parent_root: Path,
+    scope_contract: FullFrameScopeArtifactContract,
+) -> None:
+    """Publish one scope-local batch and immutable completion witnesses."""
+
+    _write_missing_shared_exposure_batch_items(
+        api=api,
+        request=request,
+        plan=plan,
+        windows=windows,
+        batch=runtime.batch,
+        initial_snapshots=runtime.snapshots,
+        writers=runtime.writers,
+        pending_items=runtime.pending_items,
+    )
+    _finalize_shared_exposure_batch(
+        api=api,
+        request=request,
+        plan=plan,
+        windows=windows,
+        batch=runtime.batch,
+        shard_paths=runtime.shard_paths,
+        initial_snapshots=runtime.snapshots,
+        writers=runtime.writers,
+        validated_complete_items=runtime.validated_complete_items,
+        expected_parent_fingerprints=runtime.expected_parent_fingerprints,
+        expected_final_fingerprints=runtime.expected_final_fingerprints,
+        rendered_frames=rendered_frames,
+        frame_modes=frame_modes,
+        storage_guard_cache=runtime.storage_guard_cache,
+        parent_root=parent_root,
+        scope_contract=scope_contract,
+    )
+    runtime.pending_items.clear()
+    runtime.existing_fingerprints.clear()
+    runtime.snapshots.clear()
+    runtime.shard_paths.clear()
+    runtime.storage_guard_cache.clear()
+
+
+def _render_multiscope_shared_exposure_frame(
+    *,
+    request: WorkerRequest,
+    api: Any,
+    services: Any,
+    contract: FullFrameScopeArtifactContract,
+    catalog: Any,
+    frame_index: int,
+    expected_shape: tuple[int, int],
+    plan: Mapping[str, Any],
+    windows: Mapping[int, Any],
+    scope_modes: Mapping[int, str],
+    runtime_by_scope_batch: dict[tuple[int, int], _SharedExposureBatchRuntime],
+    batch_by_scope_frame: Mapping[int, Mapping[int, _SharedExposureFrameBatch]],
+    render_frames_by_scope_batch: Mapping[tuple[int, int], tuple[int, ...]],
+    all_scope_modes: Mapping[int, Mapping[int, str]],
+) -> None:
+    """Render six parent images and stage exact same-scope crop products.
+
+    Each yielded result is persisted and cropped before the next scope is
+    requested.  There is intentionally no in-memory six-image cube and no
+    image-level sum.
+    """
+
+    if contract.is_single_scope:
+        raise ValueError("six-scope shared exposure requires a multiscope contract")
+    if set(scope_modes) != set(contract.scope_ids):
+        raise ValueError("scope_modes must contain the complete scope contract")
+
+    if request.execution.overwrite:
+        absolute_raw_frame_index = (
+            _ET_FULL_FRAME_ABSOLUTE_RAW_FRAME_START_INDEX + int(frame_index)
+        )
+        for scope_id, mode in scope_modes.items():
+            if mode == "skip":
+                continue
+            cadence_path = contract.scope_root(scope_id) / api.cadence_selection_truth_relative_path(
+                absolute_raw_frame_index
+            )
+            cadence_path.unlink(missing_ok=True)
+
+    torch = None
+    if request.execution.device == "cuda":
+        import torch as torch_module
+
+        torch = torch_module
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA execution requested but torch reports no CUDA device")
+        torch.cuda.reset_peak_memory_stats()
+
+    iterator = iter(
+        api.iter_single_cadence_full_frame_scopes(
+            request.spec,
+            services=services,
+            frame_index=frame_index,
+            renderer_options=_full_frame_renderer_options(request),
+            worker_rank=request.rank,
+            rng_trace_scope={"run_id": request.run_dir.name},
+        )
+    )
+    for expected_scope_id in contract.scope_ids:
+        scope_started = time.perf_counter()
+        try:
+            scope_id, result = next(iterator)
+        except StopIteration as error:
+            raise RuntimeError(
+                "Photsim7 multiscope iterator ended before every scope was rendered"
+            ) from error
+        if int(scope_id) != expected_scope_id:
+            raise RuntimeError(
+                "Photsim7 multiscope iterator returned scope ids out of canonical "
+                f"order: expected {expected_scope_id}, received {scope_id}"
+            )
+        if torch is not None:
+            torch.cuda.synchronize()
+        mode = scope_modes[scope_id]
+        if mode == "skip":
+            del result
+            continue
+        if mode not in {
+            "parent_rendered_this_attempt",
+            "deterministic_parent_reconstruction",
+        }:
+            raise RuntimeError(f"unsupported shared-exposure scope mode {mode!r}")
+
+        scope_root = contract.scope_root(scope_id)
+        if mode == "parent_rendered_this_attempt":
+            options = api.FullFrameArtifactOptions(
+                save_frame_summaries=True,
+                save_cosmic_events=True,
+                save_bias=bool(request.spec.artifacts.save_bias_artifacts),
+                save_preview=frame_index < request.execution.preview_count,
+            )
+            writer = api.FullFrameArtifactWriter(scope_root, options=options)
+            _persist_scope_frame_result(writer=writer, result=result, spec=request.spec)
+            if not _scope_frame_is_complete(
+                contract,
+                scope_id=scope_id,
+                frame_index=frame_index,
+                expected_shape=expected_shape,
+                expected_spec=request.spec,
+            ):
+                raise RuntimeError(
+                    "Photsim7 scope artifacts failed readback validation for "
+                    f"frame {frame_index}, scope {scope_id}"
+                )
+            if request.execution.save_cosmic_mask:
+                cosmic = getattr(result.detector_result, "cosmic_metadata", None)
+                mask = None if cosmic is None else getattr(cosmic, "mask", None)
+                if mask is not None:
+                    mask_array = _as_numpy(mask)
+                    if mask_array.ndim == 3 and mask_array.shape[0] == 1:
+                        mask_array = mask_array[0]
+                    mask_path = (
+                        scope_root
+                        / "cosmic_events"
+                        / f"frame_{frame_index:06d}_mask.npy"
+                    )
+                    mask_path.parent.mkdir(parents=True, exist_ok=True)
+                    np.save(mask_path, mask_array)
+            if request.execution.save_stellar_mean:
+                stellar_mean = result.renderer_components.get("stellar_mean")
+                if stellar_mean is None:
+                    raise KeyError("Photsim7 did not return stellar_mean")
+                np.save(
+                    scope_root
+                    / "frames"
+                    / f"frame_{frame_index:06d}_stellar_mean_e.npy",
+                    _as_numpy(stellar_mean).astype(np.float32),
+                )
+            _record_frame_metrics(
+                scope_root,
+                frame_index,
+                rank=request.rank,
+                device=request.execution.device,
+                n_stars=int(catalog.n_sources),
+                pipeline_elapsed_s=time.perf_counter() - scope_started,
+                total_elapsed_s=time.perf_counter() - scope_started,
+                peak_cuda_allocated_mb=(
+                    None
+                    if torch is None
+                    else float(torch.cuda.max_memory_allocated() / 1024**2)
+                ),
+                peak_cuda_reserved_mb=(
+                    None
+                    if torch is None
+                    else float(torch.cuda.max_memory_reserved() / 1024**2)
+                ),
+            )
+        elif not _scope_frame_is_complete(
+            contract,
+            scope_id=scope_id,
+            frame_index=frame_index,
+            expected_shape=expected_shape,
+            expected_spec=request.spec,
+        ):
+            raise RuntimeError(
+                "shared-exposure reconstruction requires a complete scope parent: "
+                f"frame {frame_index}, scope {scope_id}"
+            )
+
+        batch = batch_by_scope_frame[scope_id][frame_index]
+        runtime_key = (scope_id, batch.batch_index)
+        runtime = runtime_by_scope_batch.get(runtime_key)
+        if runtime is None:
+            runtime = _open_shared_exposure_batch_runtime(
+                api=api,
+                request=request,
+                plan=plan,
+                windows=windows,
+                batch=batch,
+            )
+            runtime_by_scope_batch[runtime_key] = runtime
+        _queue_scope_shared_exposure_crops(
+            api=api,
+            request=request,
+            plan=plan,
+            windows=windows,
+            runtime=runtime,
+            parent_root=scope_root,
+            frame_index=frame_index,
+            result=result,
+        )
+        del result
+
+        batch_render_frames = render_frames_by_scope_batch[runtime_key]
+        if frame_index == batch_render_frames[-1]:
+            _finalize_scope_shared_exposure_batch(
+                api=api,
+                request=request,
+                plan=plan,
+                windows=windows,
+                runtime=runtime,
+                rendered_frames=batch_render_frames,
+                frame_modes=all_scope_modes[scope_id],
+                parent_root=scope_root,
+                scope_contract=contract,
+            )
+            runtime_by_scope_batch.pop(runtime_key, None)
+
+    try:
+        unexpected_scope_id, _ = next(iterator)
+    except StopIteration:
+        pass
+    else:
+        raise RuntimeError(
+            "Photsim7 multiscope iterator returned an unexpected extra scope "
+            f"{unexpected_scope_id}"
+        )
+
+
+def _run_multiscope_shared_exposure_worker(
+    *,
+    request: WorkerRequest,
+    api: Any,
+    scope_contract: FullFrameScopeArtifactContract,
+    assigned: tuple[int, ...],
+    expected_shape: tuple[int, int],
+    started: float,
+) -> WorkerResult:
+    """Run the exposure-first crop contract for the frozen six-scope system."""
+
+    if scope_contract.is_single_scope:
+        raise ValueError("multiscope shared exposure requires six scope artifacts")
+    shared = request.shared_exposure_stamps
+    if not shared.enabled:
+        raise ValueError("multiscope shared exposure requires enabled configuration")
+
+    from et_mainsim.shared_exposure import (
+        SharedExposureReferenceDriftError,
+        SharedExposureStorageGuardCache,
+        read_shared_exposure_frame_completion,
+        read_shared_exposure_target_plan,
+    )
+
+    shared_root = _shared_exposure_root(request.run_dir)
+    if (
+        not request.execution.resume
+        and not request.execution.overwrite
+        and os.path.lexists(shared_root)
+    ):
+        raise FileExistsError(
+            "shared-exposure bundle already exists; use resume or overwrite: "
+            f"{shared_root}"
+        )
+    if request.execution.overwrite and not request.shared_exposure_overwrite_prepared:
+        try:
+            shared_root.mkdir()
+        except FileExistsError as exc:
+            raise FileExistsError(
+                "the coordinator must clear the shared-exposure bundle before "
+                "an overwrite worker starts; direct overwrite refuses existing "
+                f"bundle state at {shared_root}"
+            ) from exc
+
+    plan_path = _shared_exposure_plan_path(request.run_dir)
+    shared_plan: dict[str, Any] | None = None
+    shared_windows: dict[int, Any] = {}
+    plan_exists = plan_path.exists()
+    if not plan_exists:
+        dependent_artifacts = (
+            [
+                path
+                for path in shared_root.rglob("*")
+                if path.is_file()
+                and not (
+                    path.parent == shared_root
+                    and path.name.startswith(f".{plan_path.name}.")
+                    and path.name.endswith(".tmp")
+                )
+            ]
+            if shared_root.exists()
+            else []
+        )
+        plan_exists = plan_path.exists()
+        if dependent_artifacts and not plan_exists:
+            raise SharedExposureReferenceDriftError(
+                "shared-exposure target plan is missing while dependent artifacts "
+                "remain"
+            )
+    if plan_exists:
+        shared_plan = read_shared_exposure_target_plan(plan_path)
+        _validate_shared_exposure_plan_for_request(shared_plan, request=request)
+        shared_windows = _shared_exposure_windows(shared_plan, api=api)
+
+    batches_by_scope = {
+        scope_id: _shared_exposure_frame_batches(
+            request,
+            assigned,
+            scope_id=scope_id,
+            scope_contract=scope_contract,
+        )
+        for scope_id in scope_contract.scope_ids
+    }
+    batch_by_scope_frame = {
+        scope_id: _shared_exposure_batch_by_frame(batches)
+        for scope_id, batches in batches_by_scope.items()
+    }
+    scope_modes: dict[int, dict[int, str]] = {
+        scope_id: {} for scope_id in scope_contract.scope_ids
+    }
+    skipped: list[int] = []
+    resume_snapshots: dict[
+        tuple[int, int], dict[str, _SharedExposureShardSnapshot]
+    ] = {}
+    resume_shard_paths: dict[tuple[int, int], dict[str, Path]] = {}
+    resume_guard_caches: dict[tuple[int, int], Any] = {}
+    linked_recovery_keys: set[tuple[int, int]] = set()
+
+    def resume_batch_state(
+        scope_id: int,
+        batch: _SharedExposureFrameBatch,
+    ) -> tuple[dict[str, Path], dict[str, _SharedExposureShardSnapshot], Any]:
+        key = (scope_id, batch.batch_index)
+        if key not in resume_snapshots:
+            if shared_plan is None:
+                raise RuntimeError("shared-exposure plan is required for resume")
+            shard_paths = _shared_exposure_batch_shard_paths(
+                batch,
+                plan_content_sha256=shared_plan["content_sha256"],
+                product_keys=shared.product_keys,
+            )
+            snapshots = _inspect_shared_exposure_shards(
+                api=api,
+                request=request,
+                plan=shared_plan,
+                windows=shared_windows,
+                batch=batch,
+                shard_paths=shard_paths,
+            )
+            resume_shard_paths[key] = shard_paths
+            resume_snapshots[key] = snapshots
+            resume_guard_caches[key] = SharedExposureStorageGuardCache()
+            if any(snapshot.has_linked_partial for snapshot in snapshots.values()):
+                linked_recovery_keys.add(key)
+        return (
+            resume_shard_paths[key],
+            resume_snapshots[key],
+            resume_guard_caches[key],
+        )
+
+    for frame_index in assigned:
+        every_scope_complete = True
+        for scope_id in scope_contract.scope_ids:
+            parent_root = scope_contract.scope_root(scope_id)
+            parent_complete = _scope_frame_is_complete(
+                scope_contract,
+                scope_id=scope_id,
+                frame_index=frame_index,
+                expected_shape=expected_shape,
+                expected_spec=request.spec,
+            )
+            if not request.execution.resume:
+                if not request.execution.overwrite and _has_partial_artifacts(
+                    parent_root,
+                    frame_index,
+                ):
+                    raise FileExistsError(
+                        f"Frame {frame_index}, scope {scope_id} already has "
+                        "artifacts; use resume or overwrite"
+                    )
+                scope_modes[scope_id][frame_index] = "parent_rendered_this_attempt"
+                every_scope_complete = False
+                continue
+            if shared_plan is None:
+                scope_modes[scope_id][frame_index] = (
+                    "deterministic_parent_reconstruction"
+                    if parent_complete
+                    else "parent_rendered_this_attempt"
+                )
+                every_scope_complete = False
+                continue
+
+            batch = batch_by_scope_frame[scope_id][frame_index]
+            shard_paths, snapshots, guard_cache = resume_batch_state(scope_id, batch)
+            marker_path = _shared_exposure_completion_path(
+                request.run_dir,
+                frame_index,
+                scope_id=scope_id,
+                scope_contract=scope_contract,
+            )
+            if marker_path.exists():
+                marker = read_shared_exposure_frame_completion(
+                    marker_path,
+                    reference_root=request.run_dir,
+                    storage_guard_cache=guard_cache,
+                )
+                _validate_shared_exposure_marker_for_request(
+                    marker,
+                    request=request,
+                    plan=shared_plan,
+                    frame_index=frame_index,
+                    shard_paths=shard_paths,
+                    parent_root=parent_root,
+                )
+                if not parent_complete:
+                    raise SharedExposureReferenceDriftError(
+                        "shared-exposure completion exists but its scope parent "
+                        f"is incomplete for frame {frame_index}, scope {scope_id}"
+                    )
+                if not _shared_exposure_frame_has_complete_finals(
+                    snapshots,
+                    product_keys=shared.product_keys,
+                    target_source_ids=shared.target_source_ids,
+                    frame_index=frame_index,
+                    complete_status=api.ItemStatus.COMPLETE,
+                ):
+                    raise SharedExposureReferenceDriftError(
+                        "shared-exposure completion marker does not resolve to "
+                        "complete final shards for "
+                        f"frame {frame_index}, scope {scope_id}"
+                    )
+                scope_modes[scope_id][frame_index] = "skip"
+                continue
+
+            every_scope_complete = False
+            if parent_complete:
+                scope_modes[scope_id][frame_index] = (
+                    "deterministic_parent_reconstruction"
+                )
+                continue
+            if _shared_exposure_frame_has_complete_item(
+                snapshots,
+                target_source_ids=shared.target_source_ids,
+                frame_index=frame_index,
+                complete_status=api.ItemStatus.COMPLETE,
+            ):
+                raise SharedExposureReferenceDriftError(
+                    "shared-exposure crop is complete but its scope parent is "
+                    f"incomplete for frame {frame_index}, scope {scope_id}"
+                )
+            scope_modes[scope_id][frame_index] = "parent_rendered_this_attempt"
+        if every_scope_complete:
+            skipped.append(frame_index)
+
+    # Validate every marker before cleaning recoverable final/partial hard-link
+    # debris.  This mirrors the single-scope ordering and never mutates a bad
+    # control plane artifact.
+    if shared_plan is not None and request.execution.resume:
+        for scope_id, batch_index in sorted(linked_recovery_keys):
+            batch = batches_by_scope[scope_id][batch_index]
+            shard_paths = resume_shard_paths[(scope_id, batch_index)]
+            snapshots = resume_snapshots[(scope_id, batch_index)]
+            _recover_linked_shared_exposure_publications(
+                api=api,
+                request=request,
+                plan=shared_plan,
+                windows=shared_windows,
+                batch=batch,
+                shard_paths=shard_paths,
+                snapshots=snapshots,
+            )
+    for snapshots in resume_snapshots.values():
+        snapshots.clear()
+    for cache in resume_guard_caches.values():
+        cache.clear()
+
+    to_render = tuple(
+        frame_index
+        for frame_index in assigned
+        if any(
+            scope_modes[scope_id][frame_index] != "skip"
+            for scope_id in scope_contract.scope_ids
+        )
+    )
+    if not to_render:
+        _atomic_json(
+            request.run_dir / f"worker_{request.rank:02d}_start.json",
+            {
+                "schema_id": "et_mainsim.full_frame_worker",
+                "schema_version": 1,
+                "rank": request.rank,
+                "world_size": request.world_size,
+                "pid": os.getpid(),
+                "device": request.execution.device,
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "assigned_frames": list(assigned),
+                "render_frames": [],
+                "skipped_frames": skipped,
+                "catalog_cache": str(request.catalog_cache),
+                "n_sources": None,
+            },
+        )
+        result = WorkerResult(
+            rank=request.rank,
+            rendered=(),
+            skipped=tuple(skipped),
+            elapsed_s=time.perf_counter() - started,
+        )
+        _atomic_json(
+            request.run_dir / f"worker_{request.rank:02d}_done.json",
+            {
+                "schema_id": "et_mainsim.full_frame_worker",
+                "schema_version": 1,
+                **result.to_dict(),
+            },
+        )
+        return result
+
+    catalog = api.StarCatalogCache.read(request.catalog_cache)
+    catalog = _select_brightest_catalog(catalog, request.execution.max_stars, api)
+    registry = api.DataRegistry(data_root=request.data_root)
+    services = api.build_multiscope_full_frame_services(
+        request.spec,
+        catalog=catalog,
+        data_registry=registry,
+    )
+    if shared_plan is None:
+        from et_mainsim.shared_exposure import (
+            build_shared_exposure_target_plan,
+            publish_shared_exposure_target_plan,
+        )
+
+        geometry = api.resolve_full_frame_source_pixel_geometry(services.services[0])
+        shared_plan = build_shared_exposure_target_plan(
+            geometry,
+            shared.target_source_ids,
+            detector_shape=expected_shape,
+            stamp_shape=shared.stamp_shape,
+        )
+        _validate_shared_exposure_plan_for_request(shared_plan, request=request)
+        publish_shared_exposure_target_plan(plan_path, shared_plan)
+        shared_windows = _shared_exposure_windows(shared_plan, api=api)
+
+    render_frames_by_scope_batch = {
+        (scope_id, batch.batch_index): tuple(
+            frame_index
+            for frame_index in batch.frame_ids
+            if scope_modes[scope_id][frame_index] != "skip"
+        )
+        for scope_id, batches in batches_by_scope.items()
+        for batch in batches
+        if any(scope_modes[scope_id][frame_index] != "skip" for frame_index in batch.frame_ids)
+    }
+    if any(
+        scope_modes[scope_id][frame_index] == "parent_rendered_this_attempt"
+        for scope_id in scope_contract.scope_ids
+        for frame_index in to_render
+    ):
+        _write_effect_timeseries(request.run_dir, services, request.rank)
+
+    _atomic_json(
+        request.run_dir / f"worker_{request.rank:02d}_start.json",
+        {
+            "schema_id": "et_mainsim.full_frame_worker",
+            "schema_version": 1,
+            "rank": request.rank,
+            "world_size": request.world_size,
+            "pid": os.getpid(),
+            "device": request.execution.device,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "assigned_frames": list(assigned),
+            "render_frames": list(to_render),
+            "scope_render_modes": {
+                str(scope_id): {
+                    str(frame_index): scope_modes[scope_id][frame_index]
+                    for frame_index in to_render
+                }
+                for scope_id in scope_contract.scope_ids
+            },
+            "skipped_frames": skipped,
+            "catalog_cache": str(request.catalog_cache),
+            "n_sources": int(catalog.n_sources),
+        },
+    )
+
+    runtime_by_scope_batch: dict[tuple[int, int], _SharedExposureBatchRuntime] = {}
+    rendered: list[int] = []
+    try:
+        for frame_index in to_render:
+            _render_multiscope_shared_exposure_frame(
+                request=request,
+                api=api,
+                services=services,
+                contract=scope_contract,
+                catalog=catalog,
+                frame_index=frame_index,
+                expected_shape=expected_shape,
+                plan=shared_plan,
+                windows=shared_windows,
+                scope_modes={
+                    scope_id: scope_modes[scope_id][frame_index]
+                    for scope_id in scope_contract.scope_ids
+                },
+                runtime_by_scope_batch=runtime_by_scope_batch,
+                batch_by_scope_frame=batch_by_scope_frame,
+                render_frames_by_scope_batch=render_frames_by_scope_batch,
+                all_scope_modes=scope_modes,
+            )
+            if not frame_completion(
+                request.run_dir,
+                frame_index,
+                expected_shape=expected_shape,
+                expected_spec=request.spec,
+            ).is_complete:
+                raise RuntimeError(
+                    "Photsim7 scope artifacts failed all-scope readback "
+                    f"validation for frame {frame_index}"
+                )
+            rendered.append(frame_index)
+        if runtime_by_scope_batch:
+            raise RuntimeError(
+                "shared-exposure scope batches remained open after their final "
+                "assigned frame"
+            )
+    except BaseException as primary_error:
+        close_errors: list[tuple[int, str, Exception]] = []
+        for runtime in runtime_by_scope_batch.values():
+            close_errors.extend(
+                _close_shared_exposure_writers(
+                    {runtime.batch.batch_index: runtime.writers}
+                )
+            )
+        for batch_index, product_key, close_error in close_errors:
+            primary_error.add_note(
+                "shared-exposure writer close failed for "
+                f"batch {batch_index}, product {product_key!r}: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        raise
+
+    result = WorkerResult(
+        rank=request.rank,
+        rendered=tuple(rendered),
+        skipped=tuple(skipped),
+        elapsed_s=time.perf_counter() - started,
+    )
+    _atomic_json(
+        request.run_dir / f"worker_{request.rank:02d}_done.json",
+        {
+            "schema_id": "et_mainsim.full_frame_worker",
+            "schema_version": 1,
+            **result.to_dict(),
+        },
+    )
+    return result
+
+
 def run_worker(
     request: WorkerRequest, *, science_api: Any | None = None
 ) -> WorkerResult:
     api = _science_api() if science_api is None else science_api
     started = time.perf_counter()
     expected_shape = tuple(int(value) for value in request.spec.detector.shape)
+    scope_contract = _scope_contract_for_spec(request.run_dir, request.spec)
     assigned = tuple(request.frame_indices[request.rank :: request.world_size])
     request.run_dir.mkdir(parents=True, exist_ok=True)
 
     shared = request.shared_exposure_stamps
+    if shared.enabled and not scope_contract.is_single_scope:
+        return _run_multiscope_shared_exposure_worker(
+            request=request,
+            api=api,
+            scope_contract=scope_contract,
+            assigned=assigned,
+            expected_shape=expected_shape,
+            started=started,
+        )
     shared_root = _shared_exposure_root(request.run_dir)
     if (
         shared.enabled
@@ -1472,12 +2822,12 @@ def run_worker(
             shared_windows = _shared_exposure_windows(shared_plan, api=api)
 
     parent_complete_by_frame = {
-        frame_index: frame_is_complete(
+        frame_index: frame_completion(
             request.run_dir,
             frame_index,
             expected_shape=expected_shape,
             expected_spec=request.spec,
-        )
+        ).is_complete
         for frame_index in assigned
     }
     frame_modes: dict[int, str] = {}
@@ -1490,8 +2840,9 @@ def run_worker(
     for frame_index in assigned:
         parent_complete = parent_complete_by_frame[frame_index]
         if not request.execution.resume:
-            if not request.execution.overwrite and _has_partial_artifacts(
-                request.run_dir, frame_index
+            if not request.execution.overwrite and _has_partial_scope_artifacts(
+                scope_contract,
+                frame_index,
             ):
                 raise FileExistsError(
                     f"Frame {frame_index} already has artifacts; use resume or "
@@ -1685,11 +3036,18 @@ def run_worker(
         api,
     )
     registry = api.DataRegistry(data_root=request.data_root)
-    services = api.build_full_frame_services(
-        request.spec,
-        catalog=catalog,
-        data_registry=registry,
-    )
+    if scope_contract.is_single_scope:
+        services = api.build_full_frame_services(
+            request.spec,
+            catalog=catalog,
+            data_registry=registry,
+        )
+    else:
+        services = api.build_multiscope_full_frame_services(
+            request.spec,
+            catalog=catalog,
+            data_registry=registry,
+        )
     shared_writers_by_batch: dict[int, dict[str, Any]] = {}
     if shared.enabled:
         from et_mainsim.shared_exposure import (
@@ -1762,6 +3120,18 @@ def run_worker(
     rendered: list[int] = []
     try:
         for frame_index in to_render:
+            if not scope_contract.is_single_scope:
+                _render_multiscope_frame(
+                    request=request,
+                    api=api,
+                    services=services,
+                    contract=scope_contract,
+                    catalog=catalog,
+                    frame_index=frame_index,
+                    expected_shape=expected_shape,
+                )
+                rendered.append(frame_index)
+                continue
             if request.execution.overwrite:
                 absolute_raw_frame_index = (
                     _ET_FULL_FRAME_ABSOLUTE_RAW_FRAME_START_INDEX + int(frame_index)
@@ -2437,7 +3807,16 @@ def _shared_exposure_incomplete_frames_for_worker(
         return ()
     api = _science_api() if science_api is None else science_api
     assigned = tuple(request.frame_indices[request.rank :: request.world_size])
-    batches = _shared_exposure_frame_batches(request, assigned)
+    scope_contract = _scope_contract_for_spec(request.run_dir, request.spec)
+    batches_by_scope = {
+        scope_id: _shared_exposure_frame_batches(
+            request,
+            assigned,
+            scope_id=scope_id,
+            scope_contract=scope_contract,
+        )
+        for scope_id in scope_contract.scope_ids
+    }
     from et_mainsim.shared_exposure import (
         SharedExposureStorageGuardCache,
         read_shared_exposure_frame_completion,
@@ -2450,53 +3829,58 @@ def _shared_exposure_incomplete_frames_for_worker(
     plan = read_shared_exposure_target_plan(plan_path)
     _validate_shared_exposure_plan_for_request(plan, request=request)
     windows = _shared_exposure_windows(plan, api=api)
-    incomplete: list[int] = []
-    for batch in batches:
-        storage_guard_cache = SharedExposureStorageGuardCache()
-        shard_paths = _shared_exposure_batch_shard_paths(
-            batch,
-            plan_content_sha256=plan["content_sha256"],
-            product_keys=request.shared_exposure_stamps.product_keys,
-        )
-        snapshots = _inspect_shared_exposure_shards(
-            api=api,
-            request=request,
-            plan=plan,
-            windows=windows,
-            batch=batch,
-            shard_paths=shard_paths,
-        )
-        for frame_index in batch.frame_ids:
-            marker_path = _shared_exposure_completion_path(
-                request.run_dir,
-                frame_index,
+    incomplete: set[int] = set()
+    for scope_id, batches in batches_by_scope.items():
+        parent_root = scope_contract.scope_root(scope_id)
+        for batch in batches:
+            storage_guard_cache = SharedExposureStorageGuardCache()
+            shard_paths = _shared_exposure_batch_shard_paths(
+                batch,
+                plan_content_sha256=plan["content_sha256"],
+                product_keys=request.shared_exposure_stamps.product_keys,
             )
-            if not marker_path.is_file():
-                incomplete.append(frame_index)
-                continue
-            marker = read_shared_exposure_frame_completion(
-                marker_path,
-                reference_root=request.run_dir,
-                storage_guard_cache=storage_guard_cache,
-            )
-            _validate_shared_exposure_marker_for_request(
-                marker,
+            snapshots = _inspect_shared_exposure_shards(
+                api=api,
                 request=request,
                 plan=plan,
-                frame_index=frame_index,
+                windows=windows,
+                batch=batch,
                 shard_paths=shard_paths,
             )
-            if not _shared_exposure_frame_has_complete_finals(
-                snapshots,
-                product_keys=request.shared_exposure_stamps.product_keys,
-                target_source_ids=request.shared_exposure_stamps.target_source_ids,
-                frame_index=frame_index,
-                complete_status=api.ItemStatus.COMPLETE,
-            ):
-                incomplete.append(frame_index)
-        snapshots.clear()
-        storage_guard_cache.clear()
-    return tuple(incomplete)
+            for frame_index in batch.frame_ids:
+                marker_path = _shared_exposure_completion_path(
+                    request.run_dir,
+                    frame_index,
+                    scope_id=scope_id,
+                    scope_contract=scope_contract,
+                )
+                if not marker_path.is_file():
+                    incomplete.add(frame_index)
+                    continue
+                marker = read_shared_exposure_frame_completion(
+                    marker_path,
+                    reference_root=request.run_dir,
+                    storage_guard_cache=storage_guard_cache,
+                )
+                _validate_shared_exposure_marker_for_request(
+                    marker,
+                    request=request,
+                    plan=plan,
+                    frame_index=frame_index,
+                    shard_paths=shard_paths,
+                    parent_root=parent_root,
+                )
+                if not _shared_exposure_frame_has_complete_finals(
+                    snapshots,
+                    product_keys=request.shared_exposure_stamps.product_keys,
+                    target_source_ids=request.shared_exposure_stamps.target_source_ids,
+                    frame_index=frame_index,
+                    complete_status=api.ItemStatus.COMPLETE,
+                ):
+                    incomplete.add(frame_index)
+            snapshots.clear()
+            storage_guard_cache.clear()
+    return tuple(frame_index for frame_index in assigned if frame_index in incomplete)
 
 
 def run_full_frame(
@@ -2506,6 +3890,7 @@ def run_full_frame(
     science_api: Any | None = None,
 ) -> dict[str, Any]:
     preflight(plan)
+    scope_contract = _scope_contract_for_spec(plan.run_dir, plan.spec)
     store = RunManifestStore(plan.run_dir / "run_manifest.json")
     if (
         plan.run_dir.exists()
@@ -2536,8 +3921,7 @@ def run_full_frame(
 
         artifacts: dict[str, Any] = {
             "run_manifest": str(store.path),
-            "frames": str(plan.run_dir / "frames"),
-            "frame_summaries": str(plan.run_dir / "frame_summaries"),
+            **scope_contract.to_manifest_artifacts(),
             "frame_product_schema_id": FRAME_PRODUCT_SCHEMA_ID,
             "frame_product_schema_version": FRAME_PRODUCT_SCHEMA_VERSION,
             "selection_truth": _full_frame_product_contract(),
@@ -2552,11 +3936,9 @@ def run_full_frame(
             )
 
             shared_root = _shared_exposure_root(plan.run_dir)
-            artifacts["shared_exposure"] = {
+            shared_artifacts: dict[str, Any] = {
                 "root": str(shared_root),
                 "target_plan": str(_shared_exposure_plan_path(plan.run_dir)),
-                "completion_markers": str(shared_root / "completion"),
-                "worker_shards": str(shared_root / "shards"),
                 "target_plan_schema_id": TARGET_PLAN_SCHEMA_ID,
                 "target_plan_schema_version": TARGET_PLAN_SCHEMA_VERSION,
                 "frame_completion_schema_id": FRAME_COMPLETION_SCHEMA_ID,
@@ -2568,6 +3950,51 @@ def run_full_frame(
                 "independent_stamp_simulation": False,
                 "zero_new_rng_draws": True,
             }
+            if scope_contract.is_single_scope:
+                # Preserve the frozen single-scope manifest projection exactly.
+                shared_artifacts.update(
+                    {
+                        "completion_markers": str(shared_root / "completion"),
+                        "worker_shards": str(shared_root / "shards"),
+                    }
+                )
+            else:
+                shared_artifacts.update(
+                    {
+                        "layout": "per_scope_directories",
+                        "scope_ids": list(scope_contract.scope_ids),
+                        "image_level_combination": "forbidden",
+                        "scopes": {
+                            f"scope_{scope_id}": {
+                                "root": str(
+                                    _shared_exposure_scope_root(
+                                        plan.run_dir,
+                                        scope_id=scope_id,
+                                        scope_contract=scope_contract,
+                                    )
+                                ),
+                                "completion_markers": str(
+                                    _shared_exposure_scope_root(
+                                        plan.run_dir,
+                                        scope_id=scope_id,
+                                        scope_contract=scope_contract,
+                                    )
+                                    / "completion"
+                                ),
+                                "worker_shards": str(
+                                    _shared_exposure_scope_root(
+                                        plan.run_dir,
+                                        scope_id=scope_id,
+                                        scope_contract=scope_contract,
+                                    )
+                                    / "shards"
+                                ),
+                            }
+                            for scope_id in scope_contract.scope_ids
+                        },
+                    }
+                )
+            artifacts["shared_exposure"] = shared_artifacts
         store.create(
             workflow="et-full-frame",
             preset=plan.preset_name,
@@ -2641,12 +4068,12 @@ def run_full_frame(
         incomplete = [
             frame_index
             for frame_index in plan.frame_indices
-            if not frame_is_complete(
+            if not frame_completion(
                 plan.run_dir,
                 frame_index,
                 expected_shape=tuple(plan.spec.detector.shape),
                 expected_spec=plan.spec,
-            )
+            ).is_complete
         ]
         if incomplete:
             raise RuntimeError(

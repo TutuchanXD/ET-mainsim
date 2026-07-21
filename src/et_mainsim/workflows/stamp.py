@@ -399,6 +399,11 @@ def _frame_plan(spec: Any) -> dict[str, Any]:
 
 
 def preflight(plan: StampRunPlan) -> None:
+    if int(plan.spec.instrument.telescope_count) != 1:
+        raise ValueError(
+            "independent et-stamp cannot create a six-scope same-exposure "
+            "product; use et-full-frame with shared_exposure_stamps"
+        )
     if plan.paths.data_root is None:
         raise ValueError("ET_DATA_DIR or paths.data_root is required to run")
     if not plan.paths.data_root.is_dir():

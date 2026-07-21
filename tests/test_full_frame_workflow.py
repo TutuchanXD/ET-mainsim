@@ -87,12 +87,106 @@ def _artifact_paths_for_test(run_dir: Path, frame_index: int) -> tuple[Path, ...
     )
 
 
+def _legacy_single_scope_spec(spec):
+    """Make legacy-root tests explicit without changing science defaults."""
+
+    return replace(
+        spec,
+        instrument=replace(spec.instrument, telescope_count=1),
+    )
+
+
+def test_scope_persistence_reuses_persisted_selection_metadata_in_provenance() -> None:
+    from et_mainsim.workflows.full_frame import _persist_scope_frame_result
+    from photsim7.frame_products import FrameArrayProduct, SingleCadenceFrameProducts
+
+    in_memory_selection = {
+        "schema_id": "photsim7.cadence_selection_truth.v1",
+        "verification_status": "complete_in_memory",
+    }
+    product = SingleCadenceFrameProducts(
+        frame_index=0,
+        detector_id="main_rd",
+        final_frame=FrameArrayProduct(
+            name="final_frame",
+            array=np.zeros((3, 5), dtype=np.uint16),
+            unit="dn",
+            domain="dn",
+        ),
+        frame_summary={"frame_index": 0},
+        selection_truth=in_memory_selection,
+        provenance={
+            "services": {"scope": {"scope_id": 0, "scope_count": 6}},
+            "selection_truth": in_memory_selection,
+        },
+    )
+    truth = SimpleNamespace(
+        schema_id="photsim7.cadence_selection_truth.v1",
+        schema_version=1,
+        science_conformance_claim=True,
+        content_sha256="a" * 64,
+        geometry_reference={"content_sha256": "b" * 64},
+        psf_reference={"content_sha256": "c" * 64},
+        jitter_model_selection_truth=SimpleNamespace(
+            to_json_dict=lambda: {"model_index": 4}
+        ),
+    )
+
+    def identity(label: str, digest: str):
+        return SimpleNamespace(
+            relative_path=f"selection_truth/{label}/{digest}.json",
+            schema_id=f"test.{label}.v1",
+            schema_version=1,
+            content_sha256=digest * 64,
+        )
+
+    artifacts = SimpleNamespace(
+        geometry=identity("geometry", "b"),
+        psf=identity("psf", "c"),
+        cadence=identity("cadence", "a"),
+    )
+
+    class RecordingWriter:
+        written_product = None
+
+        def write_selection_truth(self, value):
+            assert value is truth
+            return artifacts
+
+        def write_frame(self, *args, **kwargs):
+            return None
+
+        def write_frame_product_schema(self, value):
+            self.written_product = value
+
+    writer = RecordingWriter()
+    result = SimpleNamespace(
+        frame_products=product,
+        selection_truth=truth,
+        detector_result=SimpleNamespace(cosmic_metadata=None, bias_metadata=None),
+    )
+    spec = SimpleNamespace(
+        science_profile=SimpleNamespace(profile_id="legacy_science_v1")
+    )
+
+    _persist_scope_frame_result(writer=writer, result=result, spec=spec)
+
+    persisted = writer.written_product.selection_truth
+    assert persisted["verification_status"] == "persisted_and_verified"
+    assert writer.written_product.provenance["selection_truth"] is persisted
+    assert writer.written_product.provenance["services"] == {
+        "scope": {"scope_id": 0, "scope_count": 6}
+    }
+
+
 def test_resume_requires_frame_summary_schema_and_matching_shape(tmp_path) -> None:
     from et_mainsim.workflows.full_frame import frame_is_complete
     from photsim7.spec_factories import make_et_main_detector_spec
 
     run_dir = tmp_path / "run"
-    base = make_et_main_detector_spec(shape=(5, 7), run_seed=7)
+    base = _legacy_single_scope_spec(
+        make_et_main_detector_spec(shape=(5, 7), run_seed=7)
+    )
     spec = replace(
         base,
         psf=replace(base.psf, use_jitter_integrated_psf=False),
@@ -143,13 +237,395 @@ def test_resume_requires_frame_summary_schema_and_matching_shape(tmp_path) -> No
     )
 
 
+def test_six_scope_worker_persists_scope_local_products_and_requires_all_scopes(
+    tmp_path,
+) -> None:
+    from et_mainsim.config import ExecutionConfig
+    from et_mainsim.workflows.full_frame import (
+        WorkerRequest,
+        frame_completion,
+        run_worker,
+    )
+    from photsim7.frame_products import FrameArrayProduct, SingleCadenceFrameProducts
+    from photsim7.full_frame_artifacts import (
+        FullFrameArtifactOptions,
+        FullFrameArtifactWriter,
+    )
+    from photsim7.spec_factories import make_et_main_detector_spec
+
+    base = make_et_main_detector_spec(shape=(5, 7), run_seed=7)
+    spec = replace(
+        base,
+        instrument=replace(base.instrument, telescope_count=6),
+        psf=replace(base.psf, use_jitter_integrated_psf=False),
+    )
+    catalog = SimpleNamespace(
+        n_sources=1,
+        star_data={"et_mag": np.array([12.0])},
+    )
+    yielded_scope_ids: list[int] = []
+
+    class FakeCache:
+        @staticmethod
+        def read(path):
+            return catalog
+
+    class FakeRegistry:
+        def __init__(self, *, data_root):
+            self.data_root = Path(data_root)
+
+    def fake_iter_scopes(typed_spec, *, services, frame_index, **kwargs):
+        assert typed_spec is spec
+        assert services == "six-scope-services"
+        assert frame_index == 0
+        for scope_id in range(6):
+            yielded_scope_ids.append(scope_id)
+            product = SingleCadenceFrameProducts(
+                frame_index=frame_index,
+                detector_id=typed_spec.detector.detector_id,
+                final_frame=FrameArrayProduct(
+                    name="final_frame",
+                    array=np.full((5, 7), scope_id, dtype=np.uint16),
+                    unit="dn",
+                    domain="dn",
+                ),
+                frame_summary={"frame_index": frame_index},
+                selection_truth=_unavailable_selection_marker(
+                    profile_id=typed_spec.science_profile.profile_id
+                ),
+                provenance={
+                    "services": {
+                        "scope": {"scope_id": scope_id, "scope_count": 6}
+                    }
+                },
+            )
+            yield scope_id, SimpleNamespace(
+                frame_products=product,
+                detector_result=SimpleNamespace(
+                    cosmic_metadata=None,
+                    bias_metadata=None,
+                ),
+                renderer_components={},
+                selection_truth=None,
+            )
+
+    api = SimpleNamespace(
+        DataRegistry=FakeRegistry,
+        StarCatalogCache=FakeCache,
+        FullFrameArtifactOptions=FullFrameArtifactOptions,
+        FullFrameArtifactWriter=FullFrameArtifactWriter,
+        build_multiscope_full_frame_services=(
+            lambda typed_spec, *, catalog, data_registry: "six-scope-services"
+        ),
+        iter_single_cadence_full_frame_scopes=fake_iter_scopes,
+    )
+    request = WorkerRequest(
+        spec=spec,
+        execution=ExecutionConfig(
+            backend="in-process",
+            device="cpu",
+            resume=True,
+            preview_count=0,
+        ),
+        run_dir=tmp_path / "run",
+        data_root=tmp_path / "data",
+        catalog_cache=tmp_path / "stars.npz",
+        frame_indices=(0,),
+    )
+
+    result = run_worker(request, science_api=api)
+
+    assert result.rendered == (0,)
+    assert yielded_scope_ids == [0, 1, 2, 3, 4, 5]
+    assert not (request.run_dir / "frames" / "frame_000000.npy").exists()
+    for scope_id in range(6):
+        schema_path = (
+            request.run_dir
+            / f"scope_{scope_id}"
+            / "frame_summaries"
+            / "frame_000000_schema.json"
+        )
+        assert schema_path.is_file()
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        assert schema["provenance"]["services"]["scope"]["scope_id"] == scope_id
+
+    completion = frame_completion(
+        request.run_dir,
+        0,
+        expected_shape=(5, 7),
+        expected_spec=spec,
+    )
+    assert completion.is_complete is True
+
+    scope_zero_summary = (
+        request.run_dir
+        / "scope_0"
+        / "frame_summaries"
+        / "frame_000000.json"
+    )
+    scope_zero_summary_before_repair = scope_zero_summary.read_bytes()
+    scope_five_schema = (
+        request.run_dir
+        / "scope_5"
+        / "frame_summaries"
+        / "frame_000000_schema.json"
+    )
+    corrupt = json.loads(scope_five_schema.read_text(encoding="utf-8"))
+    corrupt["provenance"]["services"]["scope"]["scope_id"] = 4
+    scope_five_schema.write_text(json.dumps(corrupt), encoding="utf-8")
+
+    assert (
+        frame_completion(
+            request.run_dir,
+            0,
+            expected_shape=(5, 7),
+            expected_spec=spec,
+        ).is_complete
+        is False
+    )
+
+    yielded_scope_ids.clear()
+    repaired = run_worker(request, science_api=api)
+
+    assert repaired.rendered == (0,)
+    assert yielded_scope_ids == [0, 1, 2, 3, 4, 5]
+    assert scope_zero_summary.read_bytes() == scope_zero_summary_before_repair
+    assert (
+        frame_completion(
+            request.run_dir,
+            0,
+            expected_shape=(5, 7),
+            expected_spec=spec,
+        ).is_complete
+        is True
+    )
+
+
+def test_six_scope_run_manifest_and_completion_use_scope_products(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from et_mainsim.config import (
+        EXECUTION_SCHEMA_ID,
+        EXECUTION_SCHEMA_VERSION,
+        ExecutionConfig,
+        FullFrameWorkload,
+        RunConfig,
+        RunPaths,
+    )
+    from et_mainsim.workflows import full_frame
+    from et_mainsim.workflows.full_frame import (
+        FullFrameRunPlan,
+        WorkerResult,
+        run_full_frame,
+    )
+    from photsim7.spec_factories import make_et_main_detector_spec
+
+    base = make_et_main_detector_spec(shape=(5, 7), run_seed=7)
+    spec = replace(
+        base,
+        instrument=replace(base.instrument, telescope_count=6),
+        psf=replace(base.psf, use_jitter_integrated_psf=False),
+    )
+    config = RunConfig(
+        schema_id=EXECUTION_SCHEMA_ID,
+        schema_version=EXECUTION_SCHEMA_VERSION,
+        workflow="et-full-frame",
+        run_id="six-scope",
+        paths=RunPaths(
+            output_root=str(tmp_path),
+            data_root=str(tmp_path / "data"),
+            catalog_cache=str(tmp_path / "stars.npz"),
+        ),
+        execution=ExecutionConfig(
+            backend="in-process",
+            device="cpu",
+            resume=True,
+            preview_count=0,
+        ),
+        workload=FullFrameWorkload(),
+    )
+    plan = FullFrameRunPlan(
+        preset_name="six-scope-test",
+        run_config=config,
+        paths=config.resolve_paths(cwd=tmp_path),
+        spec=spec,
+        run_dir=tmp_path / "six-scope",
+        catalog_cache=tmp_path / "stars.npz",
+        frame_indices=(0,),
+        repo_root=tmp_path,
+    )
+
+    monkeypatch.setattr(full_frame, "preflight", lambda _plan: None)
+    monkeypatch.setattr(
+        full_frame,
+        "prepare_catalog",
+        lambda _plan, **kwargs: SimpleNamespace(n_sources=1, metadata={}),
+    )
+
+    def fake_worker(request, **kwargs):
+        for scope_id in range(6):
+            _write_complete_frame(request.run_dir / f"scope_{scope_id}", 0)
+            schema_path = (
+                request.run_dir
+                / f"scope_{scope_id}"
+                / "frame_summaries"
+                / "frame_000000_schema.json"
+            )
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            schema["provenance"] = {
+                "services": {
+                    "scope": {"scope_id": scope_id, "scope_count": 6}
+                }
+            }
+            schema_path.write_text(json.dumps(schema), encoding="utf-8")
+        return WorkerResult(rank=0, rendered=(0,), skipped=(), elapsed_s=0.0)
+
+    monkeypatch.setattr(full_frame, "run_worker", fake_worker)
+
+    result = run_full_frame(plan)
+
+    assert result["status"] == "completed"
+    artifacts = result["artifacts"]
+    assert artifacts["layout"] == "per_scope_directories"
+    assert artifacts["image_level_combination"] == "forbidden"
+    assert "frames" not in artifacts
+    assert artifacts["scopes"]["scope_0"]["frames"].endswith(
+        "six-scope/scope_0/frames"
+    )
+
+
+def test_six_scope_manifest_namespaces_shared_exposure_artifacts(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """The coordinator advertises scope-local crop products, never a sum."""
+
+    from et_mainsim.config import (
+        EXECUTION_SCHEMA_ID,
+        EXECUTION_SCHEMA_VERSION,
+        ExecutionConfig,
+        FullFrameWorkload,
+        RunConfig,
+        RunPaths,
+        SharedExposureStampsConfig,
+    )
+    from et_mainsim.workflows import full_frame
+    from et_mainsim.workflows.full_frame import (
+        FullFrameRunPlan,
+        WorkerResult,
+        run_full_frame,
+    )
+    from photsim7.spec_factories import make_et_main_detector_spec
+
+    base = make_et_main_detector_spec(shape=(5, 7), run_seed=7)
+    spec = replace(
+        base,
+        instrument=replace(base.instrument, telescope_count=6),
+        psf=replace(base.psf, use_jitter_integrated_psf=False),
+    )
+    shared = SharedExposureStampsConfig(
+        enabled=True,
+        target_source_ids=(11,),
+        stamp_rows=5,
+        stamp_cols=7,
+        frames_per_shard=1,
+    )
+    config = RunConfig(
+        schema_id=EXECUTION_SCHEMA_ID,
+        schema_version=EXECUTION_SCHEMA_VERSION,
+        workflow="et-full-frame",
+        run_id="six-scope-shared",
+        paths=RunPaths(
+            output_root=str(tmp_path),
+            data_root=str(tmp_path / "data"),
+            catalog_cache=str(tmp_path / "stars.npz"),
+        ),
+        execution=ExecutionConfig(
+            backend="in-process",
+            device="cpu",
+            resume=True,
+            preview_count=0,
+        ),
+        workload=FullFrameWorkload(shared_exposure_stamps=shared),
+    )
+    plan = FullFrameRunPlan(
+        preset_name="six-scope-shared-test",
+        run_config=config,
+        paths=config.resolve_paths(cwd=tmp_path),
+        spec=spec,
+        run_dir=tmp_path / "six-scope-shared",
+        catalog_cache=tmp_path / "stars.npz",
+        frame_indices=(0,),
+        repo_root=tmp_path,
+    )
+
+    monkeypatch.setattr(full_frame, "preflight", lambda _plan: None)
+    monkeypatch.setattr(
+        full_frame,
+        "prepare_catalog",
+        lambda _plan, **kwargs: SimpleNamespace(n_sources=1, metadata={}),
+    )
+
+    def fake_worker(request, **kwargs):
+        for scope_id in range(6):
+            _write_complete_frame(request.run_dir / f"scope_{scope_id}", 0)
+            schema_path = (
+                request.run_dir
+                / f"scope_{scope_id}"
+                / "frame_summaries"
+                / "frame_000000_schema.json"
+            )
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            schema["provenance"] = {
+                "services": {
+                    "scope": {"scope_id": scope_id, "scope_count": 6}
+                }
+            }
+            schema_path.write_text(json.dumps(schema), encoding="utf-8")
+        return WorkerResult(rank=0, rendered=(0,), skipped=(), elapsed_s=0.0)
+
+    audit_requests = []
+    monkeypatch.setattr(full_frame, "run_worker", fake_worker)
+    monkeypatch.setattr(
+        full_frame,
+        "_shared_exposure_incomplete_frames_for_worker",
+        lambda request, **kwargs: (audit_requests.append(request), ())[1],
+    )
+
+    result = run_full_frame(plan)
+
+    assert result["status"] == "completed"
+    assert len(audit_requests) == 1
+    artifacts = result["artifacts"]["shared_exposure"]
+    assert artifacts["layout"] == "per_scope_directories"
+    assert artifacts["image_level_combination"] == "forbidden"
+    assert artifacts["target_plan"].endswith("shared_exposure/target_plan.json")
+    assert "completion_markers" not in artifacts
+    assert "worker_shards" not in artifacts
+    assert sorted(artifacts["scopes"]) == [f"scope_{scope_id}" for scope_id in range(6)]
+    for scope_id in range(6):
+        scope_artifacts = artifacts["scopes"][f"scope_{scope_id}"]
+        assert scope_artifacts["root"].endswith(
+            f"shared_exposure/scope_{scope_id}"
+        )
+        assert scope_artifacts["completion_markers"].endswith(
+            f"shared_exposure/scope_{scope_id}/completion"
+        )
+        assert scope_artifacts["worker_shards"].endswith(
+            f"shared_exposure/scope_{scope_id}/shards"
+        )
+
+
 def test_worker_delegates_rendering_to_photsim7_public_pipeline(tmp_path) -> None:
     from et_mainsim.config import ExecutionConfig
     from et_mainsim.workflows.full_frame import WorkerRequest, run_worker
     from photsim7.spec_factories import make_et_main_detector_spec
 
     calls: list[tuple[str, object]] = []
-    base = make_et_main_detector_spec(shape=(5, 7), run_seed=7)
+    base = _legacy_single_scope_spec(
+        make_et_main_detector_spec(shape=(5, 7), run_seed=7)
+    )
     spec = replace(
         base,
         psf=replace(base.psf, use_jitter_integrated_psf=False),
@@ -236,7 +712,9 @@ def test_worker_resume_skips_without_loading_catalog_or_services(tmp_path) -> No
             raise AssertionError(f"resume should not read catalog cache {path}")
 
     fake_api = SimpleNamespace(StarCatalogCache=ForbiddenCache)
-    base = make_et_main_detector_spec(shape=(5, 7), run_seed=7)
+    base = _legacy_single_scope_spec(
+        make_et_main_detector_spec(shape=(5, 7), run_seed=7)
+    )
     spec = replace(
         base,
         psf=replace(base.psf, use_jitter_integrated_psf=False),
@@ -277,7 +755,9 @@ def test_worker_request_v2_round_trips_shared_exposure_contract(tmp_path) -> Non
         product_keys=("final_stamp", "electron_stamp"),
     )
     request = WorkerRequest(
-        spec=make_et_main_detector_spec(shape=(5, 7), run_seed=7),
+        spec=_legacy_single_scope_spec(
+            make_et_main_detector_spec(shape=(5, 7), run_seed=7)
+        ),
         execution=ExecutionConfig(),
         run_dir=tmp_path / "run",
         data_root=tmp_path / "data",
@@ -372,7 +852,9 @@ def test_shared_exposure_batches_preserve_rank_stride_order_and_full_hash(
     from photsim7.spec_factories import make_et_main_detector_spec
 
     request = WorkerRequest(
-        spec=make_et_main_detector_spec(shape=(5, 7), run_seed=7),
+        spec=_legacy_single_scope_spec(
+            make_et_main_detector_spec(shape=(5, 7), run_seed=7)
+        ),
         execution=ExecutionConfig(),
         run_dir=tmp_path / "run",
         data_root=tmp_path / "data",
@@ -504,7 +986,9 @@ def _selection_ready_worker_request(tmp_path, *, n_frames: int = 2):
     bundle_sha256 = hashlib.sha256(
         (data_root / bundle_name / "sim_psf_images.pkl").read_bytes()
     ).hexdigest()
-    base = make_et_main_detector_spec(shape=(5, 7), run_seed=17)
+    base = _legacy_single_scope_spec(
+        make_et_main_detector_spec(shape=(5, 7), run_seed=17)
+    )
     spec = replace(
         base,
         observation=replace(
@@ -625,9 +1109,17 @@ def _shared_final_shard_path(request, *, product_key="final_stamp") -> Path:
     return legacy_path
 
 
-def test_tiny_cpu_worker_writes_readable_photsim7_artifacts(tmp_path) -> None:
+@pytest.mark.parametrize("telescope_count", (1, 6))
+def test_tiny_cpu_worker_writes_readable_photsim7_artifacts(
+    tmp_path,
+    telescope_count: int,
+) -> None:
     from et_mainsim.config import ExecutionConfig
-    from et_mainsim.workflows.full_frame import WorkerRequest, run_worker
+    from et_mainsim.workflows.full_frame import (
+        WorkerRequest,
+        frame_completion,
+        run_worker,
+    )
     from photsim7.catalog_sources import PreparedStarCatalog, StarCatalogCache
     from photsim7.frame_products import read_frame_product_schema
     from photsim7.geometry_truth import reference_field_nonphysical_declaration
@@ -646,6 +1138,7 @@ def test_tiny_cpu_worker_writes_readable_photsim7_artifacts(tmp_path) -> None:
     base = make_et_main_detector_spec(shape=(5, 7), run_seed=17)
     spec = replace(
         base,
+        instrument=replace(base.instrument, telescope_count=telescope_count),
         observation=replace(
             base.observation,
             exposure_duration=1 * u.s,
@@ -714,20 +1207,38 @@ def test_tiny_cpu_worker_writes_readable_photsim7_artifacts(tmp_path) -> None:
 
     result = run_worker(request)
 
-    frame = np.load(run_dir / "frames" / "frame_000000.npy")
-    schema = read_frame_product_schema(
-        run_dir / "frame_summaries" / "frame_000000_schema.json"
-    )
-    summary = json.loads(
-        (run_dir / "frame_summaries" / "frame_000000.json").read_text(encoding="utf-8")
-    )
     assert result.rendered == (0,)
-    assert frame.shape == (5, 7)
-    assert frame.dtype == np.uint16
-    assert schema["arrays"]["final_frame"]["domain"] == "dn"
-    assert summary["et_mainsim"]["rank"] == 0
-    assert summary["et_mainsim"]["n_stars"] == 1
-    assert summary["et_mainsim"]["pipeline_elapsed_s"] >= 0.0
+    scope_roots = (
+        (run_dir,)
+        if telescope_count == 1
+        else tuple(run_dir / f"scope_{scope_id}" for scope_id in range(6))
+    )
+    if telescope_count == 6:
+        assert not (run_dir / "frames" / "frame_000000.npy").exists()
+    for scope_id, scope_root in enumerate(scope_roots):
+        frame = np.load(scope_root / "frames" / "frame_000000.npy")
+        schema = read_frame_product_schema(
+            scope_root / "frame_summaries" / "frame_000000_schema.json"
+        )
+        summary = json.loads(
+            (scope_root / "frame_summaries" / "frame_000000.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert frame.shape == (5, 7)
+        assert frame.dtype == np.uint16
+        assert schema["arrays"]["final_frame"]["domain"] == "dn"
+        if telescope_count == 6:
+            assert schema["provenance"]["services"]["scope"]["scope_id"] == scope_id
+        assert summary["et_mainsim"]["rank"] == 0
+        assert summary["et_mainsim"]["n_stars"] == 1
+        assert summary["et_mainsim"]["pipeline_elapsed_s"] >= 0.0
+    assert frame_completion(
+        run_dir,
+        0,
+        expected_shape=(5, 7),
+        expected_spec=spec,
+    ).is_complete
 
 
 def test_exposure_first_worker_renders_once_and_persists_parent_crops(
@@ -791,6 +1302,184 @@ def test_exposure_first_worker_renders_once_and_persists_parent_crops(
             )
             assert marker["mode"] == "parent_rendered_this_attempt"
             assert marker["upstream_negative_claims"]["lineage_claimed"] is False
+
+
+def test_six_scope_shared_exposure_crops_each_scope_and_resumes(tmp_path) -> None:
+    """Six scopes own independent parents and scope-local shared crops.
+
+    The contract must never create a root-level image or a shared shard whose
+    identity could be mistaken for an image-level sum.  A resumed run is only
+    complete when every scope parent, crop shard, and completion marker remains
+    valid.
+    """
+
+    from et_mainsim.config import SharedExposureStampsConfig
+    from et_mainsim.shared_exposure import (
+        read_shared_exposure_frame_completion,
+        read_shared_exposure_target_plan,
+    )
+    from et_mainsim.workflows.full_frame import (
+        _shared_exposure_incomplete_frames_for_worker,
+        run_worker,
+    )
+    from photsim7.artifacts import SharedExposureShardReader
+
+    request, api = _selection_ready_worker_request(tmp_path, n_frames=1)
+    request = replace(
+        request,
+        spec=replace(
+            request.spec,
+            instrument=replace(request.spec.instrument, telescope_count=6),
+        ),
+        shared_exposure_stamps=SharedExposureStampsConfig(
+            enabled=True,
+            target_source_ids=(11,),
+            stamp_rows=5,
+            stamp_cols=7,
+            frames_per_shard=1,
+            product_keys=("final_stamp",),
+        ),
+    )
+
+    first = run_worker(request, science_api=api)
+
+    assert first.rendered == (0,)
+    assert not (request.run_dir / "frames" / "frame_000000.npy").exists()
+    assert not (
+        request.run_dir
+        / "shared_exposure"
+        / "completion"
+        / "frame_000000000.json"
+    ).exists()
+    plan = read_shared_exposure_target_plan(
+        request.run_dir / "shared_exposure" / "target_plan.json"
+    )
+    marker_bytes: dict[int, bytes] = {}
+    for scope_id in range(6):
+        scope_root = request.run_dir / f"scope_{scope_id}"
+        parent = np.load(scope_root / "frames" / "frame_000000.npy")
+        marker_path = (
+            request.run_dir
+            / "shared_exposure"
+            / f"scope_{scope_id}"
+            / "completion"
+            / "frame_000000000.json"
+        )
+        marker = read_shared_exposure_frame_completion(
+            marker_path,
+            reference_root=request.run_dir,
+        )
+        marker_bytes[scope_id] = marker_path.read_bytes()
+        assert marker["parent_storage_guard"]["path"] == (
+            f"scope_{scope_id}/frames/frame_000000.npy"
+        )
+        shard_matches = list(
+            (
+                request.run_dir
+                / "shared_exposure"
+                / f"scope_{scope_id}"
+                / "shards"
+                / "worker_0000"
+            ).glob(
+                "batch_??????_*/shared-exposure-products/"
+                f"{plan['content_sha256']}/*.h5"
+            )
+        )
+        assert len(shard_matches) == 1
+        with SharedExposureShardReader(shard_matches[0]) as reader:
+            assert reader.provenance["scope_id"] == scope_id
+            assert np.array_equal(reader.read_array(11, 0), parent)
+
+    second = run_worker(request, science_api=api)
+
+    assert second.rendered == ()
+    assert second.skipped == (0,)
+    for scope_id in range(6):
+        marker_path = (
+            request.run_dir
+            / "shared_exposure"
+            / f"scope_{scope_id}"
+            / "completion"
+            / "frame_000000000.json"
+        )
+        assert marker_path.read_bytes() == marker_bytes[scope_id]
+
+    # The coordinator's post-worker audit must use the same per-scope
+    # completion witnesses as the worker.  A root-level marker is forbidden
+    # for a six-scope exposure and must not be mistaken for a missing crop.
+    assert (
+        _shared_exposure_incomplete_frames_for_worker(request, science_api=api)
+        == ()
+    )
+
+
+def test_six_scope_shared_exposure_keeps_two_frame_shards_scope_local(tmp_path) -> None:
+    """A multi-frame shard carries only one scope's independent parents."""
+
+    from et_mainsim.config import SharedExposureStampsConfig
+    from et_mainsim.shared_exposure import read_shared_exposure_target_plan
+    from et_mainsim.workflows.full_frame import run_worker
+    from photsim7.artifacts import SharedExposureShardReader
+
+    request, api = _selection_ready_worker_request(tmp_path, n_frames=2)
+    request = replace(
+        request,
+        spec=replace(
+            request.spec,
+            instrument=replace(request.spec.instrument, telescope_count=6),
+        ),
+        shared_exposure_stamps=SharedExposureStampsConfig(
+            enabled=True,
+            target_source_ids=(11,),
+            stamp_rows=5,
+            stamp_cols=7,
+            frames_per_shard=2,
+            product_keys=("final_stamp",),
+        ),
+    )
+
+    first = run_worker(request, science_api=api)
+
+    assert first.rendered == (0, 1)
+    plan = read_shared_exposure_target_plan(
+        request.run_dir / "shared_exposure" / "target_plan.json"
+    )
+    assert not (request.run_dir / "shared_exposure" / "shards").exists()
+    for scope_id in range(6):
+        scope_root = request.run_dir / f"scope_{scope_id}"
+        shard_matches = list(
+            (
+                request.run_dir
+                / "shared_exposure"
+                / f"scope_{scope_id}"
+                / "shards"
+                / "worker_0000"
+            ).glob(
+                "batch_??????_*/shared-exposure-products/"
+                f"{plan['content_sha256']}/*.h5"
+            )
+        )
+        assert len(shard_matches) == 1
+        with SharedExposureShardReader(shard_matches[0]) as reader:
+            assert reader.frame_ids == (0, 1)
+            assert reader.provenance["scope_id"] == scope_id
+            for frame_index in (0, 1):
+                parent = np.load(
+                    scope_root / "frames" / f"frame_{frame_index:06d}.npy"
+                )
+                assert np.array_equal(reader.read_array(11, frame_index), parent)
+                assert (
+                    request.run_dir
+                    / "shared_exposure"
+                    / f"scope_{scope_id}"
+                    / "completion"
+                    / f"frame_{frame_index:09d}.json"
+                ).is_file()
+
+    second = run_worker(request, science_api=api)
+
+    assert second.rendered == ()
+    assert second.skipped == (0, 1)
 
 
 def test_exposure_first_three_targets_two_products_still_render_once_per_frame(
@@ -2131,6 +2820,7 @@ def test_run_records_worker_failure_in_manifest(tmp_path) -> None:
         StarCatalogCache=FakeCache,
         build_catalog_from_spec=lambda *args, **kwargs: catalog,
         build_full_frame_services=fail_services,
+        build_multiscope_full_frame_services=fail_services,
     )
 
     with pytest.raises(RuntimeError, match="service construction failed"):
