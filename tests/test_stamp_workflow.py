@@ -1244,6 +1244,61 @@ def test_stamp_resume_rejects_changed_direct_target_table(tmp_path) -> None:
         run_stamp(plan)
 
 
+def test_stamp_rejects_mismatched_spec_before_legacy_manifest_upgrade(
+    tmp_path,
+) -> None:
+    from et_mainsim.manifest import ManifestIdentityError, RunManifestStore
+    from et_mainsim.workflows.stamp import (
+        _frame_plan,
+        _workload_identity,
+        run_stamp,
+    )
+
+    plan = _table_plan(tmp_path)
+    bundle_name = _write_test_psf_bundle(plan.paths.data_root)
+    plan = replace(
+        plan,
+        spec=replace(
+            plan.spec,
+            detector=replace(plan.spec.detector, n_subpixels=3),
+            psf=replace(plan.spec.psf, bundle_name=bundle_name),
+        ),
+    )
+    execution_payload = {
+        **plan.run_config.execution.to_dict(),
+        "paths": plan.paths.to_dict(),
+    }
+    store = RunManifestStore(plan.run_dir / "run_manifest.json")
+    store.create(
+        workflow="et-stamp",
+        preset=plan.preset_name,
+        run_id=plan.run_config.run_id,
+        simulation_spec=plan.spec.to_json_dict(),
+        execution=execution_payload,
+        workload=_workload_identity(plan),
+        frame_plan=_frame_plan(plan.spec, plan.workload),
+        provenance={},
+        artifacts={},
+    )
+    manifest_path = store.path
+    original_bytes = manifest_path.read_bytes()
+    mismatched_plan = replace(
+        plan,
+        spec=replace(
+            plan.spec,
+            rng=replace(
+                plan.spec.rng,
+                run_seed=plan.spec.rng.run_seed + 1,
+            ),
+        ),
+    )
+
+    with pytest.raises(ManifestIdentityError, match="scientific spec"):
+        run_stamp(mismatched_plan, science_api=SimpleNamespace())
+
+    assert manifest_path.read_bytes() == original_bytes
+
+
 def test_stamp_resume_rejects_changed_psf_bundle_content(tmp_path) -> None:
     from et_mainsim.manifest import ManifestIdentityError
     from et_mainsim.workflows.stamp import run_stamp

@@ -19,7 +19,7 @@ from et_mainsim.config import (
     StampWorkload,
     worker_assignments,
 )
-from et_mainsim.manifest import RunManifestStore
+from et_mainsim.manifest import ManifestIdentityError, RunManifestStore
 from et_mainsim.presets import resource_path
 from et_mainsim.provenance import collect_provenance
 from et_mainsim.stamp_inputs import (
@@ -1895,6 +1895,43 @@ def _workload_identity(plan: StampRunPlan) -> dict[str, Any]:
     return payload
 
 
+def _normalize_legacy_stamp_workload(workload: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply only the declared artifact-default migration in memory."""
+
+    normalized_workload = dict(workload)
+    normalized_workload.setdefault("artifact_profile", "detailed")
+    normalized_workload.setdefault("write_batch_size", 32)
+    normalized_workload.setdefault("coadd_shard_index", 0)
+    normalized_workload.setdefault("coadd_shard_count", 1)
+    return normalized_workload
+
+
+def _ensure_existing_stamp_manifest_identity(
+    store: RunManifestStore,
+    *,
+    run_id: str,
+    simulation_spec: Mapping[str, Any],
+    execution: Mapping[str, Any],
+    workload: Mapping[str, Any],
+) -> None:
+    """Validate an existing run before any artifact-manifest migration write."""
+
+    payload = store.load()
+    stored_workload = payload.get("workload", {})
+    if not isinstance(stored_workload, Mapping):
+        raise ManifestIdentityError("Existing run workload identity conflicts")
+    stored_workload = dict(stored_workload)
+    store.ensure_identity(
+        workflow="et-stamp",
+        run_id=run_id,
+        simulation_spec=simulation_spec,
+        execution=execution,
+        workload=stored_workload,
+    )
+    if _normalize_legacy_stamp_workload(stored_workload) != dict(workload):
+        raise ManifestIdentityError("Existing run workload identity conflicts")
+
+
 def _upgrade_stamp_artifact_manifest(
     store: RunManifestStore,
     *,
@@ -1905,11 +1942,7 @@ def _upgrade_stamp_artifact_manifest(
 ) -> None:
     payload = store.load()
     stored_workload = dict(payload.get("workload", {}))
-    normalized_workload = dict(stored_workload)
-    normalized_workload.setdefault("artifact_profile", "detailed")
-    normalized_workload.setdefault("write_batch_size", 32)
-    normalized_workload.setdefault("coadd_shard_index", 0)
-    normalized_workload.setdefault("coadd_shard_count", 1)
+    normalized_workload = _normalize_legacy_stamp_workload(stored_workload)
     if normalized_workload != dict(workload):
         return
     artifacts = dict(payload.get("artifacts", {}))
@@ -1964,19 +1997,19 @@ def run_stamp(
     frame_plan = _frame_plan(plan.spec, plan.workload)
     coadd_shard = _coadd_shard_provenance(plan)
     if store.path.exists():
+        _ensure_existing_stamp_manifest_identity(
+            store,
+            run_id=plan.run_config.run_id,
+            simulation_spec=spec_payload,
+            execution=execution_payload,
+            workload=workload_payload,
+        )
         _upgrade_stamp_artifact_manifest(
             store,
             workload=workload_payload,
             artifact_policy=_artifact_policy(plan),
             frame_plan=frame_plan,
             coadd_shard=coadd_shard,
-        )
-        store.ensure_identity(
-            workflow="et-stamp",
-            run_id=plan.run_config.run_id,
-            simulation_spec=spec_payload,
-            execution=execution_payload,
-            workload=workload_payload,
         )
     else:
         store.create(
