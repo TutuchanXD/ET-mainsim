@@ -8,6 +8,51 @@ import pytest
 from astropy.table import Table
 
 
+def _stub_semantic_registry_identity(monkeypatch, stamp_inputs, registry) -> None:
+    candidate = {
+        "schema_id": "et_coord.semantic_registry_identity.v1",
+        "schema_version": 1,
+        "freeze_status": "candidate_pending_owner_freeze",
+        "owner_approval_required": True,
+        "registry_data_dir": str(registry),
+        "sha256": "b" * 64,
+    }
+    monkeypatch.setattr(
+        stamp_inputs,
+        "focalplane_registry_identity",
+        lambda _path: candidate,
+    )
+
+
+def test_focalplane_registry_identity_uses_et_coord_semantic_candidate(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import et_coord
+    from et_mainsim.stamp_inputs import focalplane_registry_identity
+
+    candidate = {
+        "schema_id": "et_coord.semantic_registry_identity.v1",
+        "schema_version": 1,
+        "freeze_status": "candidate_pending_owner_freeze",
+        "owner_approval_required": True,
+        "registry_data_dir": str(tmp_path / "data"),
+        "sha256": "a" * 64,
+    }
+    captured = {}
+
+    def fake_identity(path):
+        captured["path"] = path
+        return candidate
+
+    monkeypatch.setattr(et_coord, "semantic_registry_identity", fake_identity)
+
+    identity = focalplane_registry_identity(tmp_path)
+
+    assert identity == candidate
+    assert captured["path"] == tmp_path.resolve()
+
+
 def test_stamp_target_table_defaults_to_gaia_g_and_detector_center(tmp_path) -> None:
     from et_mainsim.stamp_inputs import load_stamp_target_table
 
@@ -209,6 +254,7 @@ def test_stamp_target_table_maps_icrs_to_expected_detector_and_field_angle(
             residual_arcsec=0.02,
         ),
     )
+    _stub_semantic_registry_identity(monkeypatch, stamp_inputs, registry)
 
     loaded = stamp_inputs.load_stamp_target_table(
         path,
@@ -256,6 +302,7 @@ def test_stamp_target_table_allows_mixed_sky_and_explicit_rows(
             residual_arcsec=0.01,
         ),
     )
+    _stub_semantic_registry_identity(monkeypatch, stamp_inputs, registry)
 
     loaded = stamp_inputs.load_stamp_target_table(
         path,
@@ -302,6 +349,7 @@ def test_stamp_target_table_rejects_bad_sky_mapping(
     path = tmp_path / "targets.csv"
     path.write_text("gaia_g_mag,ra_deg,dec_deg\n12,10,20\n", encoding="utf-8")
     monkeypatch.setattr(stamp_inputs, "_sky_to_focal", lambda *_a, **_k: result)
+    _stub_semantic_registry_identity(monkeypatch, stamp_inputs, registry)
 
     with pytest.raises(ValueError, match=message):
         stamp_inputs.load_stamp_target_table(
