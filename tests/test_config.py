@@ -182,6 +182,7 @@ stamp_cols = 17
 include_neighbors = false
 save_raw = true
 save_coadd = true
+write_batch_size = 7
 
 [execution]
 backend = "in-process"
@@ -194,7 +195,9 @@ device = "cpu"
     assert config.workload.input_table == "targets.csv"
     assert config.workload.variability_table == "curves.ecsv"
     assert config.workload.stamp_shape == (15, 17)
+    assert config.workload.write_batch_size == 7
     assert config.to_dict()["workload"]["kind"] == "stamp"
+    assert config.to_dict()["workload"]["write_batch_size"] == 7
 
 
 @pytest.mark.parametrize(
@@ -212,6 +215,7 @@ device = "cpu"
             'kind = "stamp"\ninput_mode = "catalog"\nvariability_table = "curves.csv"',
             "variability_table",
         ),
+        ('kind = "stamp"\nwrite_batch_size = 0', "write_batch_size"),
         ('kind = "legacy"', "match workflow"),
     ],
 )

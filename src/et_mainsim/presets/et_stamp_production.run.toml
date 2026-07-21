@@ -22,6 +22,7 @@ include_neighbors = true
 save_raw = true
 save_coadd = true
 save_electron_components = false
+write_batch_size = 32
 
 [execution]
 backend = "local-subprocess"

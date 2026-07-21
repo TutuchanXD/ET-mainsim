@@ -110,6 +110,8 @@ def test_cli_stamp_table_dry_run_is_read_only_and_query_independent(
             str(curves),
             "--output-root",
             str(output_root),
+            "--write-batch-size",
+            "7",
             "--dry-run",
         ]
     )
@@ -120,6 +122,7 @@ def test_cli_stamp_table_dry_run_is_read_only_and_query_independent(
     assert plan["workflow"] == "et-stamp"
     assert plan["workload"]["input_mode"] == "table"
     assert plan["workload"]["include_neighbors"] is False
+    assert plan["workload"]["write_batch_size"] == 7
     assert plan["simulation_spec"]["catalog"]["source_type"] == "prepared"
     assert plan["input_table"] == str(table)
     assert plan["variability_table"] == str(curves)

@@ -728,6 +728,82 @@ def _selection_sidecar_plan(tmp_path):
     )
 
 
+def _batch_write_plan(tmp_path, *, write_batch_size):
+    plan = _variable_table_plan(
+        tmp_path,
+        target_body=(
+            "source_id,gaia_g_mag,psf_id,curve_id\n10,12.0,0,sn\n"
+        ),
+        curve_body=(
+            "curve_id,frame_index,relative_flux\n"
+            "sn,0,0.90\n"
+            "sn,1,0.95\n"
+            "sn,2,1.00\n"
+            "sn,3,1.05\n"
+            "sn,4,1.10\n"
+        ),
+    )
+    bundle_name, bundle_sha256 = _write_test_psf_bundle(
+        plan.paths.data_root
+    )
+    return replace(
+        plan,
+        run_config=replace(
+            plan.run_config,
+            workload=replace(
+                plan.workload,
+                write_batch_size=write_batch_size,
+            ),
+        ),
+        spec=replace(
+            plan.spec,
+            detector=replace(plan.spec.detector, n_subpixels=3),
+            observation=replace(
+                plan.spec.observation,
+                exposure_duration=10 * u.s,
+                readout_duration=0 * u.s,
+                observing_duration=50 * u.s,
+                n_frames=5,
+                n_raw_frames_per_coadd=1,
+            ),
+            psf=replace(
+                plan.spec.psf,
+                bundle_name=bundle_name,
+                bundle_sha256=bundle_sha256,
+            ),
+        ),
+    )
+
+
+def _stamp_artifact_snapshot(target_dir):
+    from photsim7.artifacts import StampShardReader
+
+    shards = {}
+    for case_id in ("raw", "coadd"):
+        with StampShardReader(target_dir / f"{case_id}.h5") as reader:
+            shards[case_id] = {
+                "star_ids": reader.star_ids,
+                "frame_ids": reader.frame_ids,
+                "provenance": dict(reader.spec.provenance),
+                "arrays": tuple(
+                    reader.read_stamp(star_id, frame_id)
+                    for star_id in reader.star_ids
+                    for frame_id in reader.frame_ids
+                ),
+                "seeds": tuple(
+                    reader.read_seed(star_id, frame_id)
+                    for star_id in reader.star_ids
+                    for frame_id in reader.frame_ids
+                ),
+            }
+    sidecars = {
+        str(path.relative_to(target_dir)): path.read_bytes()
+        for path in sorted(target_dir.rglob("*"))
+        if path.is_file() and path.suffix != ".h5"
+    }
+    return shards, sidecars
+
+
 def _complete_selection_api(api):
     from photsim7.dynamic_effects import EffectTimeseries, build_frame_timing
     from photsim7.jitter_bank import (
@@ -899,10 +975,320 @@ def test_stamp_run_writes_readable_raw_coadd_truth_and_resumes(tmp_path) -> None
         assert not (output_target / "schemas" / absent_name).exists()
 
 
+def test_stamp_write_buffer_batches_final_flush_and_retries_without_aliasing() -> None:
+    from et_mainsim.workflows.stamp import _StampWriteBuffer
+
+    class Writer:
+        def __init__(self):
+            self.fail_once = True
+            self.batches = []
+
+        def write_stamps(self, stamps):
+            snapshot = tuple(
+                (star_id, frame_id, stamp.copy(), seed)
+                for star_id, frame_id, stamp, seed in stamps
+            )
+            self.batches.append(snapshot)
+            if self.fail_once:
+                self.fail_once = False
+                raise OSError("simulated batch failure")
+
+        def write_stamp(self, *_args, **_kwargs):
+            raise AssertionError("batch workflow must not use write_stamp")
+
+    writer = Writer()
+    buffer = _StampWriteBuffer(writer, batch_size=2)
+    first = np.full((2, 2), 1, dtype=np.uint16)
+    buffer.add(star_id=10, frame_id=0, stamp=first, seed=41)
+    first[:] = 99
+
+    with pytest.raises(OSError, match="simulated batch failure"):
+        buffer.add(
+            star_id=10,
+            frame_id=1,
+            stamp=np.full((2, 2), 2, dtype=np.uint16),
+            seed=42,
+        )
+
+    assert buffer.pending_count == 2
+    np.testing.assert_array_equal(writer.batches[0][0][2], 1)
+    buffer.flush()
+    assert buffer.pending_count == 0
+    buffer.add(
+        star_id=10,
+        frame_id=2,
+        stamp=np.full((2, 2), 3, dtype=np.uint16),
+        seed=43,
+    )
+    assert buffer.pending_count == 1
+    buffer.flush()
+
+    assert [len(batch) for batch in writer.batches] == [2, 2, 1]
+    assert buffer.pending_count == 0
+    np.testing.assert_array_equal(writer.batches[1][0][2], 1)
+
+
+def test_batched_stamp_writes_preserve_products_provenance_sidecars_and_resume(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from et_mainsim.workflows.stamp import _science_api, run_stamp
+    from photsim7.artifacts import StampShardWriter
+
+    plan = _batch_write_plan(tmp_path, write_batch_size=1)
+
+    def reject_single_write(*_args, **_kwargs):
+        raise AssertionError("ET-mainsim must use StampShardWriter.write_stamps")
+
+    monkeypatch.setattr(StampShardWriter, "write_stamp", reject_single_write)
+    run_stamp(plan, science_api=_complete_selection_api(_science_api()))
+    target_dir = plan.run_dir / "stamps" / "target_10"
+    single_shards, single_sidecars = _stamp_artifact_snapshot(target_dir)
+
+    saved_run = tmp_path / "batch-size-1-run"
+    plan.run_dir.rename(saved_run)
+    batched_plan = replace(
+        plan,
+        run_config=replace(
+            plan.run_config,
+            workload=replace(plan.workload, write_batch_size=3),
+        ),
+    )
+    run_stamp(
+        batched_plan,
+        science_api=_complete_selection_api(_science_api()),
+    )
+    batched_shards, batched_sidecars = _stamp_artifact_snapshot(target_dir)
+
+    assert batched_sidecars == single_sidecars
+    assert set(batched_shards) == set(single_shards)
+    for case_id in single_shards:
+        expected = single_shards[case_id]
+        actual = batched_shards[case_id]
+        assert actual["star_ids"] == expected["star_ids"]
+        assert actual["frame_ids"] == expected["frame_ids"]
+        assert actual["seeds"] == expected["seeds"]
+        assert actual["provenance"] == expected["provenance"]
+        for actual_array, expected_array in zip(
+            actual["arrays"], expected["arrays"], strict=True
+        ):
+            np.testing.assert_array_equal(actual_array, expected_array)
+
+    resume_plan = replace(
+        batched_plan,
+        run_config=replace(
+            batched_plan.run_config,
+            workload=replace(
+                batched_plan.workload,
+                write_batch_size=4,
+            ),
+        ),
+    )
+    resumed = run_stamp(
+        resume_plan,
+        science_api=_complete_selection_api(_science_api()),
+    )
+
+    assert resumed["completion"]["rendered_targets"] == 0
+    assert resumed["completion"]["skipped_targets"] == 1
+    assert "write_batch_size" not in resumed["workload"]
+    assert [
+        attempt["control"]["write_batch_size"]
+        for attempt in resumed["attempts"]
+    ] == [3, 4]
+
+
+def test_batch_storage_failure_closes_partial_writers_and_resumes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from et_mainsim.workflows.stamp import _science_api, run_stamp
+    from photsim7.artifacts import (
+        ArtifactStorageError,
+        ItemStatus,
+        StampShardReader,
+        StampShardWriter,
+    )
+    from photsim7.artifacts.hdf5_backend import ImageShardWriter
+
+    plan = _batch_write_plan(tmp_path, write_batch_size=3)
+    original_payload_write = ImageShardWriter._write_payload
+    original_close = StampShardWriter.close
+    failed = False
+    closed_cases = []
+
+    def fail_second_raw_payload(writer, index, image, seed):
+        nonlocal failed
+        if writer.spec.case_id == "raw" and index == (0, 1) and not failed:
+            failed = True
+            raise OSError("simulated ET batch storage failure")
+        return original_payload_write(writer, index, image, seed)
+
+    def record_close(writer):
+        closed_cases.append(writer.spec.case_id)
+        return original_close(writer)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            ImageShardWriter,
+            "_write_payload",
+            fail_second_raw_payload,
+        )
+        patch.setattr(StampShardWriter, "close", record_close)
+        with pytest.raises(
+            ArtifactStorageError,
+            match="simulated ET batch storage failure",
+        ):
+            run_stamp(
+                plan,
+                science_api=_complete_selection_api(_science_api()),
+            )
+
+    target_dir = plan.run_dir / "stamps" / "target_10"
+    raw_partial = target_dir / "raw.partial.h5"
+    coadd_partial = target_dir / "coadd.partial.h5"
+    assert closed_cases == ["raw", "coadd"]
+    assert raw_partial.is_file()
+    assert coadd_partial.is_file()
+    assert not (target_dir / "raw.h5").exists()
+    assert not (target_dir / "coadd.h5").exists()
+    assert not (target_dir / "target_artifacts.json").exists()
+    with StampShardReader(raw_partial, allow_incomplete=True) as reader:
+        assert [reader.item_status(10, frame_id) for frame_id in range(5)] == [
+            ItemStatus.FAILED,
+            ItemStatus.FAILED,
+            ItemStatus.FAILED,
+            ItemStatus.UNWRITTEN,
+            ItemStatus.UNWRITTEN,
+        ]
+    with StampShardReader(coadd_partial, allow_incomplete=True) as reader:
+        assert all(
+            reader.item_status(10, frame_id) is ItemStatus.UNWRITTEN
+            for frame_id in range(5)
+        )
+
+    resume_plan = replace(
+        plan,
+        run_config=replace(
+            plan.run_config,
+            workload=replace(plan.workload, write_batch_size=2),
+        ),
+    )
+    resumed = run_stamp(
+        resume_plan,
+        science_api=_complete_selection_api(_science_api()),
+    )
+
+    assert resumed["status"] == "completed"
+    assert [attempt["status"] for attempt in resumed["attempts"]] == [
+        "failed",
+        "completed",
+    ]
+    assert (target_dir / "raw.h5").is_file()
+    assert (target_dir / "coadd.h5").is_file()
+    assert not raw_partial.exists()
+    assert not coadd_partial.exists()
+
+
+def test_coadd_batch_failure_resumes_after_raw_shard_was_finalized(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from et_mainsim.workflows.stamp import _science_api, run_stamp
+    from photsim7.artifacts import (
+        ArtifactStorageError,
+        ItemStatus,
+        StampShardReader,
+        StampShardWriter,
+    )
+    from photsim7.artifacts.hdf5_backend import ImageShardWriter
+
+    plan = _batch_write_plan(tmp_path, write_batch_size=8)
+    original_payload_write = ImageShardWriter._write_payload
+    original_close = StampShardWriter.close
+    failed = False
+    closed_cases = []
+
+    def fail_second_coadd_payload(writer, index, image, seed):
+        nonlocal failed
+        if writer.spec.case_id == "coadd" and index == (0, 1) and not failed:
+            failed = True
+            raise OSError("simulated coadd batch storage failure")
+        return original_payload_write(writer, index, image, seed)
+
+    def record_close(writer):
+        closed_cases.append(writer.spec.case_id)
+        return original_close(writer)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            ImageShardWriter,
+            "_write_payload",
+            fail_second_coadd_payload,
+        )
+        patch.setattr(StampShardWriter, "close", record_close)
+        with pytest.raises(
+            ArtifactStorageError,
+            match="simulated coadd batch storage failure",
+        ):
+            run_stamp(
+                plan,
+                science_api=_complete_selection_api(_science_api()),
+            )
+
+    target_dir = plan.run_dir / "stamps" / "target_10"
+    raw_path = target_dir / "raw.h5"
+    coadd_partial = target_dir / "coadd.partial.h5"
+    assert closed_cases == ["coadd"]
+    assert raw_path.is_file()
+    assert not (target_dir / "raw.partial.h5").exists()
+    assert coadd_partial.is_file()
+    assert not (target_dir / "coadd.h5").exists()
+    assert not (target_dir / "target_artifacts.json").exists()
+    raw_bytes = raw_path.read_bytes()
+    with StampShardReader(coadd_partial, allow_incomplete=True) as reader:
+        assert all(
+            reader.item_status(10, frame_id) is ItemStatus.FAILED
+            for frame_id in range(5)
+        )
+
+    resume_plan = replace(
+        plan,
+        run_config=replace(
+            plan.run_config,
+            workload=replace(plan.workload, write_batch_size=2),
+        ),
+    )
+    resumed = run_stamp(
+        resume_plan,
+        science_api=_complete_selection_api(_science_api()),
+    )
+
+    assert resumed["status"] == "completed"
+    assert raw_path.read_bytes() == raw_bytes
+    assert (target_dir / "coadd.h5").is_file()
+    assert not coadd_partial.exists()
+    assert [attempt["status"] for attempt in resumed["attempts"]] == [
+        "failed",
+        "completed",
+    ]
+    assert [
+        attempt["control"]["write_batch_size"]
+        for attempt in resumed["attempts"]
+    ] == [8, 2]
+
+
 def test_stamp_worker_request_round_trip_preserves_table_contract(tmp_path) -> None:
     from et_mainsim.workflows.stamp import StampWorkerRequest
 
     plan = _table_plan(tmp_path)
+    plan = replace(
+        plan,
+        run_config=replace(
+            plan.run_config,
+            workload=replace(plan.workload, write_batch_size=7),
+        ),
+    )
     with pytest.raises(ValueError, match="input identities"):
         StampWorkerRequest.from_plan(plan, target_ids=(0,))
     request = StampWorkerRequest.from_plan(
@@ -919,12 +1305,18 @@ def test_stamp_worker_request_round_trip_preserves_table_contract(tmp_path) -> N
 
     assert restored.plan.workload.input_mode == "table"
     assert restored.plan.input_table_path == tmp_path / "targets.csv"
+    assert restored.plan.workload.write_batch_size == 7
     assert restored.target_ids == (0, 1)
     assert restored.rank == 1
     assert restored.world_size == 2
     assert restored.input_identities == {
         "target_table": {"path": "targets.csv", "sha256": "abc"}
     }
+
+    legacy_payload = request.to_json_dict()
+    legacy_payload["run_config"]["workload"].pop("write_batch_size")
+    legacy_restored = StampWorkerRequest.from_json_dict(legacy_payload)
+    assert legacy_restored.plan.workload.write_batch_size == 32
 
 
 def test_stamp_worker_reloads_and_rejects_changed_variability_identity(
