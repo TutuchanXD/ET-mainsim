@@ -1519,7 +1519,11 @@ def test_stamp_target_persists_closed_selection_sidecar_manifest(
     tmp_path,
 ) -> None:
     from et_mainsim.workflows.stamp import _science_api, run_stamp
-    from photsim7.selection_artifacts import read_cadence_selection_truth
+    from photsim7.selection_artifacts import (
+        CADENCE_SELECTION_TRUTH_SCHEMA_ID,
+        CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
+        read_cadence_selection_truth,
+    )
 
     plan = _selection_sidecar_plan(tmp_path)
     api = _complete_selection_api(_science_api())
@@ -1559,8 +1563,8 @@ def test_stamp_target_persists_closed_selection_sidecar_manifest(
     assert (target_dir / geometry["relative_path"]).is_file()
     assert (target_dir / psf["relative_path"]).is_file()
     assert cadence == {
-        "schema_id": "photsim7.cadence_selection_truth.v1",
-        "schema_version": 1,
+        "schema_id": CADENCE_SELECTION_TRUTH_SCHEMA_ID,
+        "schema_version": CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
         "relative_directory": "selection_truth/cadence",
         "filename_template": "frame_{absolute_raw_frame_index:09d}.json",
         "count": 2,
@@ -1679,6 +1683,10 @@ def test_selection_resume_binds_spacecraft_and_science_realization(tmp_path):
         _selection_index_record,
         _validate_selection_sidecars,
     )
+    from photsim7.selection_artifacts import (
+        CADENCE_SELECTION_TRUTH_SCHEMA_ID,
+        CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
+    )
 
     plan = _selection_sidecar_plan(tmp_path)
     geometry = {
@@ -1711,6 +1719,8 @@ def test_selection_resume_binds_spacecraft_and_science_realization(tmp_path):
                 ).encode("utf-8")
             ).hexdigest()
             truths[frame_index] = SimpleNamespace(
+                schema_id=CADENCE_SELECTION_TRUTH_SCHEMA_ID,
+                schema_version=CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
                 local_frame_index=frame_index,
                 absolute_raw_frame_index=frame_index,
                 detector_id=plan.spec.detector.detector_id,
@@ -1747,8 +1757,8 @@ def test_selection_resume_binds_spacecraft_and_science_realization(tmp_path):
             "source_geometry_truth": geometry,
             "psf_selection_truth": psf,
             "cadence_selection_truth": {
-                "schema_id": "photsim7.cadence_selection_truth.v1",
-                "schema_version": 1,
+                "schema_id": CADENCE_SELECTION_TRUTH_SCHEMA_ID,
+                "schema_version": CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
                 "relative_directory": "selection_truth/cadence",
                 "filename_template": (
                     "frame_{absolute_raw_frame_index:09d}.json"
@@ -1888,6 +1898,11 @@ def test_stamp_completion_rejects_selection_manifest_identity_changes(
 def test_stamp_run_identity_requires_current_product_contract(tmp_path):
     from et_mainsim.manifest import ManifestIdentityError
     from et_mainsim.workflows.stamp import _science_api, run_stamp
+    from photsim7.psf.selection_truth import PSF_SELECTION_TRUTH_SCHEMA_ID
+    from photsim7.selection_artifacts import (
+        CADENCE_SELECTION_TRUTH_SCHEMA_ID,
+        CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
+    )
 
     plan = _selection_sidecar_plan(tmp_path)
     api = _complete_selection_api(_science_api())
@@ -1905,11 +1920,10 @@ def test_stamp_run_identity_requires_current_product_contract(tmp_path):
         "source_geometry_truth_schema_id": (
             "photsim7.source_geometry_truth.v1"
         ),
-        "psf_selection_truth_schema_id": (
-            "photsim7.psf_selection_truth.v2"
-        ),
-        "cadence_selection_truth_schema_id": (
-            "photsim7.cadence_selection_truth.v1"
+        "psf_selection_truth_schema_id": PSF_SELECTION_TRUTH_SCHEMA_ID,
+        "cadence_selection_truth_schema_id": CADENCE_SELECTION_TRUTH_SCHEMA_ID,
+        "cadence_selection_truth_schema_version": (
+            CADENCE_SELECTION_TRUTH_SCHEMA_VERSION
         ),
     }
 

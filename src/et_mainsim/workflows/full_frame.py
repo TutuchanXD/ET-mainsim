@@ -30,6 +30,9 @@ from et_mainsim.scope_artifacts import (
     FullFrameScopeArtifactContract,
     ScopeFrameCompletion,
 )
+from et_mainsim.selection_schemas import (
+    is_supported_cadence_selection_truth_schema,
+)
 
 
 _SELECTION_TRUTH_SCOPE = "geometry_psf_and_jitter_selection_truth_only"
@@ -616,8 +619,10 @@ def _unavailable_selection_is_complete(
     }:
         return False
     return bool(
-        selection.get("schema_id") == "photsim7.cadence_selection_truth.v1"
-        and int(selection.get("schema_version", 0)) == 1
+        is_supported_cadence_selection_truth_schema(
+            selection.get("schema_id"),
+            selection.get("schema_version"),
+        )
         and selection.get("verification_status") == "unavailable"
         and selection.get("science_conformance_claim") is False
         and selection.get("science_conformance_claim_scope") == _SELECTION_TRUTH_SCOPE
@@ -652,8 +657,10 @@ def _persisted_selection_is_complete(
     }:
         return False
     if (
-        selection.get("schema_id") != "photsim7.cadence_selection_truth.v1"
-        or int(selection.get("schema_version", 0)) != 1
+        not is_supported_cadence_selection_truth_schema(
+            selection.get("schema_id"),
+            selection.get("schema_version"),
+        )
         or selection.get("verification_status") != "persisted_and_verified"
         or selection.get("science_conformance_claim_scope") != _SELECTION_TRUTH_SCOPE
         or selection.get("requested_science_profile_id")
@@ -704,7 +711,9 @@ def _persisted_selection_is_complete(
     except (AttributeError, TypeError, ValueError):
         return False
     if (
-        truth.detector_id != str(expected_spec.detector.detector_id)
+        truth.schema_id != selection["schema_id"]
+        or truth.schema_version != int(selection["schema_version"])
+        or truth.detector_id != str(expected_spec.detector.detector_id)
         or truth.local_frame_index != int(frame_index)
         or truth.absolute_raw_frame_index != absolute_raw_frame_index
         or truth.spacecraft_id != _ET_FULL_FRAME_SPACECRAFT_ID

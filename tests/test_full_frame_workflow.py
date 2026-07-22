@@ -237,6 +237,35 @@ def test_resume_requires_frame_summary_schema_and_matching_shape(tmp_path) -> No
     )
 
 
+def test_resume_accepts_current_unavailable_selection_truth_schema(tmp_path) -> None:
+    from et_mainsim.workflows.full_frame import frame_is_complete
+    from photsim7.selection_artifacts import (
+        CADENCE_SELECTION_TRUTH_SCHEMA_ID,
+        CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
+    )
+    from photsim7.spec_factories import make_et_main_detector_spec
+
+    run_dir = tmp_path / "run"
+    base = _legacy_single_scope_spec(
+        make_et_main_detector_spec(shape=(5, 7), run_seed=7)
+    )
+    spec = replace(
+        base,
+        psf=replace(base.psf, use_jitter_integrated_psf=False),
+    )
+    marker = _unavailable_selection_marker()
+    marker["schema_id"] = CADENCE_SELECTION_TRUTH_SCHEMA_ID
+    marker["schema_version"] = CADENCE_SELECTION_TRUTH_SCHEMA_VERSION
+    _write_complete_frame(run_dir, 0, selection_truth=marker)
+
+    assert frame_is_complete(
+        run_dir,
+        0,
+        expected_shape=(5, 7),
+        expected_spec=spec,
+    )
+
+
 def test_six_scope_worker_persists_scope_local_products_and_requires_all_scopes(
     tmp_path,
 ) -> None:
@@ -2714,6 +2743,11 @@ def test_full_frame_run_identity_requires_current_product_contract(tmp_path) -> 
     from et_mainsim.manifest import ManifestIdentityError
     from et_mainsim.presets import load_preset
     from et_mainsim.workflows.full_frame import build_run_plan, run_full_frame
+    from photsim7.psf.selection_truth import PSF_SELECTION_TRUTH_SCHEMA_ID
+    from photsim7.selection_artifacts import (
+        CADENCE_SELECTION_TRUTH_SCHEMA_ID,
+        CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
+    )
 
     loaded = load_preset("et-full-frame-smoke")
     data_root = tmp_path / "data"
@@ -2744,9 +2778,11 @@ def test_full_frame_run_identity_requires_current_product_contract(tmp_path) -> 
         "frame_product_schema_id": ("photsim7.single_cadence_frame_products.v1"),
         "frame_product_schema_version": 1,
         "source_geometry_truth_schema_id": ("photsim7.source_geometry_truth.v1"),
-        "psf_selection_truth_schema_id": ("photsim7.psf_selection_truth.v2"),
-        "cadence_selection_truth_schema_id": ("photsim7.cadence_selection_truth.v1"),
-        "cadence_selection_truth_schema_version": 1,
+        "psf_selection_truth_schema_id": PSF_SELECTION_TRUTH_SCHEMA_ID,
+        "cadence_selection_truth_schema_id": CADENCE_SELECTION_TRUTH_SCHEMA_ID,
+        "cadence_selection_truth_schema_version": (
+            CADENCE_SELECTION_TRUTH_SCHEMA_VERSION
+        ),
         "full_frame_source_pixel_geometry_schema_id": (
             "photsim7.full_frame_source_pixel_geometry.v1"
         ),
