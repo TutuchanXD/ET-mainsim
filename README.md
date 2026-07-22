@@ -31,6 +31,15 @@ containing the semantic focal-plane registry identity API.
 The package import is lightweight and does not initialize Torch, Ray, CUDA,
 catalogs, or external assets.
 
+### Developer: continuous time-shard planning
+
+Long-duration stamp production needs globally contiguous raw-frame shards,
+rather than the current target-only worker partition. The renderer is not
+changed yet; the standalone planning API fixes the global raw index, complete
+coadd boundaries, midpoint timestamps, and tail-rejection manifest contract.
+See [continuous time-shard planning](docs/continuous_time_shards.md) for the
+10 s -> 30 s/1 min/2 min/5 min example and the minimal future scheduler hook.
+
 ## Quick Start
 
 ```bash
