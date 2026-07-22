@@ -31,6 +31,15 @@ containing the semantic focal-plane registry identity API.
 The package import is lightweight and does not initialize Torch, Ray, CUDA,
 catalogs, or external assets.
 
+### Developer: continuous time-shard planning
+
+Long-duration stamp production needs globally contiguous raw-frame shards,
+rather than the current target-only worker partition. The renderer is not
+changed yet; the standalone planning API fixes the global raw index, complete
+coadd boundaries, midpoint timestamps, and tail-rejection manifest contract.
+See [continuous time-shard planning](docs/continuous_time_shards.md) for the
+10 s -> 30 s/1 min/2 min/5 min example and the minimal future scheduler hook.
+
 ## Quick Start
 
 ```bash
@@ -140,4 +149,6 @@ artifacts can be read without rerunning via `tools/artifact_readback/`.
 The removed script layout is preserved by Git tag `legacy-scripts-final`.
 See [migration](docs/main_rd_photsim7_migration.md) for command and artifact
 mapping. Current details are in [full frame](docs/full_frame_workflow.md),
-[stamp](docs/stamp_workflow.md), and [legacy](docs/legacy_workflow.md).
+[stamp](docs/stamp_workflow.md), [stamp science delivery
+bundles](docs/stamp_science_delivery_zh.md), and
+[legacy](docs/legacy_workflow.md).

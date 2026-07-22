@@ -2,7 +2,15 @@
 
 本文档定义 ET stamp 仿真第一版源内禀光变输入契约。目标是让科学团队提供的“源本身随时间变化”在进入探测器效应前，沿现有的星等、PSF、泊松噪声、读出和 coadd 链路完成可复现仿真。
 
-第一版只接收 **Gaia G Vega 基准星等**与按仿真 raw frame 对齐的无量纲相对流量。输入文件里的物理时间不会被读取、插值或换算；数据提供方必须先把曲线转换成仿真帧序列。
+这里的 ECSV/CSV contract 是通用 table-mode 输入。银河系团队最新的 FITS 已有一条
+单独的、正式可生产 profile：它保留输入曲线的相对节点间隔、去除绝对 epoch 后做
+10 s 曝光平均，并冻结为 `q(t)=1+DeltaF/F_ref` snapshot。其正式执行和交付语义见
+[galaxy_independent_stamp_production_zh.md](galaxy_independent_stamp_production_zh.md)。
+
+第一版只接收 **Gaia G Vega 基准星等**与无量纲相对流量。通用 ECSV
+table-mode 要求数据提供方先把曲线转换成仿真 raw frame 序列；其物理时间不会被
+读取、插值或换算。Galaxy FITS formal profile 则保留其相对采样间隔、丢弃绝对
+epoch，并在仿真时间轴上执行曝光平均，详见后文。
 
 ## 1. 最小交付物
 
@@ -98,7 +106,9 @@ m_i = m_ref - 2.5 * log10(relative_flux_i)
 
 ### 3.2 时间对齐规则
 
-ET-mainsim 只读取 `frame_index`。即使表里存在 `time`、`observer_time`、MJD 或 phase 列，它们也会被忽略并记录在 provenance 的 ignored time columns 中。
+通用 ECSV table-mode 只读取 `frame_index`。即使表里存在 `time`、`observer_time`、MJD 或 phase 列，它们也会被忽略并记录在 provenance 的 ignored time columns 中。Galaxy
+FITS formal profile 是唯一例外：它不使用绝对 epoch，但会把有限节点之间的相对间隔
+用于构造分段线性 clean curve，并计算每个仿真曝光的精确平均 `q(t)`。
 
 科学团队需要在交付前决定如何把物理曲线映射到仿真帧：
 
@@ -256,17 +266,24 @@ raw/coadd HDF5 provenance 和逐帧 schema 还会保存：
 
 仓库中的 `scripts/validate_source_variability_stamp.py` 会从 production spec 派生 22 raw frame、220 s、2 raw/coadd 的短时 spec，并自动运行相同链路的静态/注入两组；不要只对 production preset 加 `--frames 22`，因为原 preset 的 30 raw/coadd 与 22 不整除。
 
-## 9. 当前银河系考古团队数据阻塞
+## 9. 当前银河系考古团队 FITS 评估
 
-所给文件名为 `BaiduNetdisk_mac_..._arm64....dmg`。当前工作区中的同一 payload 被保存为 `.zip`，但文件头是 zlib block、尾部有 Apple UDIF 的 `koly` 标记；文件名和已展开目录都指向 **macOS ARM64 百度网盘客户端安装镜像**，不是科学数据压缩包。当前展开目录中没有 CSV、ECSV、FITS、HDF5 或其他 regular science file。
+最新提交的 `mock_lightcurves_sourceid.fits` 已替代此前误提交的百度网盘安装镜像，
+可以用于正式 independent stamp 生产。文件含 74 个源，并给出：
 
-因此这份输入无法评估光变注入。请银河系考古团队重新交付实际数据文件，并至少说明：
+- Gaia source ID (`Source`)；
+- Gaia G 星等 (`Gmag`)；
+- ICRS/J2000 坐标 (`RAJ2000`, `DEJ2000`)；
+- 源类别 (`class`)；
+- 内禀 `relative_flux = Delta F / F_ref` 和相对时间节点 (`time`)。
 
-- 每个源的 `source_id`、Gaia G Vega 基准星等；
-- ICRS/J2000 RA/Dec，或缺坐标时的 PSF ID；
-- 是否存在内禀光变；若有，按本文格式给出 frame-aligned relative flux；
-- 波段、星等制、单位、frame 对齐/归一化方法；
-- 文件版本、生成说明与 SHA-256。
+正式读取器将 `q=1+relative_flux`，删除尾部 NaN padding，忽略绝对时间零点，并对
+每个 10 s raw exposure 做 piecewise-linear 区间平均。所有当前 74 条曲线约覆盖
+1461 天，足以支持 90 天生产；10 个默认正式目标均可映射到 ET focal plane。
+
+仍应随每次科学更新明确以下版本信息：Gaia G 是否为 Vega、`relative_flux` 的基准
+定义、clean/noisy 列选择、曲线生成版本和 SHA-256。若将来加入没有 RA/Dec 的新源，
+团队必须给出明确 PSF ID；不能由生产者猜测位置。
 
 ## 10. 第一版明确不做的事情
 
