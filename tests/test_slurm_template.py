@@ -65,3 +65,26 @@ def test_galaxy_standard_analysis_slurm_launcher_is_fail_closed() -> None:
     assert "--cadence-seconds 60" in script
     assert "--output-dir \"${OUTPUT_DIR}\"" in script
     assert "--overwrite" not in script
+
+
+def test_galaxy_standard_analysis_array_launcher_is_serial_and_manifest_driven() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "galaxy_standard_stamp_analysis_array_slurm.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "#SBATCH --partition=cpu" in script
+    assert "#SBATCH --cpus-per-task=8" in script
+    assert "#SBATCH --mem=64G" in script
+    assert "#SBATCH --time=12:00:00" in script
+    assert "#SBATCH --array=0-9%1" in script
+    assert "#SBATCH --gres=" not in script
+    assert 'ARRAY_INDEX="${SLURM_ARRAY_TASK_ID:?This launcher must be submitted as an array job}"' in script
+    assert "if len(targets) != 10:" in script
+    assert "source_id = int(targets[array_index][\"source_id_int64\"])" in script
+    assert 'python -m et_mainsim.standard_stamp_analysis' in script
+    assert "--case injected" in script
+    assert "--cadence-seconds 60" in script
+    assert "--output-dir \"${OUTPUT_DIR}\"" in script
+    assert "--overwrite" not in script
