@@ -74,6 +74,10 @@ def _as_bool_mask(
         raise ReferencePhotometryContractError(
             f"{field_name} must be a boolean or integer mask, got {array.dtype}"
         )
+    if not np.all((array == 0) | (array == 1)):
+        raise ReferencePhotometryContractError(
+            f"{field_name} values must be exactly 0 or 1"
+        )
     return np.asarray(array, dtype=bool)
 
 
@@ -582,6 +586,10 @@ def _validate_cdpp_inputs(
         raise ReferencePhotometryContractError(
             "aperture_valid must be a boolean or integer mask"
         )
+    if not np.all((valid == 0) | (valid == 1)):
+        raise ReferencePhotometryContractError(
+            "aperture_valid values must be exactly 0 or 1"
+        )
     if exposure.shape == ():
         exposure = np.broadcast_to(exposure, time.shape)
     if exposure.shape != time.shape:
@@ -1078,13 +1086,55 @@ class _FormalDeliveryHeader:
     coadd_factor: int
     frame_count: int
     stamp_shape: tuple[int, int]
-    gain_e_per_dn: NDArray[np.float64]
+    gain_mode: Literal["scalar", "stamp_map", "per_frame_stamp_map"]
+    static_gain_e_per_dn: NDArray[np.float64] | None
     manifest_identity: str
     provenance_identity: str
     first_raw_frame_start: int
     last_raw_frame_stop: int
     first_time_start_seconds: float
     last_time_end_seconds: float
+
+
+_FORMAL_TIME_CONTINUITY_ABS_TOLERANCE_SECONDS = 1e-8
+
+
+def _formal_time_intervals_are_contiguous(
+    starts: NDArray[np.float64],
+    exposures: NDArray[np.float64],
+) -> bool:
+    """Check exact delivered interval adjacency with one stable absolute tolerance."""
+
+    if starts.size <= 1:
+        return True
+    return bool(
+        np.allclose(
+            starts[1:],
+            starts[:-1] + exposures[:-1],
+            rtol=0.0,
+            atol=_FORMAL_TIME_CONTINUITY_ABS_TOLERANCE_SECONDS,
+        )
+    )
+
+
+def _as_positive_formal_gain(
+    value: ArrayLike,
+    *,
+    field_name: str,
+) -> NDArray[np.float64]:
+    """Normalize one bounded gain value/crop without truthy coercion."""
+
+    try:
+        gain = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ReferencePhotometryContractError(
+            f"{field_name} must contain finite numeric gain values"
+        ) from error
+    if gain.size == 0 or not np.all(np.isfinite(gain)) or np.any(gain <= 0.0):
+        raise ReferencePhotometryContractError(
+            f"{field_name} must contain finite positive gain values"
+        )
+    return gain
 
 
 _FORMAL_REQUIRED_DATASETS = (
@@ -1237,16 +1287,48 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
             raise ReferencePhotometryContractError(
                 "formal delivery gain_e_per_dn is stored twice"
             )
+        static_gain: NDArray[np.float64] | None
         if "gain_e_per_dn" in handle:
-            gain = np.asarray(handle["gain_e_per_dn"], dtype=np.float64)
+            gain_dataset = handle["gain_e_per_dn"]
+            gain_shape = tuple(int(size) for size in gain_dataset.shape)
+            if gain_shape == ():
+                gain_mode: Literal["scalar", "stamp_map", "per_frame_stamp_map"] = (
+                    "scalar"
+                )
+                static_gain = _as_positive_formal_gain(
+                    gain_dataset[()],
+                    field_name="formal delivery gain_e_per_dn",
+                )
+            elif gain_shape == (ny, nx):
+                gain_mode = "stamp_map"
+                static_gain = _as_positive_formal_gain(
+                    gain_dataset[...],
+                    field_name="formal delivery gain_e_per_dn",
+                )
+            elif gain_shape == (n_frames, ny, nx):
+                # Do not materialize a potentially large 3-D calibration cube
+                # while reading headers.  Each bounded image batch crops and
+                # validates the matching gain planes below.
+                gain_mode = "per_frame_stamp_map"
+                static_gain = None
+            else:
+                raise ReferencePhotometryContractError(
+                    "streamed formal delivery gain must be scalar, stamp map, or "
+                    "per-frame stamp map"
+                )
         elif "gain_e_per_dn" in handle.attrs:
-            gain = np.asarray(handle.attrs["gain_e_per_dn"], dtype=np.float64)
+            gain_attribute = np.asarray(handle.attrs["gain_e_per_dn"])
+            if gain_attribute.shape != ():
+                raise ReferencePhotometryContractError(
+                    "formal delivery gain root attribute must be scalar"
+                )
+            gain_mode = "scalar"
+            static_gain = _as_positive_formal_gain(
+                gain_attribute,
+                field_name="formal delivery gain_e_per_dn",
+            )
         else:
             raise ReferencePhotometryContractError("formal delivery lacks gain_e_per_dn")
-        if gain.shape not in {(), (ny, nx)} or not np.all(np.isfinite(gain)) or np.any(gain <= 0.0):
-            raise ReferencePhotometryContractError(
-                "streamed formal delivery gain must be positive scalar or stamp map"
-            )
         starts = np.asarray(handle["time_start_seconds"], dtype=np.float64)
         exposure = np.asarray(handle["exposure_seconds"], dtype=np.float64)
         raw_start = np.asarray(handle["raw_frame_start_index"], dtype=np.int64)
@@ -1258,6 +1340,7 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
             or np.any(raw_start < 0)
             or np.any(raw_stop - raw_start != coadd_factor)
             or (n_frames > 1 and not np.all(np.diff(starts) > 0.0))
+            or not _formal_time_intervals_are_contiguous(starts, exposure)
             or (n_frames > 1 and not np.all(raw_start[1:] == raw_stop[:-1]))
         ):
             raise ReferencePhotometryContractError(
@@ -1271,7 +1354,8 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
         coadd_factor=coadd_factor,
         frame_count=n_frames,
         stamp_shape=(ny, nx),
-        gain_e_per_dn=gain,
+        gain_mode=gain_mode,
+        static_gain_e_per_dn=static_gain,
         manifest_identity=_formal_identity_json(manifest, omit=frozenset({"time_shard"})),
         provenance_identity=_formal_identity_json(provenance, omit=frozenset()),
         first_raw_frame_start=int(raw_start[0]),
@@ -1279,6 +1363,74 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
         first_time_start_seconds=float(starts[0]),
         last_time_end_seconds=float(starts[-1] + exposure[-1]),
     )
+
+
+def _formal_gain_crop(
+    handle: Any,
+    header: _FormalDeliveryHeader,
+    *,
+    frame_slice: slice,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+) -> float | NDArray[np.float64]:
+    """Return the calibration crop matching one streamed image batch.
+
+    Scalar and static stamp-map gains were fully bounded and validated while
+    parsing the header.  A formal per-frame gain cube is intentionally read
+    only for the current 13x13 crop, so a 90-day production reduction never
+    loads the full calibration cube into memory.
+    """
+
+    if header.gain_mode == "scalar":
+        assert header.static_gain_e_per_dn is not None
+        return float(header.static_gain_e_per_dn)
+    if header.gain_mode == "stamp_map":
+        assert header.static_gain_e_per_dn is not None
+        return header.static_gain_e_per_dn[y0:y1, x0:x1]
+
+    if "gain_e_per_dn" not in handle:
+        raise ReferencePhotometryContractError(
+            "formal delivery per-frame gain must be stored as a dataset"
+        )
+    dataset = handle["gain_e_per_dn"]
+    expected_shape = (header.frame_count, *header.stamp_shape)
+    if tuple(int(size) for size in dataset.shape) != expected_shape:
+        raise ReferencePhotometryContractError(
+            "formal delivery per-frame gain shape changed after header validation"
+        )
+    gain_crop = _as_positive_formal_gain(
+        dataset[frame_slice, y0:y1, x0:x1],
+        field_name="formal delivery per-frame gain_e_per_dn",
+    )
+    expected_crop_shape = (
+        int(frame_slice.stop) - int(frame_slice.start),
+        y1 - y0,
+        x1 - x0,
+    )
+    if gain_crop.shape != expected_crop_shape:
+        raise ReferencePhotometryContractError(
+            "formal delivery per-frame gain crop shape is invalid"
+        )
+    return gain_crop
+
+
+def _formal_gain_contracts_match(
+    header: _FormalDeliveryHeader,
+    first: _FormalDeliveryHeader,
+) -> bool:
+    """Compare static gains exactly while allowing explicit per-frame maps."""
+
+    if header.gain_mode != first.gain_mode:
+        return False
+    if header.gain_mode == "per_frame_stamp_map":
+        # The per-frame values intentionally vary by cadence and therefore by
+        # shard.  The mode, shape, provenance, and manifest are fixed below.
+        return True
+    assert header.static_gain_e_per_dn is not None
+    assert first.static_gain_e_per_dn is not None
+    return bool(np.array_equal(header.static_gain_e_per_dn, first.static_gain_e_per_dn))
 
 
 def reduce_stamp_delivery_series_v1(
@@ -1316,7 +1468,7 @@ def reduce_stamp_delivery_series_v1(
             header.product_kind != first.product_kind
             or header.coadd_factor != first.coadd_factor
             or header.stamp_shape != first.stamp_shape
-            or not np.array_equal(header.gain_e_per_dn, first.gain_e_per_dn)
+            or not _formal_gain_contracts_match(header, first)
             or header.manifest_identity != first.manifest_identity
             or header.provenance_identity != first.provenance_identity
         ):
@@ -1329,7 +1481,7 @@ def reduce_stamp_delivery_series_v1(
                 header.first_time_start_seconds,
                 float(previous_time_end),
                 rel_tol=0.0,
-                abs_tol=1e-8,
+                abs_tol=_FORMAL_TIME_CONTINUITY_ABS_TOLERANCE_SECONDS,
             )
         ):
             raise ReferencePhotometryContractError(
@@ -1354,10 +1506,6 @@ def reduce_stamp_delivery_series_v1(
     expected_time_start: float | None = None
     for header in headers:
         with h5py.File(header.path, "r") as handle:
-            if header.gain_e_per_dn.shape == ():
-                gain_crop: float | NDArray[np.float64] = float(header.gain_e_per_dn)
-            else:
-                gain_crop = header.gain_e_per_dn[y0:y1, x0:x1]
             for offset in range(0, header.frame_count, int(batch_frames)):
                 stop = min(offset + int(batch_frames), header.frame_count)
                 frame_slice = slice(offset, stop)
@@ -1374,9 +1522,11 @@ def reduce_stamp_delivery_series_v1(
                     handle["column_noise_sum_dn_by_x"][frame_slice, x0:x1],
                     dtype=np.float64,
                 )
-                valid = np.asarray(
+                mask_shape = tuple(int(size) for size in final.shape)
+                valid = _as_bool_mask(
                     handle["valid_mask"][frame_slice, y0:y1, x0:x1],
-                    dtype=bool,
+                    field_name="formal delivery valid_mask",
+                    shape=mask_shape,
                 )
                 fullwell = np.asarray(
                     handle["fullwell_count"][frame_slice, y0:y1, x0:x1],
@@ -1394,13 +1544,15 @@ def reduce_stamp_delivery_series_v1(
                     handle["cosmic_count"][frame_slice, y0:y1, x0:x1],
                     dtype=np.uint16,
                 )
-                saturated = np.asarray(
+                saturated = _as_bool_mask(
                     handle["saturated_mask"][frame_slice, y0:y1, x0:x1],
-                    dtype=bool,
+                    field_name="formal delivery saturated_mask",
+                    shape=mask_shape,
                 )
-                cosmic = np.asarray(
+                cosmic = _as_bool_mask(
                     handle["cosmic_mask"][frame_slice, y0:y1, x0:x1],
-                    dtype=bool,
+                    field_name="formal delivery cosmic_mask",
+                    shape=mask_shape,
                 )
                 time = np.asarray(handle["time_start_seconds"][frame_slice], dtype=np.float64)
                 exposure = np.asarray(handle["exposure_seconds"][frame_slice], dtype=np.float64)
@@ -1435,17 +1587,17 @@ def reduce_stamp_delivery_series_v1(
                 if expected_raw_start is not None and (
                     int(raw_start[0]) != expected_raw_start
                     or not math.isclose(
-                        float(time[0]),
-                        float(expected_time_start),
-                        rel_tol=0.0,
-                        abs_tol=1e-8,
+                            float(time[0]),
+                            float(expected_time_start),
+                            rel_tol=0.0,
+                            abs_tol=_FORMAL_TIME_CONTINUITY_ABS_TOLERANCE_SECONDS,
                     )
                 ):
                     raise ReferencePhotometryContractError(
                         "formal delivery frames are not globally continuous"
                     )
                 if time.size > 1 and (
-                    not np.all(np.diff(time) > 0.0)
+                    not _formal_time_intervals_are_contiguous(time, exposure)
                     or not np.all(raw_start[1:] == raw_stop[:-1])
                 ):
                     raise ReferencePhotometryContractError(
@@ -1453,6 +1605,15 @@ def reduce_stamp_delivery_series_v1(
                     )
                 expected_raw_start = int(raw_stop[-1])
                 expected_time_start = float(time[-1] + exposure[-1])
+                gain_crop = _formal_gain_crop(
+                    handle,
+                    header,
+                    frame_slice=frame_slice,
+                    y0=y0,
+                    y1=y1,
+                    x0=x0,
+                    x1=x1,
+                )
                 usable = valid & ~saturated & ~cosmic
                 usable_counts = np.count_nonzero(
                     usable.reshape(usable.shape[0], -1),
