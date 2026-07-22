@@ -49,14 +49,43 @@ def test_streamed_independent_shard_writes_raw_and_all_coadds(tmp_path) -> None:
         coadd_sizes=(3, 6),
         raw_exposure_seconds=10.0,
     )
+    physical_rng_pairing = {
+        "schema_id": "et_mainsim.galaxy_physical_rng_pairing.v1",
+        "schema_version": 1,
+        "seed_tree_run_seed": 12345,
+        "canonical_context_scope": {
+            "science_realization_id": 0,
+            "spacecraft_id": "et",
+            "detector_id": "main_lu",
+            "scope_id": 0,
+        },
+        "absolute_raw_frame_index": {
+            "formula": "absolute_raw_frame_start_index + local_frame_index",
+            "absolute_raw_frame_start_index": 0,
+            "selected_shard_absolute_frame_interval": {
+                "start_index": 0,
+                "stop_index": 6,
+            },
+        },
+        "selected_time_shard": shard.to_manifest_dict(),
+        "target_spec_sha256": "a" * 64,
+        "source_id_comparison_label": 42,
+        "source_id_in_physical_rng_identity": False,
+        "case_not_in_physical_rng_identity": True,
+        "rng_trace_scope_role": "execution_label_only",
+    }
     request = IndependentStampShardRequest(
         output_root=tmp_path,
         target_source_id=42,
         stamp_shape=(13, 13),
         shard=shard,
         gain_e_per_dn=2.0,
-        manifest={"run_id": "test", "input": "synthetic"},
-        provenance={"code": "test"},
+        manifest={
+            "run_id": "test",
+            "input": "synthetic",
+            "physical_rng_pairing": physical_rng_pairing,
+        },
+        provenance={"code": "test", "physical_rng_pairing": physical_rng_pairing},
         batch_size=2,
     )
 
@@ -76,8 +105,16 @@ def test_streamed_independent_shard_writes_raw_and_all_coadds(tmp_path) -> None:
     np.testing.assert_allclose(raw.background_expectation_e[:, 0, 0], [0.5, 1, 1.5, 2, 2.5, 3])
     assert raw.manifest["scene_policy"] == "independent_target"
     assert raw.manifest["time_shard"] == shard.to_manifest_dict()
+    assert raw.manifest["caller_manifest"] == request.manifest
     assert raw.provenance["observation_product"] == "final_dn"
     assert raw.provenance["background_realization_used"] is False
+    assert raw.provenance["caller_provenance"] == request.provenance
+    assert raw.manifest["caller_manifest"]["physical_rng_pairing"] == (
+        physical_rng_pairing
+    )
+    assert raw.provenance["caller_provenance"]["physical_rng_pairing"] == (
+        physical_rng_pairing
+    )
 
     assert coadd3.product_kind == "coadd"
     assert coadd3.final_dn.dtype == np.dtype(np.uint64)
@@ -90,6 +127,12 @@ def test_streamed_independent_shard_writes_raw_and_all_coadds(tmp_path) -> None:
     np.testing.assert_array_equal(coadd3.cosmic_count[:, 0, 0], [1, 0])
     np.testing.assert_array_equal(coadd3.raw_frame_start_index, [0, 3])
     np.testing.assert_array_equal(coadd3.raw_frame_stop_index_exclusive, [3, 6])
+    assert coadd3.manifest["caller_manifest"]["physical_rng_pairing"] == (
+        physical_rng_pairing
+    )
+    assert coadd3.provenance["caller_provenance"]["physical_rng_pairing"] == (
+        physical_rng_pairing
+    )
 
     np.testing.assert_array_equal(coadd6.final_dn[:, 0, 0], [21])
     np.testing.assert_array_equal(coadd6.fullwell_count[:, 0, 0], [1])

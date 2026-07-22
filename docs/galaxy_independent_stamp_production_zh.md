@@ -2,8 +2,9 @@
 
 本文说明当前可以进入正式科学数据生产的第一条源光变链路：银河系团队提交的
 `mock_lightcurves_sourceid.fits`。它不是全幅或共享曝光模拟，而是**每个目标独立
-渲染的 stamp**；同一目标在全部时间分片中保持同一全局随机数、温度、指向和
-光变时间轴。
+渲染、调度和原子交付的 stamp**。所有目标仍使用同一 campaign 的绝对 raw-frame
+时间轴和动态效应（温度、指向、legacy-aligned PSF breathing 等）；"independent" 绝不
+表示每个目标拥有彼此独立的物理随机场。
 
 正式执行入口是：
 
@@ -19,7 +20,7 @@ scripts/run_galaxy_independent_stamp_production.py
 
 | 项目 | 正式 v1 取值 / 规则 |
 | --- | --- |
-| 场景 | 单一目标、无邻星的 independent stamp；不宣称等价于 full-frame/shared-exposure 场景。 |
+| 场景 | 每个 target 单独调度、单独原子交付，且 catalog 只保留该目标、无邻星；不是 full-frame 的严格 crop，也不宣称等价于 full-frame/shared-exposure 场景。 |
 | 目标数 | 10 个 Galaxy 源；默认 Gaia ID 在代码中的 `DEFAULT_GALAXY_PRODUCTION_SOURCE_IDS`。 |
 | 时间长度 | 90 天；原始曝光 10 s。 |
 | 交付 cadence | raw 10 s，以及由同一 raw realization 求和得到的 30 s、1 min、2 min、5 min。 |
@@ -27,6 +28,7 @@ scripts/run_galaxy_independent_stamp_production.py
 | 星等语义 | 只接受 Gaia G Vega 基准星等。 |
 | 背景 | 写出背景**期望**，不写出背景随机 realization。 |
 | 响应效应 | SD-20 探测器响应效应在正式生产中 fail-closed 关闭；temperature-driven legacy PSF breathing、光子/背景/暗电流/读出/数字化等由已对齐的 Photsim7 链路处理。 |
+| 物理随机场 | 同一 detector、同一绝对 raw frame 的目标共享按绝对探测器坐标/块/列寻址的物理随机场；空间不重叠位置取得不同坐标地址，重叠像元必须复用同一 realization。不同 detector 的 `detector_id` 进入物理 scope，使用不同随机场。 |
 
 当前 10 个目标的 Gaia G 都约为 11.33--11.65 mag。其中两个 rotation 曲线的振幅
 明显大于其余 subgiant 曲线，适合作为注入恢复和残差 CDPP 的代表目标。Galaxy
@@ -93,6 +95,38 @@ Gaia G Vega baseline source expectation
 每个 `target × case × time-shard` 有一个 raw HDF5 和四个 coadd HDF5。`case` 为
 `static` 或 `injected`；正式科学产出使用 `injected`，而 `static` 仅作配对验证，
 不需要全量复制一遍 90 天数据。
+
+配对验证使用 Photsim7 的**真实物理** RNG identity，而不是执行标签。对同一 Gaia
+source、同一绝对 raw-frame shard，`static` 与 `injected` 的
+`SimulationContext.detector_rng_scope` 必须逐 frame 相同；其 canonical 字段为
+`science_realization_id`、`spacecraft_id`、`absolute_raw_frame_index`、`detector_id` 和
+`scope_id`，并由同一个 SeedTree `run_seed` 派生。`case` 只保留在 HDF5 的
+`manifest_json.caller_manifest.case`、输入 truth 和 execution labels 中；它**不进入**
+物理 seed。`rng_trace_scope` 也是 execution/provenance label，Photsim7 在 detector
+seed 归一化前会丢弃它，不能据此判断像素是否配对。
+
+新 worker 在每个 raw/coadd bundle 的
+`manifest_json.caller_manifest.physical_rng_pairing` 与
+`provenance_json.caller_provenance.physical_rng_pairing` 同时写入
+`et_mainsim.galaxy_physical_rng_pairing.v1` / version 1。该只读审计记录包含 SeedTree
+`run_seed`、不含 frame 项的 canonical context scope、
+`absolute_raw_frame_start_index + local_frame_index` 公式与该 shard 的绝对半开区间、
+`target_spec_sha256`，以及明确的
+`source_id_in_physical_rng_identity=false`、
+`case_not_in_physical_rng_identity=true` 和
+`rng_trace_scope_role=execution_label_only`。`source_id` 只作为 comparison label；不把
+它写入物理 identity，才能维持与 full-frame 物理坐标场一致的重叠像元语义。
+
+因此，**同 detector 的不同 source 并非彼此独立的 stochastic realization**：它们在
+同一 campaign/frame 共享同一个坐标可寻址的 detector random field，非重叠位置因坐标
+不同而有不同 draw，重叠位置则必须一致。不同 detector 因 `detector_id` 不同而使用
+不同物理随机场。这里的 independent 仅指 target-only/no-neighbors 场景、任务调度和
+原子交付；它既不改变 campaign dynamics，也不承诺是 full-frame 图像的严格裁剪。
+
+此前 v1/v2 预检产物没有这条紧凑的直接审计记录，但其同源 `static`/`injected` 是由
+同一真实 context scope、run seed、detector 和绝对 frame interval 产生的物理配对；
+不能因旧的 `rng_trace_scope` 含有 `case` 而将其判为未配对噪声。它们仍是预检/未完成
+科学交付的产物，应按其余 production gate 判断是否可用，而不是以 RNG 不配对为由否定。
 
 `final_dn` 是唯一真实的探测器观测量。其余平面不是第二份图像，而是使团队可以
 从 `final_dn` 自行得到电子域图像、选取自己的最优孔径并完成测光的校准和质量信息：

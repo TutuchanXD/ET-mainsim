@@ -187,5 +187,29 @@ realization。后续 reference photometry 的固定口径、完整窗口 CDPP、
 6. 不会把 optional diagnostic 或 background image 标作第二个观测产品，或用它做
    默认背景扣除。
 
+Galaxy 的 paired `static`/`injected` control 必须审计真实物理 RNG，而不是
+`rng_trace_scope`。后者只是 `execution_context.labels`；它可包含 `case`，但不会进入
+detector seed。新 Galaxy worker 在 raw/coadd 的 caller manifest 和 caller provenance
+均写入 `physical_rng_pairing`，schema 为
+`et_mainsim.galaxy_physical_rng_pairing.v1` / version 1。读取端应确认同一 source 和
+同一 shard 的两个 case 该记录完全相同：其中的 SeedTree `run_seed`、canonical
+`SimulationContext.detector_rng_scope`（`science_realization_id`、`spacecraft_id`、
+`detector_id`、`scope_id`）、绝对 raw-frame 公式/半开区间以及 `target_spec_sha256` 都是
+一致的；同时必须看到 `source_id_in_physical_rng_identity=false`、
+`case_not_in_physical_rng_identity=true` 和
+`rng_trace_scope_role=execution_label_only`。source ID 只作为 comparison label，不能被
+误读为 per-target stochastic seed。
+
+这也限定了 independent stamp 的语义：它是 target-only/no-neighbors 的场景选择、任务
+调度与原子交付，不是 full-frame 的严格 crop，且不制造每个目标独立的随机 detector
+field。同 detector、同一绝对 frame 的目标使用共同的按绝对像元/块/列寻址的随机场；
+非重叠位置有不同坐标地址，重叠位置应相同。不同 detector 的 `detector_id` 属于物理
+scope，因而使用不同随机场；所有目标仍共享同一 campaign dynamics 和全局时间轴。
+
+历史 v1/v2 预检 bundle 未写入上述直接审计记录，但同源 static/injected 仍可依据
+相同的真实 context scope、run seed、detector 与绝对 frame interval 确认物理配对；不能
+仅因旧 execution label 含 `case` 而将它们判为 unpaired noise。它们是否可用于科学交付
+仍由其它 production gate 决定。
+
 生产 writer 对格式、时间范围、质量 mask、完成状态与已声明语义失败关闭；它不会
 替科学团队猜测未冻结的波段转换、物理相位、最优 aperture 或场景邻星。
