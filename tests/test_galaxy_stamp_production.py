@@ -2,9 +2,35 @@ from __future__ import annotations
 
 import json
 import shutil
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
+
+def _stub_detector_physical_pixel_shape(
+    monkeypatch,
+    stamp_inputs,
+    *,
+    detector_id: str,
+    pixel_width: float,
+    pixel_height: float,
+) -> None:
+    detector = SimpleNamespace(
+        pixel_width=pixel_width,
+        pixel_height=pixel_height,
+    )
+
+    class _Registry:
+        def get_detector(self, requested_detector_id: str):
+            assert requested_detector_id == detector_id
+            return detector
+
+    monkeypatch.setattr(
+        stamp_inputs,
+        "_load_focalplane_registry",
+        lambda *_args, **_kwargs: _Registry(),
+    )
 
 
 def test_manifest_resource_can_move_with_run_root_without_losing_identity(tmp_path) -> None:
@@ -133,6 +159,135 @@ def test_formal_registry_gate_requires_owner_freeze_and_verified_attestation() -
             runtime,
             {"verified": False, "errors": ["content mismatch"]},
         )
+
+
+def test_map_curve_to_detector_rejects_coordinate_outside_physical_detector_bounds(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.galaxy_stamp_production as production
+    import et_mainsim.stamp_inputs as stamp_inputs
+
+    registry = tmp_path / "focalplane"
+    registry.mkdir()
+    monkeypatch.setattr(
+        stamp_inputs,
+        "_sky_to_focal",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="ok",
+            detector_id="main_ld",
+            xpix=9120.25,
+            ypix=100.0,
+            field_x_deg=1.0,
+            field_y_deg=2.0,
+            residual_arcsec=0.01,
+        ),
+    )
+    _stub_detector_physical_pixel_shape(
+        monkeypatch,
+        stamp_inputs,
+        detector_id="main_ld",
+        pixel_width=9120.0,
+        pixel_height=8900.0,
+    )
+
+    with pytest.raises(ValueError, match="physical focal-plane detector bounds"):
+        production._map_curve_to_detector(
+            focalplane_registry=registry,
+            registry_sha256="registry-fixture",
+            ra_deg=10.0,
+            dec_deg=-20.0,
+        )
+
+
+def test_prepare_rejects_invalid_physical_mapping_before_creating_run_root(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A bad coordinate must not leave a no-resume production root behind."""
+
+    import et_mainsim.galaxy_stamp_production as production
+    import et_mainsim.stamp_inputs as stamp_inputs
+    from et_mainsim.galaxy_lightcurves import GalaxyLightCurve
+
+    input_fits = tmp_path / "galaxy.fits"
+    input_fits.write_bytes(b"synthetic source fixture")
+    data_root = tmp_path / "data-root"
+    registry = tmp_path / "registry"
+    data_root.mkdir()
+    registry.mkdir()
+    curve = GalaxyLightCurve(
+        source_id=42,
+        gaia_g_mag=11.5,
+        ra_deg=10.0,
+        dec_deg=-20.0,
+        source_class="fixture",
+        native_time_seconds=np.array([0.0, 30.0]),
+        clean_flux_factor=np.array([1.0, 1.3]),
+        input_identity={"sha256": "fixture"},
+    )
+
+    class _Spec:
+        def to_json_dict(self):
+            return {"schema": "test-spec"}
+
+    monkeypatch.setattr(
+        production,
+        "load_galaxy_lightcurves",
+        lambda path, source_ids: {42: curve},
+    )
+    monkeypatch.setattr(
+        stamp_inputs,
+        "focalplane_registry_identity",
+        lambda path: {
+            "schema_id": "et_coord.semantic_registry_identity.v1",
+            "registry_data_dir": str(path),
+            "sha256": "registry-fixture",
+        },
+    )
+    monkeypatch.setattr(
+        stamp_inputs,
+        "_sky_to_focal",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="ok",
+            detector_id="main_ld",
+            xpix=9120.25,
+            ypix=100.0,
+            field_x_deg=1.0,
+            field_y_deg=2.0,
+            residual_arcsec=0.01,
+        ),
+    )
+    _stub_detector_physical_pixel_shape(
+        monkeypatch,
+        stamp_inputs,
+        detector_id="main_ld",
+        pixel_width=9120.0,
+        pixel_height=8900.0,
+    )
+    monkeypatch.setattr(
+        production,
+        "build_galaxy_independent_production_spec",
+        lambda **kwargs: _Spec(),
+    )
+
+    config = production.GalaxyStampProductionConfig(
+        input_fits=input_fits,
+        output_root=tmp_path / "prepared",
+        run_id="invalid-physical-mapping",
+        data_root=data_root,
+        focalplane_registry=registry,
+        source_ids=(42,),
+        duration_days=30.0 / 86_400.0,
+        cadence_seconds=(30.0,),
+        max_raw_frames_per_shard=3,
+        device="cpu",
+    )
+
+    with pytest.raises(ValueError, match="physical focal-plane detector bounds"):
+        production.prepare_galaxy_independent_production(config)
+
+    assert not config.run_root.exists()
 
 
 def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch) -> None:

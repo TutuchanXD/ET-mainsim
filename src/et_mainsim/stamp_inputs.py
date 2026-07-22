@@ -279,6 +279,71 @@ def _sky_to_focal(
     return sky_to_focal(registry, ra=ra_deg, dec=dec_deg)
 
 
+def _focalplane_detector_pixel_shape(
+    focalplane_registry: Path | str,
+    *,
+    detector_id: str,
+    registry_sha256: str = "",
+) -> tuple[float, float]:
+    """Return the physical ``(x, y)`` pixel extent for one registry detector.
+
+    A SimulationSpec raster is deliberately not a focal-plane geometry source:
+    rotated ET main detectors can have physical x/y extents that differ from
+    the raster's ``(rows, cols)`` storage orientation.  Coordinate-mapped
+    targets therefore validate against the frozen et_coord DetectorSpec.
+    """
+
+    registry = _load_focalplane_registry(
+        str(Path(focalplane_registry).expanduser().resolve()),
+        str(registry_sha256),
+    )
+    try:
+        detector = registry.get_detector(str(detector_id))
+    except (AttributeError, KeyError) as exc:
+        raise ValueError(
+            f"fixed focal-plane registry has no detector {detector_id!r}"
+        ) from exc
+    try:
+        pixel_width = float(detector.pixel_width)
+        pixel_height = float(detector.pixel_height)
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"focal-plane detector {detector_id!r} has invalid physical pixel bounds"
+        ) from exc
+    if (
+        not math.isfinite(pixel_width)
+        or not math.isfinite(pixel_height)
+        or pixel_width <= 0.0
+        or pixel_height <= 0.0
+    ):
+        raise ValueError(
+            f"focal-plane detector {detector_id!r} has invalid physical pixel bounds"
+        )
+    return pixel_width, pixel_height
+
+
+def _validate_physical_detector_coordinates(
+    *,
+    detector_id: str,
+    detector_xpix: float,
+    detector_ypix: float,
+    pixel_width: float,
+    pixel_height: float,
+    context: str,
+) -> None:
+    """Fail closed when a sky mapping lies outside the physical detector."""
+
+    if not (
+        0.0 <= detector_xpix <= pixel_width
+        and 0.0 <= detector_ypix <= pixel_height
+    ):
+        raise ValueError(
+            f"{context} must be inside physical focal-plane detector bounds "
+            f"for {detector_id!r}: x in [0, {pixel_width}], "
+            f"y in [0, {pixel_height}]"
+        )
+
+
 def _coordinate_value(
     row: Any,
     columns: Mapping[str, str],
@@ -329,6 +394,7 @@ def load_stamp_target_table(
     targets: list[StampTarget] = []
     sky_count = 0
     registry_identity: dict[str, Any] | None = None
+    physical_detector_shape: tuple[float, float] | None = None
     for row_index, row in enumerate(table):
         source_id = (
             row_index
@@ -412,6 +478,12 @@ def load_stamp_target_table(
                 raise ValueError(
                     f"row {row_index} maps to detector {mapped_detector!r}, not configured detector {detector_id!r}"
                 )
+            if physical_detector_shape is None:
+                physical_detector_shape = _focalplane_detector_pixel_shape(
+                    focalplane_registry,
+                    detector_id=mapped_detector,
+                    registry_sha256=str(registry_identity["sha256"]),
+                )
             detector_xpix = _finite(
                 getattr(result, "xpix", None),
                 field_name="mapped detector_xpix",
@@ -442,6 +514,14 @@ def load_stamp_target_table(
                 raise ValueError(
                     f"row {row_index} focalplane residual_arcsec must be non-negative"
                 )
+            _validate_physical_detector_coordinates(
+                detector_id=mapped_detector,
+                detector_xpix=detector_xpix,
+                detector_ypix=detector_ypix,
+                pixel_width=physical_detector_shape[0],
+                pixel_height=physical_detector_shape[1],
+                context=f"row {row_index} mapped detector coordinates",
+            )
             psf_id = None
             location_mode = "sky_icrs_j2000"
             sky_count += 1
@@ -474,8 +554,9 @@ def load_stamp_target_table(
             focalplane_residual_arcsec = None
             location_mode = "explicit_psf"
 
-        if not (0.0 <= detector_xpix <= cols - 1) or not (
-            0.0 <= detector_ypix <= rows - 1
+        if location_mode == "explicit_psf" and (
+            not (0.0 <= detector_xpix <= cols - 1)
+            or not (0.0 <= detector_ypix <= rows - 1)
         ):
             raise ValueError(
                 f"row {row_index} detector coordinates must be inside detector shape"
@@ -528,6 +609,15 @@ def load_stamp_target_table(
                 "focalplane registry changed while resolving stamp target coordinates"
             )
         provenance["focalplane_registry_identity"] = registry_identity
+        if physical_detector_shape is None:
+            raise RuntimeError(
+                "coordinate targets resolved without physical focal-plane detector bounds"
+            )
+        provenance["coordinate_physical_detector_bounds"] = {
+            "detector_id": str(detector_id),
+            "pixel_width": physical_detector_shape[0],
+            "pixel_height": physical_detector_shape[1],
+        }
     return LoadedStampTargetTable(
         targets=tuple(targets),
         provenance=provenance,

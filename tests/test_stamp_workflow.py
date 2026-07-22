@@ -137,6 +137,16 @@ def _stub_semantic_registry_identity(monkeypatch, stamp_inputs, registry) -> Non
         lambda _path: candidate,
     )
 
+    class _Registry:
+        def get_detector(self, _detector_id: str):
+            return SimpleNamespace(pixel_width=64.0, pixel_height=64.0)
+
+    monkeypatch.setattr(
+        stamp_inputs,
+        "_load_focalplane_registry",
+        lambda *_args, **_kwargs: _Registry(),
+    )
+
 
 def test_table_stamp_plan_does_not_require_full_frame_catalog_assets(tmp_path) -> None:
     from et_mainsim.workflows.stamp import preflight

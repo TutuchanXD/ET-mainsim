@@ -23,6 +23,46 @@ def _stub_semantic_registry_identity(monkeypatch, stamp_inputs, registry) -> Non
         lambda _path: candidate,
     )
 
+    class _Registry:
+        def get_detector(self, _detector_id: str):
+            # Existing coordinate fixtures use detector_shape=(rows=9,
+            # cols=11); their physical geometry is intentionally expressed in
+            # x/y order here rather than inheriting raster orientation.
+            return SimpleNamespace(pixel_width=11.0, pixel_height=9.0)
+
+    monkeypatch.setattr(
+        stamp_inputs,
+        "_load_focalplane_registry",
+        lambda *_args, **_kwargs: _Registry(),
+    )
+
+
+def _stub_detector_physical_pixel_shape(
+    monkeypatch,
+    stamp_inputs,
+    *,
+    detector_id: str,
+    pixel_width: float,
+    pixel_height: float,
+) -> None:
+    """Install the focal-plane geometry used by coordinate-target tests."""
+
+    detector = SimpleNamespace(
+        pixel_width=pixel_width,
+        pixel_height=pixel_height,
+    )
+
+    class _Registry:
+        def get_detector(self, requested_detector_id: str):
+            assert requested_detector_id == detector_id
+            return detector
+
+    monkeypatch.setattr(
+        stamp_inputs,
+        "_load_focalplane_registry",
+        lambda *_args, **_kwargs: _Registry(),
+    )
+
 
 def test_focalplane_registry_identity_uses_et_coord_semantic_candidate(
     monkeypatch,
@@ -106,6 +146,66 @@ def test_stamp_target_table_accepts_documented_aliases_and_coordinates(tmp_path)
         "focalplane_residual_arcsec": None,
         "psf_node_angle_deg": None,
         "psf_angle_delta_deg": None,
+    }
+
+
+def test_coordinate_target_uses_physical_focalplane_pixel_bounds_not_raster_shape(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A rotated main detector may be wider than the renderer's raster columns."""
+
+    import et_mainsim.stamp_inputs as stamp_inputs
+
+    registry = tmp_path / "focalplane"
+    registry.mkdir()
+    path = tmp_path / "targets.ecsv"
+    Table(
+        {
+            "source_id": [2080632520701306880],
+            "gaia_g_mag": [11.0],
+            "ra_deg": [10.0],
+            "dec_deg": [-20.0],
+        }
+    ).write(path, format="ascii.ecsv")
+    monkeypatch.setattr(
+        stamp_inputs,
+        "_sky_to_focal",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="ok",
+            detector_id="main_ld",
+            # main_ld is physically 9120 x 8900 pixels.  The ET simulation
+            # raster remains (rows, cols) = (9120, 8900), so this valid x
+            # coordinate must not be compared with raster cols=8900.
+            xpix=9065.726,
+            ypix=6185.964,
+            field_x_deg=1.0,
+            field_y_deg=2.0,
+            residual_arcsec=0.01,
+        ),
+    )
+    _stub_semantic_registry_identity(monkeypatch, stamp_inputs, registry)
+    _stub_detector_physical_pixel_shape(
+        monkeypatch,
+        stamp_inputs,
+        detector_id="main_ld",
+        pixel_width=9120.0,
+        pixel_height=8900.0,
+    )
+
+    loaded = stamp_inputs.load_stamp_target_table(
+        path,
+        detector_shape=(9120, 8900),
+        detector_id="main_ld",
+        focalplane_registry=registry,
+    )
+
+    assert loaded.targets[0].detector_xpix == pytest.approx(9065.726)
+    assert loaded.targets[0].detector_ypix == pytest.approx(6185.964)
+    assert loaded.provenance["coordinate_physical_detector_bounds"] == {
+        "detector_id": "main_ld",
+        "pixel_width": 9120.0,
+        "pixel_height": 8900.0,
     }
 
 
