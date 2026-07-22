@@ -228,6 +228,9 @@ def test_standard_analysis_writes_formal_lightcurve_quality_and_residual(
 
     analysis = json.loads(result.analysis_manifest_path.read_text(encoding="utf-8"))
     assert analysis["schema_id"] == "et_mainsim.standard_stamp_analysis.v1"
+    assert analysis["production_manifest_relative_to_run_root"] == (
+        "production_manifest.json"
+    )
     assert analysis["observation_product"] == "final_dn"
     assert analysis["ordinary_cdpp_label"] == (
         "undetrended_astrophysical_plus_instrument_legacy_compatible_diagnostic"
