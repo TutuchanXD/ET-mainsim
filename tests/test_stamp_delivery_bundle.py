@@ -201,3 +201,97 @@ def test_contract_rejects_a_background_realization_as_a_reduction_input() -> Non
     }
     with pytest.raises(StampDeliveryBundleContractError, match="must be false"):
         StampDeliveryBundle.from_arrays(**payload)
+
+
+def test_streaming_appender_keeps_partial_invisible_until_complete(tmp_path) -> None:
+    from et_mainsim.stamp_delivery import (
+        StampDeliveryBundle,
+        StampDeliveryBundleAppender,
+        read_stamp_delivery_bundle,
+    )
+
+    payload = _bundle_payload()
+    frame_fields = (
+        "final_dn",
+        "background_expectation_e",
+        "bias_level_sum_dn",
+        "column_noise_sum_dn_by_x",
+        "valid_mask",
+        "fullwell_count",
+        "adc_low_count",
+        "adc_high_count",
+        "cosmic_count",
+        "time_start_seconds",
+        "exposure_seconds",
+        "raw_frame_start_index",
+        "raw_frame_stop_index_exclusive",
+    )
+
+    def one_frame(frame_index: int) -> StampDeliveryBundle:
+        batch = dict(payload)
+        for name in frame_fields:
+            batch[name] = np.asarray(batch[name])[frame_index : frame_index + 1]
+        return StampDeliveryBundle.from_arrays(**batch)
+
+    path = tmp_path / "streamed-raw.h5"
+    appender = StampDeliveryBundleAppender(
+        path,
+        product_kind="raw",
+        coadd_factor=1,
+        stamp_shape=(3, 4),
+        gain_e_per_dn=2.0,
+        manifest=payload["manifest"],
+        provenance=payload["provenance"],
+    )
+    appender.append(one_frame(0))
+    assert not path.exists()
+    assert len(list(tmp_path.glob("*.partial"))) == 1
+    appender.append(one_frame(1))
+
+    report = appender.complete()
+    assert report.complete is True
+    assert path.is_file()
+    assert not list(tmp_path.glob("*.partial"))
+    assert read_stamp_delivery_bundle(path).shape == (2, 3, 4)
+    with pytest.raises(RuntimeError, match="already completed"):
+        appender.append(one_frame(0))
+
+
+def test_streaming_appender_aborts_a_partial_product_on_context_exit(tmp_path) -> None:
+    from et_mainsim.stamp_delivery import (
+        StampDeliveryBundle,
+        StampDeliveryBundleAppender,
+    )
+
+    payload = _bundle_payload()
+    batch = dict(payload)
+    for name in (
+        "final_dn",
+        "background_expectation_e",
+        "bias_level_sum_dn",
+        "column_noise_sum_dn_by_x",
+        "valid_mask",
+        "fullwell_count",
+        "adc_low_count",
+        "adc_high_count",
+        "cosmic_count",
+        "time_start_seconds",
+        "exposure_seconds",
+        "raw_frame_start_index",
+        "raw_frame_stop_index_exclusive",
+    ):
+        batch[name] = np.asarray(batch[name])[:1]
+    path = tmp_path / "aborted-raw.h5"
+    with StampDeliveryBundleAppender(
+        path,
+        product_kind="raw",
+        coadd_factor=1,
+        stamp_shape=(3, 4),
+        gain_e_per_dn=2.0,
+        manifest=payload["manifest"],
+        provenance=payload["provenance"],
+    ) as appender:
+        appender.append(StampDeliveryBundle.from_arrays(**batch))
+
+    assert not path.exists()
+    assert not list(tmp_path.glob("*.partial"))

@@ -19,6 +19,34 @@ write_stamp_delivery_bundle("target_42/shard_0003_raw.h5", bundle)
 checked = read_stamp_delivery_bundle("target_42/shard_0003_raw.h5")
 ```
 
+对于 time-shard worker，不需要把整个 shard 累积在内存中。可使用
+`StampDeliveryBundleAppender`：每次 `append()` 一个已由
+`StampDeliveryBundle.from_arrays()` 验证过的有限 batch，最后只调用一次
+`complete()`。每个 batch 必须具有相同的 `product_kind`、`coadd_factor`、
+stamp shape、静态 `gain_e_per_dn`、`manifest` 和 `provenance`；batch 之间不能
+在时间或 raw-frame 区间重叠。streaming appender 的 gain 仅支持标量或固定的
+`(ny,nx)` map，避免未显式设计的逐帧 gain 混合。
+
+```python
+from et_mainsim.stamp_delivery import StampDeliveryBundleAppender
+
+with StampDeliveryBundleAppender(
+    final_path,
+    product_kind="raw",
+    coadd_factor=1,
+    stamp_shape=(ny, nx),
+    gain_e_per_dn=gain_e_per_dn,
+    manifest=manifest,
+    provenance=provenance,
+) as writer:
+    for batch in bounded_batches:
+        writer.append(StampDeliveryBundle.from_arrays(**batch))
+    report = writer.complete()
+```
+
+离开 context 前未执行 `complete()`，或任一 `append()`/readback 出错时，partial
+文件会被删除；因此它同样没有 append-after-final 或从 partial 续跑的语义。
+
 ## 核心语义
 
 `final_dn` 是本合同中唯一的**真实探测器观测量**。它是原始 10 s 帧或由连续

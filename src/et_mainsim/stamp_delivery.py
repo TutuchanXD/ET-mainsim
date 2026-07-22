@@ -703,6 +703,358 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def _validate_appender_stamp_shape(value: tuple[int, int]) -> tuple[int, int]:
+    if not isinstance(value, tuple) or len(value) != 2:
+        raise StampDeliveryBundleContractError(
+            "stamp_shape must be a (ny, nx) tuple"
+        )
+    ny, nx = value
+    if isinstance(ny, bool) or isinstance(nx, bool):
+        raise StampDeliveryBundleContractError("stamp_shape dimensions must be integers")
+    try:
+        normalised = (int(ny), int(nx))
+    except (TypeError, ValueError) as error:
+        raise StampDeliveryBundleContractError(
+            "stamp_shape dimensions must be integers"
+        ) from error
+    if normalised[0] <= 0 or normalised[1] <= 0:
+        raise StampDeliveryBundleContractError("stamp_shape dimensions must be positive")
+    return normalised
+
+
+def _validate_delivery_provenance(value: Mapping[str, Any]) -> dict[str, Any]:
+    normalised = _as_json_mapping(value, name="provenance")
+    if normalised.get("observation_product") != STAMP_DELIVERY_OBSERVATION_PRODUCT:
+        raise StampDeliveryBundleContractError(
+            "provenance.observation_product must be 'final_dn'"
+        )
+    if normalised.get("background_realization_used") is not False:
+        raise StampDeliveryBundleContractError(
+            "provenance.background_realization_used must be false"
+        )
+    return normalised
+
+
+def _create_appendable_dataset(
+    handle: Any,
+    name: str,
+    *,
+    tail_shape: tuple[int, ...],
+    dtype: np.dtype[Any],
+) -> None:
+    if len(tail_shape) == 2:
+        chunks = (64, *tail_shape)
+    elif len(tail_shape) == 1:
+        chunks = (256, *tail_shape)
+    elif len(tail_shape) == 0:
+        chunks = (4096,)
+    else:  # pragma: no cover - all v1 planes have 0, 1, or 2 trailing axes.
+        raise AssertionError(f"unsupported appendable tail shape {tail_shape}")
+    handle.create_dataset(
+        name,
+        shape=(0, *tail_shape),
+        maxshape=(None, *tail_shape),
+        chunks=chunks,
+        dtype=dtype,
+    )
+
+
+class StampDeliveryBundleAppender:
+    """Stream bounded batches into one invisible partial delivery bundle.
+
+    The appender deliberately does not offer resume or post-completion append.
+    Batches are appended only to one sibling ``.partial`` file while a small
+    output lock is held.  ``complete()`` marks that file complete, closes and
+    fully validates it, then atomically renames it to the requested final
+    pathname.  If a worker exits its context without ``complete()``, the
+    partial product is deleted.
+
+    ``gain_e_per_dn`` is static for one streamed shard: scalar or ``(ny,nx)``.
+    A time-varying gain plane is valid in the one-shot bundle API but is not
+    accepted here until a producer has a concrete per-frame calibration use
+    case.  This avoids silently mixing gain contracts across independently
+    produced batches.
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        product_kind: DeliveryProductKind | str,
+        coadd_factor: int,
+        stamp_shape: tuple[int, int],
+        gain_e_per_dn: ArrayLike,
+        manifest: Mapping[str, Any],
+        provenance: Mapping[str, Any],
+        overwrite: bool = False,
+    ) -> None:
+        self._target = Path(path)
+        self._target.parent.mkdir(parents=True, exist_ok=True)
+        if self._target.name in {"", ".", ".."}:
+            raise StampDeliveryBundleContractError(
+                "path must name an HDF5 bundle file"
+            )
+        self._product_kind = _normalise_product_kind(product_kind)
+        self._coadd_factor = _normalise_coadd_factor(
+            coadd_factor,
+            product_kind=self._product_kind,
+        )
+        self._stamp_shape = _validate_appender_stamp_shape(stamp_shape)
+        raw_gain = _as_finite_float_array(gain_e_per_dn, name="gain_e_per_dn")
+        if np.any(raw_gain <= 0.0) or raw_gain.shape not in {
+            (),
+            self._stamp_shape,
+        }:
+            raise StampDeliveryBundleContractError(
+                "streaming gain_e_per_dn must be positive scalar or (ny, nx)"
+            )
+        self._gain_e_per_dn = raw_gain
+        self._manifest = _as_json_mapping(manifest, name="manifest")
+        self._provenance = _validate_delivery_provenance(provenance)
+        self._overwrite = bool(overwrite)
+        self._partial = self._target.with_name(
+            f".{self._target.name}.{uuid.uuid4().hex}.partial"
+        )
+        self._lock_context = _exclusive_output_lock(self._target)
+        self._lock_held = False
+        self._handle: Any | None = None
+        self._frame_count = 0
+        self._final_dn_dtype: np.dtype[Any] | None = None
+        self._last_time_end: float | None = None
+        self._last_raw_stop: int | None = None
+        self._state = "new"
+
+        try:
+            self._lock_context.__enter__()
+            self._lock_held = True
+            if self._target.exists() and not self._overwrite:
+                raise FileExistsError(
+                    f"stamp delivery bundle already exists: {self._target}; use a new "
+                    "shard identity instead of resuming it"
+                )
+            h5py = _h5py()
+            self._handle = h5py.File(self._partial, "w")
+            self._handle.attrs["schema_id"] = STAMP_DELIVERY_SCHEMA_ID
+            self._handle.attrs["schema_version"] = STAMP_DELIVERY_SCHEMA_VERSION
+            self._handle.attrs["complete"] = False
+            self._handle.attrs["product_kind"] = self._product_kind
+            self._handle.attrs["coadd_factor"] = self._coadd_factor
+            self._handle.attrs["observation_product"] = STAMP_DELIVERY_OBSERVATION_PRODUCT
+            self._handle.attrs["background_realization_used"] = False
+            if self._gain_e_per_dn.shape == ():
+                self._handle.attrs["gain_e_per_dn"] = float(self._gain_e_per_dn)
+            else:
+                _write_dataset(self._handle, "gain_e_per_dn", self._gain_e_per_dn)
+            _write_json_dataset(self._handle, "manifest_json", self._manifest)
+            _write_json_dataset(self._handle, "provenance_json", self._provenance)
+            self._handle.flush()
+            self._state = "open"
+        except BaseException:
+            self.abort()
+            raise
+
+    @property
+    def path(self) -> Path:
+        """Return the final pathname, which remains invisible until completion."""
+
+        return self._target
+
+    @property
+    def frame_count(self) -> int:
+        """Return the number of successfully appended output planes."""
+
+        return self._frame_count
+
+    def _require_open(self) -> Any:
+        if self._state == "completed":
+            raise RuntimeError("stamp delivery appender is already completed")
+        if self._state != "open" or self._handle is None:
+            raise RuntimeError("stamp delivery appender is not open")
+        return self._handle
+
+    def _release_lock(self) -> None:
+        if self._lock_held:
+            self._lock_context.__exit__(None, None, None)
+            self._lock_held = False
+
+    def _create_frame_datasets(self, bundle: StampDeliveryBundle) -> None:
+        assert self._handle is not None
+        _, ny, nx = bundle.shape
+        for name, tail_shape, dtype in (
+            ("final_dn", (ny, nx), bundle.final_dn.dtype),
+            ("background_expectation_e", (ny, nx), np.dtype(np.float64)),
+            ("bias_level_sum_dn", (), np.dtype(np.float64)),
+            ("column_noise_sum_dn_by_x", (nx,), np.dtype(np.float64)),
+            ("valid_mask", (ny, nx), np.dtype(np.uint8)),
+            ("fullwell_count", (ny, nx), np.dtype(np.uint16)),
+            ("adc_low_count", (ny, nx), np.dtype(np.uint16)),
+            ("adc_high_count", (ny, nx), np.dtype(np.uint16)),
+            ("cosmic_count", (ny, nx), np.dtype(np.uint16)),
+            ("saturated_mask", (ny, nx), np.dtype(np.uint8)),
+            ("cosmic_mask", (ny, nx), np.dtype(np.uint8)),
+            ("time_start_seconds", (), np.dtype(np.float64)),
+            ("exposure_seconds", (), np.dtype(np.float64)),
+            ("raw_frame_start_index", (), np.dtype(np.int64)),
+            ("raw_frame_stop_index_exclusive", (), np.dtype(np.int64)),
+        ):
+            _create_appendable_dataset(
+                self._handle,
+                name,
+                tail_shape=tail_shape,
+                dtype=np.dtype(dtype),
+            )
+        self._final_dn_dtype = bundle.final_dn.dtype
+
+    def _validate_batch_identity(self, bundle: StampDeliveryBundle) -> None:
+        if not isinstance(bundle, StampDeliveryBundle):
+            raise TypeError("bundle must be a StampDeliveryBundle")
+        if bundle.product_kind != self._product_kind:
+            raise StampDeliveryBundleContractError(
+                "streamed batch product_kind differs from appender product_kind"
+            )
+        if bundle.coadd_factor != self._coadd_factor:
+            raise StampDeliveryBundleContractError(
+                "streamed batch coadd_factor differs from appender coadd_factor"
+            )
+        if bundle.shape[1:] != self._stamp_shape:
+            raise StampDeliveryBundleContractError(
+                "streamed batch stamp shape differs from appender stamp_shape"
+            )
+        if bundle.manifest != self._manifest:
+            raise StampDeliveryBundleContractError(
+                "streamed batch manifest differs from appender manifest"
+            )
+        if bundle.provenance != self._provenance:
+            raise StampDeliveryBundleContractError(
+                "streamed batch provenance differs from appender provenance"
+            )
+        if not np.array_equal(bundle.gain_e_per_dn, self._gain_e_per_dn):
+            raise StampDeliveryBundleContractError(
+                "streamed batch gain_e_per_dn differs from appender calibration"
+            )
+        if self._final_dn_dtype is not None and bundle.final_dn.dtype != (
+            self._final_dn_dtype
+        ):
+            raise StampDeliveryBundleContractError(
+                "streamed batch final_dn dtype differs from the first batch"
+            )
+        if self._last_time_end is not None and float(bundle.time_start_seconds[0]) < (
+            self._last_time_end
+        ):
+            raise StampDeliveryBundleContractError(
+                "streamed batches overlap or reverse time_start_seconds"
+            )
+        if self._last_raw_stop is not None and int(bundle.raw_frame_start_index[0]) < (
+            self._last_raw_stop
+        ):
+            raise StampDeliveryBundleContractError(
+                "streamed batches overlap or reverse raw-frame intervals"
+            )
+
+    def append(self, bundle: StampDeliveryBundle) -> int:
+        """Append one validated bounded batch and return total output frames."""
+
+        handle = self._require_open()
+        self._validate_batch_identity(bundle)
+        if self._frame_count == 0:
+            self._create_frame_datasets(bundle)
+        assert self._final_dn_dtype is not None
+        batch_count = bundle.shape[0]
+        start = self._frame_count
+        stop = start + batch_count
+        payloads: tuple[tuple[str, NDArray[np.generic]], ...] = (
+            ("final_dn", bundle.final_dn),
+            ("background_expectation_e", bundle.background_expectation_e),
+            ("bias_level_sum_dn", bundle.bias_level_sum_dn),
+            ("column_noise_sum_dn_by_x", bundle.column_noise_sum_dn_by_x),
+            ("valid_mask", bundle.valid_mask.astype(np.uint8, copy=False)),
+            ("fullwell_count", bundle.fullwell_count),
+            ("adc_low_count", bundle.adc_low_count),
+            ("adc_high_count", bundle.adc_high_count),
+            ("cosmic_count", bundle.cosmic_count),
+            ("saturated_mask", bundle.saturated_mask.astype(np.uint8, copy=False)),
+            ("cosmic_mask", bundle.cosmic_mask.astype(np.uint8, copy=False)),
+            ("time_start_seconds", bundle.time_start_seconds),
+            ("exposure_seconds", bundle.exposure_seconds),
+            ("raw_frame_start_index", bundle.raw_frame_start_index),
+            ("raw_frame_stop_index_exclusive", bundle.raw_frame_stop_index_exclusive),
+        )
+        for name, value in payloads:
+            dataset = handle[name]
+            dataset.resize((stop, *dataset.shape[1:]))
+            dataset[start:stop] = value
+        self._frame_count = stop
+        self._last_time_end = float(
+            bundle.time_start_seconds[-1] + bundle.exposure_seconds[-1]
+        )
+        self._last_raw_stop = int(bundle.raw_frame_stop_index_exclusive[-1])
+        handle.flush()
+        return self._frame_count
+
+    def complete(self) -> StampDeliveryBundleValidation:
+        """Validate the staged file and atomically publish its final pathname."""
+
+        handle = self._require_open()
+        if self._frame_count == 0:
+            raise StampDeliveryBundleContractError(
+                "cannot complete a delivery bundle with no appended frames"
+            )
+        try:
+            handle.attrs["complete"] = True
+            handle.flush()
+            handle.close()
+            self._handle = None
+            with self._partial.open("rb") as stream:
+                os.fsync(stream.fileno())
+            report = validate_stamp_delivery_bundle(self._partial)
+            if self._target.exists() and not self._overwrite:
+                raise FileExistsError(
+                    f"stamp delivery bundle already exists: {self._target}; refusing "
+                    "to replace it"
+                )
+            os.replace(self._partial, self._target)
+            _fsync_directory(self._target.parent)
+            self._state = "completed"
+            self._release_lock()
+            return StampDeliveryBundleValidation(
+                path=self._target,
+                complete=report.complete,
+                product_kind=report.product_kind,
+                coadd_factor=report.coadd_factor,
+                frame_count=report.frame_count,
+                stamp_shape=report.stamp_shape,
+                final_dn_dtype=report.final_dn_dtype,
+                observation_product=report.observation_product,
+            )
+        except BaseException:
+            self.abort()
+            raise
+
+    def abort(self) -> None:
+        """Close and delete an unpublished partial bundle, if one exists."""
+
+        if self._state == "completed":
+            return
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+        try:
+            self._partial.unlink()
+        except FileNotFoundError:
+            pass
+        self._state = "aborted"
+        self._release_lock()
+
+    def __enter__(self) -> "StampDeliveryBundleAppender":
+        self._require_open()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        if self._state == "open":
+            self.abort()
+        return False
+
+
 def write_stamp_delivery_bundle(
     path: Path | str,
     bundle: StampDeliveryBundle,
@@ -888,6 +1240,7 @@ __all__ = [
     "STAMP_DELIVERY_SCHEMA_ID",
     "STAMP_DELIVERY_SCHEMA_VERSION",
     "StampDeliveryBundle",
+    "StampDeliveryBundleAppender",
     "StampDeliveryBundleContractError",
     "StampDeliveryBundleValidation",
     "read_stamp_delivery_bundle",
