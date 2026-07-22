@@ -35,6 +35,44 @@ def _input_arrays(*, n_frames: int = 2, shape: tuple[int, int] = (15, 15)):
     }
 
 
+def _write_formal_raw_bundle(tmp_path, name: str, *, n_frames: int, start: int):
+    """Persist a compact valid raw formal bundle for corruption tests."""
+
+    from et_mainsim.stamp_delivery import (
+        StampDeliveryBundle,
+        write_stamp_delivery_bundle,
+    )
+
+    ny, nx = 15, 15
+    raw = np.arange(start, start + n_frames, dtype=np.int64)
+    bundle = StampDeliveryBundle.from_arrays(
+        product_kind="raw",
+        coadd_factor=1,
+        final_dn=np.full((n_frames, ny, nx), 16, dtype=np.uint16),
+        background_expectation_e=np.full((n_frames, ny, nx), 2.0),
+        bias_level_sum_dn=np.full(n_frames, 10.0),
+        column_noise_sum_dn_by_x=np.zeros((n_frames, nx)),
+        valid_mask=np.ones((n_frames, ny, nx), dtype=bool),
+        fullwell_count=np.zeros((n_frames, ny, nx), dtype=np.uint16),
+        adc_low_count=np.zeros((n_frames, ny, nx), dtype=np.uint16),
+        adc_high_count=np.zeros((n_frames, ny, nx), dtype=np.uint16),
+        cosmic_count=np.zeros((n_frames, ny, nx), dtype=np.uint16),
+        time_start_seconds=raw.astype(float) * 10.0,
+        exposure_seconds=np.full(n_frames, 10.0),
+        raw_frame_start_index=raw,
+        raw_frame_stop_index_exclusive=raw + 1,
+        gain_e_per_dn=np.asarray(2.0),
+        manifest={"target_source_id_int64": 42},
+        provenance={
+            "observation_product": "final_dn",
+            "background_realization_used": False,
+        },
+    )
+    path = tmp_path / name
+    write_stamp_delivery_bundle(path, bundle)
+    return path
+
+
 def test_reduce_reference_photometry_derives_electrons_from_final_dn_only() -> None:
     from et_mainsim.reference_photometry import (
         ReferencePhotometryInput,
@@ -87,6 +125,27 @@ def test_reduce_reference_photometry_invalidates_a_fixed_aperture_on_any_mask(
     assert result.aperture_valid.tolist() == [False, True]
     assert np.isnan(result.flux_e[0])
     assert result.flux_e[1] == pytest.approx(845.0)
+
+
+@pytest.mark.parametrize("mask_name", ["valid_mask", "saturated_mask", "cosmic_mask"])
+def test_reference_photometry_rejects_nonbinary_input_masks(mask_name: str) -> None:
+    """Masks are binary wire values, not arbitrary truthy integer arrays."""
+
+    from et_mainsim.reference_photometry import (
+        ReferencePhotometryContractError,
+        ReferencePhotometryInput,
+    )
+
+    payload = _input_arrays()
+    payload[mask_name] = np.asarray(payload[mask_name], dtype=np.uint8)
+    payload[mask_name][0, 0, 0] = 2
+
+    with pytest.raises(ReferencePhotometryContractError, match="exactly 0 or 1"):
+        ReferencePhotometryInput.from_arrays(
+            **payload,
+            time_index_unit="frame_index",
+            raw_frame_seconds=60.0,
+        )
 
 
 def test_load_reference_photometry_input_reads_composite_hdf5_bundle(tmp_path) -> None:
@@ -263,6 +322,119 @@ def test_reduce_stamp_delivery_series_rejects_a_gap_between_shards(tmp_path) -> 
 
     with pytest.raises(ReferencePhotometryContractError, match="globally continuous"):
         reduce_stamp_delivery_series_v1((first, gap), batch_frames=1)
+
+
+def test_reduce_stamp_delivery_series_rejects_an_intra_shard_time_gap(tmp_path) -> None:
+    """Contiguous raw indices cannot conceal a physical-time gap in one shard."""
+
+    from et_mainsim.reference_photometry import (
+        ReferencePhotometryContractError,
+        reduce_stamp_delivery_series_v1,
+    )
+
+    n_frames = 3
+    path = _write_formal_raw_bundle(
+        tmp_path,
+        "intra_shard_gap.h5",
+        n_frames=n_frames,
+        start=0,
+    )
+    with h5py.File(path, "r+") as handle:
+        handle["time_start_seconds"][...] = np.array([0.0, 20.0, 30.0])
+
+    with pytest.raises(ReferencePhotometryContractError, match="invalid frame intervals"):
+        # One batch ensures the reader cannot rely only on its batch-edge check.
+        reduce_stamp_delivery_series_v1((path,), batch_frames=n_frames)
+
+
+@pytest.mark.parametrize("mask_name", ["valid_mask", "saturated_mask", "cosmic_mask"])
+def test_reduce_stamp_delivery_series_rejects_nonbinary_formal_masks(
+    tmp_path,
+    mask_name: str,
+) -> None:
+    """The streaming path must not bool-coerce corrupted formal mask values."""
+
+    from et_mainsim.reference_photometry import (
+        ReferencePhotometryContractError,
+        reduce_stamp_delivery_series_v1,
+    )
+
+    ny, nx = 15, 15
+    path = _write_formal_raw_bundle(
+        tmp_path,
+        f"nonbinary_{mask_name}.h5",
+        n_frames=2,
+        start=0,
+    )
+    with h5py.File(path, "r+") as handle:
+        handle[mask_name][0, ny // 2, nx // 2] = 2
+
+    with pytest.raises(ReferencePhotometryContractError, match="exactly 0 or 1"):
+        reduce_stamp_delivery_series_v1((path,), batch_frames=1)
+
+
+def test_reduce_stamp_delivery_series_streams_per_frame_gain_maps(tmp_path) -> None:
+    """A valid formal 3-D gain plane is cropped per frame, not rejected or reused."""
+
+    from et_mainsim.reference_photometry import reduce_stamp_delivery_series_v1
+    from et_mainsim.stamp_delivery import (
+        StampDeliveryBundle,
+        write_stamp_delivery_bundle,
+    )
+
+    ny, nx = 15, 15
+
+    def write_shard(name: str, *, start: int, gain_values: tuple[int, int]):
+        n_frames = len(gain_values)
+        gains = np.stack(
+            [np.full((ny, nx), value, dtype=float) for value in gain_values]
+        )
+        # `(final_dn - bias) * gain - background` is exactly 10 e/pixel.
+        final = np.stack(
+            [
+                np.full((ny, nx), 10 + 12 // gain, dtype=np.uint16)
+                for gain in gain_values
+            ]
+        )
+        raw = np.arange(start, start + n_frames, dtype=np.int64)
+        bundle = StampDeliveryBundle.from_arrays(
+            product_kind="raw",
+            coadd_factor=1,
+            final_dn=final,
+            background_expectation_e=np.full((n_frames, ny, nx), 2.0),
+            bias_level_sum_dn=np.full(n_frames, 10.0),
+            column_noise_sum_dn_by_x=np.zeros((n_frames, nx)),
+            valid_mask=np.ones((n_frames, ny, nx), dtype=bool),
+            fullwell_count=np.zeros((n_frames, ny, nx), dtype=np.uint16),
+            adc_low_count=np.zeros((n_frames, ny, nx), dtype=np.uint16),
+            adc_high_count=np.zeros((n_frames, ny, nx), dtype=np.uint16),
+            cosmic_count=np.zeros((n_frames, ny, nx), dtype=np.uint16),
+            time_start_seconds=raw.astype(float) * 10.0,
+            exposure_seconds=np.full(n_frames, 10.0),
+            raw_frame_start_index=raw,
+            raw_frame_stop_index_exclusive=raw + 1,
+            gain_e_per_dn=gains,
+            manifest={"target_source_id_int64": 42},
+            provenance={
+                "observation_product": "final_dn",
+                "background_realization_used": False,
+            },
+        )
+        path = tmp_path / name
+        write_stamp_delivery_bundle(path, bundle)
+        return path
+
+    first = write_shard("gain_first.h5", start=0, gain_values=(1, 2))
+    second = write_shard("gain_second.h5", start=2, gain_values=(3, 4))
+
+    result = reduce_stamp_delivery_series_v1(
+        (second, first),
+        cdpp_windows_minutes=(30,),
+        batch_frames=1,
+    )
+
+    np.testing.assert_allclose(result.time_seconds, [0.0, 10.0, 20.0, 30.0])
+    np.testing.assert_allclose(result.flux_e, np.full(4, 1690.0))
 
 
 def test_injected_model_residual_cdpp_removes_the_known_variable_source_curve() -> None:
