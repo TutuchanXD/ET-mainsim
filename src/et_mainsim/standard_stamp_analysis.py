@@ -24,8 +24,10 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from typing import Any, Literal
+import uuid
 
 import numpy as np
 
@@ -815,6 +817,109 @@ def _atomic_reference_lightcurve_csv(
     return path
 
 
+def _fsync_directory(path: Path) -> None:
+    """Persist the staged directory entries before its atomic publication."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _is_complete_standard_analysis_output(output_dir: Path) -> bool:
+    """Return whether this exact directory is already a published analysis."""
+
+    if not output_dir.is_dir() or output_dir.is_symlink():
+        return False
+    manifest_path = output_dir / "analysis_manifest.json"
+    if not manifest_path.is_file():
+        return False
+    try:
+        manifest = _read_json_object(manifest_path, label="existing analysis manifest")
+    except (OSError, StandardStampAnalysisError):
+        return False
+    return (
+        manifest.get("schema_id") == STANDARD_STAMP_ANALYSIS_SCHEMA_ID
+        and manifest.get("schema_version") == STANDARD_STAMP_ANALYSIS_SCHEMA_VERSION
+        and manifest.get("complete") is True
+    )
+
+
+def _assert_output_path_is_eligible(
+    output_dir: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    """Fail early without mutating an existing final analysis directory."""
+
+    if not output_dir.exists() and not output_dir.is_symlink():
+        return
+    if _is_complete_standard_analysis_output(output_dir):
+        raise FileExistsError(
+            f"refusing to overwrite a complete standard analysis output: {output_dir}"
+        )
+    if not overwrite:
+        raise FileExistsError(
+            "analysis output path already exists and is not a complete standard "
+            "analysis; choose a distinct output_dir or use overwrite=True to "
+            f"archive it before publishing a replacement: {output_dir}"
+        )
+    if not output_dir.is_dir() or output_dir.is_symlink():
+        raise FileExistsError(
+            "analysis output path exists but is not a replaceable directory: "
+            f"{output_dir}"
+        )
+
+
+def _incomplete_analysis_backup_path(output_dir: Path) -> Path:
+    """Allocate a non-existent sibling name before archiving an incomplete run."""
+
+    parent = output_dir.parent
+    for _ in range(128):
+        candidate = parent / (f".{output_dir.name}.incomplete-{uuid.uuid4().hex}")
+        if not candidate.exists() and not candidate.is_symlink():
+            return candidate
+    raise StandardStampAnalysisError(
+        "could not allocate a unique archive path for incomplete analysis output"
+    )
+
+
+def _publish_staged_analysis_directory(
+    staging_dir: Path,
+    output_dir: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    """Publish the two-file analysis as one directory-level transaction.
+
+    A short sibling lock serializes regular analysis publishers targeting the
+    same path.  Complete outputs are immutable even with ``overwrite=True``;
+    an explicit overwrite can only archive a pre-existing incomplete directory
+    to a unique sibling name before the new complete directory is published.
+    """
+
+    output_parent = output_dir.parent
+    lock_path = output_parent / f".{output_dir.name}.publish.lock"
+    try:
+        os.mkdir(lock_path)
+    except FileExistsError as error:
+        raise FileExistsError(
+            f"standard analysis publication is already in progress for {output_dir}"
+        ) from error
+    try:
+        _assert_output_path_is_eligible(output_dir, overwrite=overwrite)
+        if output_dir.exists() or output_dir.is_symlink():
+            archive_path = _incomplete_analysis_backup_path(output_dir)
+            os.replace(output_dir, archive_path)
+        os.replace(staging_dir, output_dir)
+    finally:
+        lock_path.rmdir()
+
+
 def _quality_summary(reference: ReferencePhotometryResult) -> dict[str, Any]:
     valid = np.asarray(reference.aperture_valid, dtype=bool)
     usable = np.asarray(reference.aperture_usable_pixel_count, dtype=np.int64)
@@ -963,24 +1068,18 @@ def run_standard_stamp_analysis_v1(
 ) -> StandardStampAnalysisResult:
     """Write the formal standard reference curve and JSON analysis manifest.
 
-    A manifest is written only after the reference CSV has been atomically
-    published.  Existing analysis files are immutable unless the caller
-    explicitly asks for ``overwrite=True``.
+    The two derived files are written and fsynced in a sibling staging
+    directory, then published together through one same-filesystem directory
+    rename.  A complete existing analysis is immutable; ``overwrite=True``
+    can only archive a pre-existing incomplete directory before publishing a
+    fresh complete result.
     """
 
     resolved = discover_standard_stamp_analysis_input(request)
     output_dir = Path(request.output_dir)
     lightcurve_path = output_dir / "reference_lightcurve.csv"
     analysis_manifest_path = output_dir / "analysis_manifest.json"
-    existing = tuple(
-        path for path in (lightcurve_path, analysis_manifest_path) if path.exists()
-    )
-    if existing and not request.overwrite:
-        names = ", ".join(str(path) for path in existing)
-        raise FileExistsError(
-            "standard analysis output already exists; use a distinct output_dir "
-            f"or overwrite=True: {names}"
-        )
+    _assert_output_path_is_eligible(output_dir, overwrite=request.overwrite)
 
     bundle_stat_fingerprints = _bundle_stat_fingerprints(resolved.bundle_paths)
     bundle_receipts = _validate_and_identify_bundles(resolved.bundle_paths)
@@ -1023,20 +1122,39 @@ def run_standard_stamp_analysis_v1(
             bin_origin_seconds=request.bin_origin_seconds,
         )
 
-    _atomic_reference_lightcurve_csv(
-        lightcurve_path,
-        reference=reference,
-        residual=residual,
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{output_dir.name}.staging-",
+            dir=output_dir.parent,
+        )
     )
-    manifest = _analysis_manifest(
-        resolved=resolved,
-        request=request,
-        reference=reference,
-        residual=residual,
-        bundle_receipts=bundle_receipts,
-        lightcurve_path=lightcurve_path,
-    )
-    _atomic_json(analysis_manifest_path, manifest)
+    try:
+        staged_lightcurve_path = staging_dir / lightcurve_path.name
+        staged_manifest_path = staging_dir / analysis_manifest_path.name
+        _atomic_reference_lightcurve_csv(
+            staged_lightcurve_path,
+            reference=reference,
+            residual=residual,
+        )
+        manifest = _analysis_manifest(
+            resolved=resolved,
+            request=request,
+            reference=reference,
+            residual=residual,
+            bundle_receipts=bundle_receipts,
+            lightcurve_path=staged_lightcurve_path,
+        )
+        _atomic_json(staged_manifest_path, manifest)
+        _fsync_directory(staging_dir)
+        _publish_staged_analysis_directory(
+            staging_dir,
+            output_dir,
+            overwrite=request.overwrite,
+        )
+    finally:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
     return StandardStampAnalysisResult(
         analysis_manifest_path=analysis_manifest_path,
         reference_lightcurve_path=lightcurve_path,

@@ -283,6 +283,110 @@ def test_standard_analysis_static_case_has_no_injected_model_residual(
     assert "injected_raw_factor_sum" not in fields
 
 
+def test_standard_analysis_publish_is_transactional_when_manifest_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed second file must not expose a lone reference CSV."""
+
+    import et_mainsim.standard_stamp_analysis as analysis_module
+
+    manifest_path = _write_formal_galaxy_run(tmp_path, case="injected")
+    output_dir = tmp_path / "analysis"
+
+    def fail_manifest_write(*args, **kwargs):
+        raise OSError("injected manifest write failure")
+
+    monkeypatch.setattr(analysis_module, "_atomic_json", fail_manifest_write)
+    with pytest.raises(OSError, match="injected manifest write failure"):
+        analysis_module.run_standard_stamp_analysis_v1(
+            analysis_module.StandardStampAnalysisRequest(
+                production_manifest_path=manifest_path,
+                source_id=SOURCE_ID,
+                case="injected",
+                cadence_seconds=CADENCE_SECONDS,
+                output_dir=output_dir,
+            )
+        )
+
+    assert not output_dir.exists()
+    assert not list(tmp_path.glob(".analysis.staging-*"))
+
+
+def test_standard_analysis_never_overwrites_an_existing_complete_output(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.standard_stamp_analysis import (
+        StandardStampAnalysisRequest,
+        run_standard_stamp_analysis_v1,
+    )
+
+    manifest_path = _write_formal_galaxy_run(tmp_path, case="injected")
+    output_dir = tmp_path / "analysis"
+    first = run_standard_stamp_analysis_v1(
+        StandardStampAnalysisRequest(
+            production_manifest_path=manifest_path,
+            source_id=SOURCE_ID,
+            case="injected",
+            cadence_seconds=CADENCE_SECONDS,
+            output_dir=output_dir,
+        )
+    )
+    csv_before = first.reference_lightcurve_path.read_bytes()
+    manifest_before = first.analysis_manifest_path.read_bytes()
+
+    with pytest.raises(FileExistsError, match="complete standard analysis"):
+        run_standard_stamp_analysis_v1(
+            StandardStampAnalysisRequest(
+                production_manifest_path=manifest_path,
+                source_id=SOURCE_ID,
+                case="injected",
+                cadence_seconds=CADENCE_SECONDS,
+                output_dir=output_dir,
+                overwrite=True,
+            )
+        )
+
+    assert first.reference_lightcurve_path.read_bytes() == csv_before
+    assert first.analysis_manifest_path.read_bytes() == manifest_before
+
+
+def test_standard_analysis_overwrite_archives_only_an_incomplete_output(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.standard_stamp_analysis import (
+        StandardStampAnalysisRequest,
+        run_standard_stamp_analysis_v1,
+    )
+
+    manifest_path = _write_formal_galaxy_run(tmp_path, case="injected")
+    output_dir = tmp_path / "analysis"
+    output_dir.mkdir()
+    stale_csv = output_dir / "reference_lightcurve.csv"
+    stale_csv.write_text("stale partial output\n", encoding="utf-8")
+
+    result = run_standard_stamp_analysis_v1(
+        StandardStampAnalysisRequest(
+            production_manifest_path=manifest_path,
+            source_id=SOURCE_ID,
+            case="injected",
+            cadence_seconds=CADENCE_SECONDS,
+            output_dir=output_dir,
+            overwrite=True,
+        )
+    )
+
+    assert result.analysis_manifest_path.is_file()
+    assert result.reference_lightcurve_path.read_text(encoding="utf-8") != (
+        "stale partial output\n"
+    )
+    archived = list(tmp_path.glob(".analysis.incomplete-*"))
+    assert len(archived) == 1
+    assert (archived[0] / "reference_lightcurve.csv").read_text(
+        encoding="utf-8"
+    ) == "stale partial output\n"
+
+
 def test_standard_analysis_fails_closed_until_every_manifest_shard_is_published(
     tmp_path: Path,
 ) -> None:

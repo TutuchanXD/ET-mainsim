@@ -184,8 +184,11 @@ print(result.analysis_manifest_path)
 | `StandardStampAnalysisNotReadyError` | 正式 run 仍缺预期 final HDF5 shard。 | 不读取 partial；等待生产补齐后以同一 request 重试。 |
 
 `--batch-frames` 只限制 HDF5 中心 aperture 的流式读取 batch；它不改变仿真、
-coadd、RNG 或 CDPP 时间定义。`--overwrite` 只允许替换既有的两个**派生分析**文件，
-不会修改任何 HDF5 delivery。
+coadd、RNG 或 CDPP 时间定义。分析输出是一个不可变的目录级交付：已有
+`complete: true` 的标准分析即使指定 `--overwrite` 也绝不覆盖。若路径残留的是不完整
+目录，`--overwrite` 只会将该目录原样归档为同级
+`.output-name.incomplete-<uuid>`，随后发布新的完整目录；它不会修改任何 HDF5
+delivery，也不会删除旧派生文件。
 
 发现阶段会读取 manifest-relative 的 time-shard plan，验证 plan 的 SHA-256
 identity，并要求该 `target × case × cadence` 的**每一个**预期 HDF5 final member
@@ -209,6 +212,12 @@ device/inode/size/mtime 状态，若输入在验证或 reduction 期间被替换
 | --- | --- |
 | `reference_lightcurve.csv` | 中心 `13×13` fixed aperture 的每 cadence 派生电子 flux、绝对时间/原始帧半开区间、`aperture_valid`、可用像元数和不可用像元数。injected case 另外有 frozen-factor sum、through-origin model flux、residual e-/ppm 与 residual valid flag。空的 `flux_derived_e` 或 residual 值表示该 cadence 因质量口径无效，不是零 flux。 |
 | `analysis_manifest.json` | 输入 production/交付 identity receipt、固定 aperture 与质量汇总、顶层 `observed_cdpp`、injected-model residual CDPP、输出字段与统计口径。任何无法估计的 CDPP 以 JSON `null` 表示，绝不写非标准 `NaN`。 |
+
+这两个文件不会分别暴露给读者：它们先在 `output_dir` 同级的私有
+`.output-name.staging-*` 目录中完成单文件原子写入与 `fsync`，再以同一文件系统上的
+目录 rename 一次性发布。若 CSV 后的 manifest 生成/写入失败，staging 目录会清理，最终
+`output_dir` 不存在；因此普通消费者看到的已发布目录总是同时包含 CSV 和
+`complete: true` manifest。
 
 `ordinary_cdpp_label` 在 variable injected case 固定为
 `undetrended_astrophysical_plus_instrument_legacy_compatible_diagnostic`；它包括真实
