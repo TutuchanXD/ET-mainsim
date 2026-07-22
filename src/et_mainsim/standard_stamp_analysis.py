@@ -53,6 +53,9 @@ STANDARD_STAMP_ANALYSIS_SCHEMA_VERSION = 1
 STANDARD_STAMP_ANALYSIS_LIGHTCURVE_SCHEMA_ID = (
     "et_mainsim.standard_stamp_reference_lightcurve.v1"
 )
+_INCOMPLETE_ARCHIVE_SCHEMA_ID = (
+    "et_mainsim.standard_stamp_analysis_incomplete_archive.v1"
+)
 
 AnalysisCase = Literal["static", "injected"]
 
@@ -888,6 +891,22 @@ def _incomplete_analysis_backup_path(output_dir: Path) -> Path:
     )
 
 
+def _write_incomplete_archive_marker(archive_dir: Path) -> None:
+    """Mark an explicit overwrite archive as non-product forensic evidence."""
+
+    _atomic_json(
+        archive_dir / "INCOMPLETE_ARCHIVE.json",
+        {
+            "schema_id": _INCOMPLETE_ARCHIVE_SCHEMA_ID,
+            "schema_version": 1,
+            "complete": False,
+            "archive_reason": "explicit_overwrite_of_incomplete_analysis_output",
+            "discovery_policy": "not_a_standard_analysis_product",
+        },
+    )
+    _fsync_directory(archive_dir)
+
+
 def _publish_staged_analysis_directory(
     staging_dir: Path,
     output_dir: Path,
@@ -915,6 +934,11 @@ def _publish_staged_analysis_directory(
         if output_dir.exists() or output_dir.is_symlink():
             archive_path = _incomplete_analysis_backup_path(output_dir)
             os.replace(output_dir, archive_path)
+            try:
+                _write_incomplete_archive_marker(archive_path)
+            except BaseException:
+                os.replace(archive_path, output_dir)
+                raise
         os.replace(staging_dir, output_dir)
     finally:
         lock_path.rmdir()

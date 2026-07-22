@@ -187,8 +187,9 @@ print(result.analysis_manifest_path)
 coadd、RNG 或 CDPP 时间定义。分析输出是一个不可变的目录级交付：已有
 `complete: true` 的标准分析即使指定 `--overwrite` 也绝不覆盖。若路径残留的是不完整
 目录，`--overwrite` 只会将该目录原样归档为同级
-`.output-name.incomplete-<uuid>`，随后发布新的完整目录；它不会修改任何 HDF5
-delivery，也不会删除旧派生文件。
+`.output-name.incomplete-<uuid>`，并写入 `INCOMPLETE_ARCHIVE.json`
+（`complete: false`、`discovery_policy: not_a_standard_analysis_product`），随后发布
+新的完整目录；它不会修改任何 HDF5 delivery，也不会删除旧派生文件。
 
 发现阶段会读取 manifest-relative 的 time-shard plan，验证 plan 的 SHA-256
 identity，并要求该 `target × case × cadence` 的**每一个**预期 HDF5 final member

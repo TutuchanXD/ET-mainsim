@@ -354,6 +354,8 @@ def test_standard_analysis_never_overwrites_an_existing_complete_output(
 def test_standard_analysis_overwrite_archives_only_an_incomplete_output(
     tmp_path: Path,
 ) -> None:
+    import et_mainsim.standard_stamp_analysis as analysis_module
+
     from et_mainsim.standard_stamp_analysis import (
         StandardStampAnalysisRequest,
         run_standard_stamp_analysis_v1,
@@ -385,6 +387,17 @@ def test_standard_analysis_overwrite_archives_only_an_incomplete_output(
     assert (archived[0] / "reference_lightcurve.csv").read_text(
         encoding="utf-8"
     ) == "stale partial output\n"
+    archive_marker = json.loads(
+        (archived[0] / "INCOMPLETE_ARCHIVE.json").read_text(encoding="utf-8")
+    )
+    assert archive_marker == {
+        "archive_reason": "explicit_overwrite_of_incomplete_analysis_output",
+        "complete": False,
+        "discovery_policy": "not_a_standard_analysis_product",
+        "schema_id": "et_mainsim.standard_stamp_analysis_incomplete_archive.v1",
+        "schema_version": 1,
+    }
+    assert not analysis_module._is_complete_standard_analysis_output(archived[0])
 
 
 def test_standard_analysis_fails_closed_until_every_manifest_shard_is_published(
