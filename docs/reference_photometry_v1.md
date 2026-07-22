@@ -207,6 +207,14 @@ device/inode/size/mtime 状态，若输入在验证或 reduction 期间被替换
 发布分析文件。全文件 hash 是有意的可复现性成本，特别是 raw 10 s 交付会明显增加
 后处理 I/O；它不改变任何 HDF5 或仿真随机数。
 
+`analysis_manifest.json` 同时保留执行端的绝对
+`production_manifest_path`，以及稳定的
+`production_manifest_relative_to_run_root`（当前为
+`production_manifest.json`）。前者用于审计实际执行位置，因 H100 与工作站的
+sshfs 挂载根不同而允许变化；跨挂载读回必须以 `run_id`、relative path 和
+`production_manifest_identity` 联合验证，不能把两个等价挂载路径的字符串差异误判为
+输入漂移。
+
 成功时 `output_dir` 只产生两个小型派生分析文件：
 
 | 文件 | 内容 |

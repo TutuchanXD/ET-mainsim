@@ -44,3 +44,24 @@ def test_h100_validation_distinguishes_physical_and_visible_gpu_ids() -> None:
     assert '--id="${physical_gpu}"' in script
     assert '--gpus "${visible_gpu}"' in script
     assert '--focalplane-registry "${ET_FOCALPLANE_ROOT%/}/data"' in script
+
+
+def test_galaxy_standard_analysis_slurm_launcher_is_fail_closed() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "galaxy_standard_stamp_analysis_slurm.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "#SBATCH --partition=cpu" in script
+    assert "#SBATCH --cpus-per-task=8" in script
+    assert "#SBATCH --mem=64G" in script
+    assert "#SBATCH --time=12:00:00" in script
+    assert "#SBATCH --gres=" not in script
+    assert ': "${ET_STAMP_MANIFEST:?Set ET_STAMP_MANIFEST to production_manifest.json}"' in script
+    assert ': "${ET_STAMP_ANALYSIS_SOURCE_ID:?Set ET_STAMP_ANALYSIS_SOURCE_ID to one source ID}"' in script
+    assert 'python -m et_mainsim.standard_stamp_analysis' in script
+    assert "--case injected" in script
+    assert "--cadence-seconds 60" in script
+    assert "--output-dir \"${OUTPUT_DIR}\"" in script
+    assert "--overwrite" not in script

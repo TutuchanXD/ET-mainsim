@@ -984,6 +984,9 @@ def _analysis_manifest(
         "schema_version": STANDARD_STAMP_ANALYSIS_SCHEMA_VERSION,
         "complete": True,
         "production_manifest_path": str(resolved.production_manifest_path),
+        "production_manifest_relative_to_run_root": (
+            resolved.production_manifest_path.relative_to(resolved.run_root).as_posix()
+        ),
         "production_manifest_identity": file_identity(
             resolved.production_manifest_path
         ),
