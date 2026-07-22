@@ -468,7 +468,11 @@ def _map_curve_to_detector(
     ra_deg: float,
     dec_deg: float,
 ) -> dict[str, Any]:
-    from .stamp_inputs import _sky_to_focal
+    from .stamp_inputs import (
+        _focalplane_detector_pixel_shape,
+        _sky_to_focal,
+        _validate_physical_detector_coordinates,
+    )
 
     mapped = _sky_to_focal(
         focalplane_registry,
@@ -494,6 +498,23 @@ def _map_curve_to_detector(
     }
     if not all(math.isfinite(value) for key, value in values.items() if key != "detector_id"):
         raise ValueError("focal-plane mapping returned a non-finite coordinate")
+    physical_pixel_width, physical_pixel_height = _focalplane_detector_pixel_shape(
+        focalplane_registry,
+        detector_id=detector_id,
+        registry_sha256=registry_sha256,
+    )
+    _validate_physical_detector_coordinates(
+        detector_id=detector_id,
+        detector_xpix=float(values["detector_xpix"]),
+        detector_ypix=float(values["detector_ypix"]),
+        pixel_width=physical_pixel_width,
+        pixel_height=physical_pixel_height,
+        context="Galaxy target mapping",
+    )
+    # Preserve enough geometry with the immutable mapping to make a later
+    # audit independent of the renderer's row/column storage orientation.
+    values["physical_detector_pixel_width"] = physical_pixel_width
+    values["physical_detector_pixel_height"] = physical_pixel_height
     values["field_angle_deg"] = float(
         math.hypot(values["field_x_deg"], values["field_y_deg"])
     )
@@ -554,6 +575,20 @@ def prepare_galaxy_independent_production(
         run_seed=config.run_seed,
     )
 
+    # Validate every coordinate against the frozen physical focal-plane
+    # geometry before creating the no-resume run root or writing any prepared
+    # inputs.  A bad mapping must remain a retryable configuration error, not
+    # leave an unusable partial formal run behind.
+    mapped_curves = {
+        source_id: _map_curve_to_detector(
+            focalplane_registry=Path(config.focalplane_registry),
+            registry_sha256=str(registry_identity["sha256"]),
+            ra_deg=curve.ra_deg,
+            dec_deg=curve.dec_deg,
+        )
+        for source_id, curve in curves.items()
+    }
+
     inputs_root = run_root / "inputs"
     factors_root = inputs_root / "galaxy_factor_snapshots"
     tables_root = inputs_root / "target_tables"
@@ -578,12 +613,7 @@ def prepare_galaxy_independent_production(
             factors=factors,
             raw_exposure_seconds=config.raw_exposure_seconds,
         )
-        mapping = _map_curve_to_detector(
-            focalplane_registry=Path(config.focalplane_registry),
-            registry_sha256=str(registry_identity["sha256"]),
-            ra_deg=curve.ra_deg,
-            dec_deg=curve.dec_deg,
-        )
+        mapping = dict(mapped_curves[source_id])
         detector_id = str(mapping["detector_id"])
         grouped_rows.setdefault(detector_id, []).append(
             (source_id, curve.gaia_g_mag, curve.ra_deg, curve.dec_deg)
