@@ -1,7 +1,7 @@
 # Reference photometry v1
 
-`et_mainsim.reference_photometry` supplies the first standard reduction for a
-future composite stamp-delivery HDF5 bundle.  It is deliberately conservative:
+`et_mainsim.reference_photometry` supplies the first standard reduction for
+formal stamp-delivery HDF5 bundles.  It is deliberately conservative:
 the only detector observation is `final_dn`; every electron-domain quantity
 emitted by this reducer is a calibration-derived analysis product.
 
@@ -32,6 +32,19 @@ deliveries.
 display-only index or an unqualified midpoint.  It is absolute from the run
 origin, so time-sharded products retain common 30/90/390-minute CDPP bin
 boundaries.
+
+正式 `et_mainsim.stamp_delivery_bundle.v1` 不使用历史的 `time_index` 字段，
+而是使用 `time_start_seconds` 与 `exposure_seconds`。请调用
+`reduce_stamp_delivery_bundle_v1(path)`，它会严格读取该正式 schema 并经由
+已验证的 adapter 建立本模块输入；不要把正式 bundle 传给
+`reduce_reference_photometry_bundle_v1()`，后者只服务于旧式 composite HDF5
+格式。
+
+对于一个目标跨多个连续 time shard 的正式生产，请调用
+`reduce_stamp_delivery_series_v1(bundle_paths)`。它只流式读取中心 `13×13`
+aperture crop，先验证每个 formal bundle 的 header、run identity、gain、全局
+raw-frame 区间和时间连续性，再一次性计算整条曲线的 CDPP；不能逐 shard 计算
+CDPP 后做平均。
 
 ## Derived light curve
 
@@ -67,7 +80,30 @@ create rejected windows.  Consequently the reported CDPP is cadence-aware and
 does not assume that a 30-second, 1-minute, 2-minute, or 5-minute delivery is
 a synthetic uniformly sampled 10-second curve.
 
-This v1 metric does not detrend the light curve.  A future science-analysis
-layer may apply the separately approved legacy trend treatment before making a
-science CDPP claim; the raw fixed-aperture curve and complete-window counts
-remain available for that step.
+This v1 metric does not detrend the light curve.  A separately approved
+science-analysis layer may apply a trend treatment only when its treatment of
+real astrophysical variation is explicit; the raw fixed-aperture curve and
+complete-window counts always remain available.
+
+## Variable-source residual CDPP
+
+For an injected variable source, the ordinary fixed-aperture CDPP necessarily
+contains real intrinsic variability and must be labelled as an
+``astrophysical-plus-instrument`` statistic.  It is not an instrumental-noise
+claim.
+
+`compute_injected_model_residual_v1(result, raw_frame_factors=...)` provides
+the companion diagnostic for a formal delivery sequence.  It uses the frozen
+10 s exposure-averaged injection factors and each output cadence's absolute
+raw-frame interval to form the corresponding factor sum, fits the physically
+required through-origin relation
+
+```text
+derived_aperture_flux_e = scale * sum(raw_frame_factor)
+```
+
+and reports residual ppm plus 30/90/390-minute complete-window CDPP.  The fit
+has no free intercept because background expectation has already been removed
+from the derived electron image; adding one is ill-conditioned for small
+variability and can absorb real detector residuals.  This residual CDPP is the
+standard instrument-like metric for the Galaxy injected production.
