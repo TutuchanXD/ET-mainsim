@@ -417,3 +417,342 @@ def test_formal_galaxy_production_spec_freezes_delivery_and_sd20_policy() -> Non
     assert spec.detector_response.whole_pixel_gain_sinusoidal_enabled is False
     assert spec.detector_response.enable_flat_field_correction is False
     assert spec.rng.run_seed == 12345
+
+
+def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Physical RNG derives from SimulationContext, not execution labels."""
+
+    from dataclasses import replace
+
+    import et_mainsim.galaxy_stamp_production as production
+    import et_mainsim.workflows.stamp as stamp_workflow
+    from et_mainsim.time_shards import plan_continuous_time_shards
+    from photsim7.detector_electronics import _base_seed_scope
+    import photsim7.simulation_services as simulation_services
+    import photsim7.stamp_pipeline as stamp_pipeline
+
+    detector_by_source = {101: "main_lu", 202: "main_lu", 303: "main_ld"}
+    source_ids = tuple(detector_by_source)
+    run_root = tmp_path / "galaxy-paired-rng"
+    inputs_root = run_root / "inputs"
+    inputs_root.mkdir(parents=True)
+    target_table = inputs_root / "targets.ecsv"
+    target_table.write_text("fixture target table\n", encoding="utf-8")
+    time_plan = plan_continuous_time_shards(
+        raw_start_index=0,
+        raw_stop_index=3,
+        coadd_sizes=(3,),
+        raw_exposure_seconds=10.0,
+        max_raw_frames_per_shard=3,
+    )
+    time_plan_path = time_plan.write_manifest(inputs_root / "time_shards.json")
+    targets = []
+    for source_id in source_ids:
+        snapshot_path = inputs_root / f"source_{source_id}.npz"
+        snapshot_path.write_bytes(f"snapshot-{source_id}".encode("utf-8"))
+        targets.append(
+            {
+                "source_id_int64": source_id,
+                "focalplane_mapping": {
+                    "detector_id": detector_by_source[source_id]
+                },
+                "target_table": {
+                    "relative_path": "inputs/targets.ecsv",
+                    "file_identity": production.file_identity(target_table),
+                },
+                "factor_snapshot_relative_path": (
+                    f"inputs/source_{source_id}.npz"
+                ),
+                "factor_snapshot": production.file_identity(snapshot_path),
+            }
+        )
+    base_spec = production.build_galaxy_independent_production_spec(
+        n_raw_frames=3,
+        raw_exposure_seconds=10.0,
+        device="cpu",
+        run_seed=12345,
+    )
+    manifest_path = run_root / "production_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": production.GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
+                "run_id": "paired-rng-fixture",
+                "runtime_defaults": {
+                    "data_root": str(tmp_path / "data"),
+                    "focalplane_registry": str(tmp_path / "registry"),
+                },
+                "delivery": {
+                    "stamp_shape": [100, 300],
+                    "time_plan_relative_path": "inputs/time_shards.json",
+                    "time_plan_identity": production.file_identity(time_plan_path),
+                },
+                "simulation_spec_base": base_spec.to_json_dict(),
+                "targets": targets,
+            }
+        ),
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "data"
+    registry = tmp_path / "registry"
+    data_root.mkdir()
+    registry.mkdir()
+
+    target_specs = {
+        source_id: replace(
+            base_spec,
+            detector=replace(
+                base_spec.detector,
+                detector_id=detector_by_source[source_id],
+            ),
+        )
+        for source_id in source_ids
+    }
+    prepared = SimpleNamespace(
+        targets={
+            source_id: SimpleNamespace(source_id=source_id)
+            for source_id in source_ids
+        },
+        psf_ids={source_id: 0 for source_id in source_ids},
+        source_input_truth={
+            source_id: {"source_id": source_id} for source_id in source_ids
+        },
+    )
+    monkeypatch.setattr(
+        production,
+        "_runtime_paths",
+        lambda *_args, **_kwargs: (data_root, registry, {}, {}),
+    )
+    monkeypatch.setattr(
+        production,
+        "read_galaxy_factor_snapshot",
+        lambda path: SimpleNamespace(
+            source_id=int(path.stem.removeprefix("source_")),
+            factors=np.ones(3, dtype=np.float64),
+            metadata={"fixture": True},
+        ),
+    )
+    monkeypatch.setattr(production, "collect_provenance", lambda *_args: {"test": True})
+    monkeypatch.setattr(
+        stamp_workflow,
+        "build_run_plan",
+        lambda **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(stamp_workflow, "_science_api", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        stamp_workflow,
+        "_prepare_table_inputs",
+        lambda *_args, **_kwargs: prepared,
+    )
+    monkeypatch.setattr(
+        stamp_workflow,
+        "_table_catalog",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        stamp_workflow,
+        "_target_spec",
+        lambda _plan, *, target, **_kwargs: target_specs[target.source_id],
+    )
+    original_build_context = simulation_services.build_simulation_context
+    contexts = []
+
+    def _capture_context(*args, **kwargs):
+        context = original_build_context(*args, **kwargs)
+        contexts.append(context)
+        return context
+
+    monkeypatch.setattr(
+        simulation_services,
+        "build_simulation_context",
+        _capture_context,
+    )
+    monkeypatch.setattr(
+        simulation_services,
+        "build_stamp_services",
+        lambda context, **_kwargs: SimpleNamespace(context=context),
+    )
+
+    render_calls = []
+
+    def _fake_render(*_args, **kwargs):
+        render_calls.append(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(stamp_pipeline, "run_single_cadence_stamp", _fake_render)
+
+    requests = []
+
+    def _fake_delivery(request, *, render_raw, adapt_raw):
+        del adapt_raw
+        requests.append(request)
+        render_raw(request.shard.raw_start_index)
+        return SimpleNamespace(
+            shard_id=request.shard.shard_id,
+            raw_frame_count=request.shard.raw_frame_count,
+            raw_path=request.shard_root / "raw.h5",
+            coadd_paths={3: request.shard_root / "coadd_30s.h5"},
+        )
+
+    monkeypatch.setattr(
+        production,
+        "run_independent_stamp_time_shard",
+        _fake_delivery,
+    )
+
+    production.run_galaxy_independent_target(
+        manifest_path,
+        source_id=101,
+        case="static",
+        data_root=data_root,
+        focalplane_registry=registry,
+        device="cpu",
+    )
+    production.run_galaxy_independent_target(
+        manifest_path,
+        source_id=101,
+        case="injected",
+        data_root=data_root,
+        focalplane_registry=registry,
+        device="cpu",
+    )
+    production.run_galaxy_independent_target(
+        manifest_path,
+        source_id=202,
+        case="injected",
+        data_root=data_root,
+        focalplane_registry=registry,
+        device="cpu",
+    )
+    production.run_galaxy_independent_target(
+        manifest_path,
+        source_id=303,
+        case="injected",
+        data_root=data_root,
+        focalplane_registry=registry,
+        device="cpu",
+    )
+
+    assert [request.manifest["case"] for request in requests] == [
+        "static",
+        "injected",
+        "injected",
+        "injected",
+    ]
+    assert render_calls[0]["source_variability"] is None
+    assert render_calls[1]["source_variability"].relative_flux.shape == (1, 3)
+    assert render_calls[0]["rng_trace_scope"] == {
+        "workflow": "galaxy-independent-stamp-production",
+        "run_id": "paired-rng-fixture",
+        "case": "static",
+    }
+    assert render_calls[1]["rng_trace_scope"] == {
+        "workflow": "galaxy-independent-stamp-production",
+        "run_id": "paired-rng-fixture",
+        "case": "injected",
+    }
+    assert render_calls[0]["rng_trace_scope"] != render_calls[1]["rng_trace_scope"]
+
+    static_context, injected_context, same_detector_context, other_detector_context = (
+        contexts
+    )
+    shard = time_plan.shards[0]
+    for frame_index in range(shard.raw_start_index, shard.raw_stop_index):
+        static_scope = static_context.detector_rng_scope(
+            local_frame_index=frame_index
+        )
+        injected_scope = injected_context.detector_rng_scope(
+            local_frame_index=frame_index
+        )
+        assert static_scope == injected_scope
+        assert static_context.seed_tree.derive_seed(
+            "readout.gaussian",
+            scope=static_scope,
+        ) == injected_context.seed_tree.derive_seed(
+            "readout.gaussian",
+            scope=injected_scope,
+        )
+        # ``case`` reaches the stamp product only as an execution label.  The
+        # detector-electronics normalization intentionally discards it (and
+        # worker rank) before the physical seed is derived.
+        assert _base_seed_scope(
+            frame_start=frame_index,
+            detector_id="main_lu",
+            worker_rank=0,
+            rng_trace_scope=render_calls[0]["rng_trace_scope"],
+            science_rng_scope=static_scope,
+        ) == _base_seed_scope(
+            frame_start=frame_index,
+            detector_id="main_lu",
+            worker_rank=9,
+            rng_trace_scope=render_calls[1]["rng_trace_scope"],
+            science_rng_scope=injected_scope,
+        )
+
+    static_scope = static_context.detector_rng_scope(local_frame_index=0)
+    same_detector_scope = same_detector_context.detector_rng_scope(
+        local_frame_index=0
+    )
+    other_detector_scope = other_detector_context.detector_rng_scope(
+        local_frame_index=0
+    )
+    assert static_scope == same_detector_scope
+    assert static_scope != other_detector_scope
+    assert static_context.seed_tree.derive_seed(
+        "readout.gaussian",
+        scope=static_scope,
+    ) == same_detector_context.seed_tree.derive_seed(
+        "readout.gaussian",
+        scope=same_detector_scope,
+    )
+    assert static_context.seed_tree.derive_seed(
+        "readout.gaussian",
+        scope=static_scope,
+    ) != other_detector_context.seed_tree.derive_seed(
+        "readout.gaussian",
+        scope=other_detector_scope,
+    )
+
+    expected_pairing = {
+        "schema_id": "et_mainsim.galaxy_physical_rng_pairing.v1",
+        "schema_version": 1,
+        "seed_tree_run_seed": 12345,
+        "canonical_context_scope": {
+            "science_realization_id": 0,
+            "spacecraft_id": "et",
+            "detector_id": "main_lu",
+            "scope_id": 0,
+        },
+        "absolute_raw_frame_index": {
+            "formula": "absolute_raw_frame_start_index + local_frame_index",
+            "absolute_raw_frame_start_index": 0,
+            "selected_shard_absolute_frame_interval": {
+                "start_index": 0,
+                "stop_index": 3,
+            },
+        },
+        "selected_time_shard": shard.to_manifest_dict(),
+        "target_spec_sha256": production._canonical_json_sha256(
+            target_specs[101].to_json_dict()
+        ),
+        "source_id_comparison_label": 101,
+        "source_id_in_physical_rng_identity": False,
+        "case_not_in_physical_rng_identity": True,
+        "rng_trace_scope_role": "execution_label_only",
+    }
+    assert requests[0].manifest["physical_rng_pairing"] == expected_pairing
+    assert requests[0].provenance["physical_rng_pairing"] == expected_pairing
+    assert requests[1].manifest["physical_rng_pairing"] == expected_pairing
+    assert requests[1].provenance["physical_rng_pairing"] == expected_pairing
+    assert requests[2].manifest["physical_rng_pairing"][
+        "canonical_context_scope"
+    ] == expected_pairing["canonical_context_scope"]
+    assert requests[2].manifest["physical_rng_pairing"][
+        "source_id_comparison_label"
+    ] == 202
+    assert requests[3].manifest["physical_rng_pairing"][
+        "canonical_context_scope"]["detector_id"] == "main_ld"

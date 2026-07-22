@@ -82,6 +82,110 @@ def _strict_source_id(value: Any, *, name: str) -> int:
     return result
 
 
+def _galaxy_physical_rng_pairing_metadata(
+    *,
+    context: Any,
+    source_id: int,
+    shard: ContinuousTimeShard,
+    target_spec_sha256: str,
+) -> dict[str, Any]:
+    """Record the actual physical RNG coordinates of one delivery shard.
+
+    ``rng_trace_scope`` is intentionally not an input: Photsim7 treats it as
+    an execution/provenance label and explicitly removes it before physical
+    detector seed derivation.  The authoritative physical coordinates are
+    instead the canonical ``SimulationContext.detector_rng_scope`` values.
+
+    Source ID is retained solely as a human-readable comparison label.  It is
+    *not* added to the physical RNG identity: detector random fields are
+    addressed by their absolute detector coordinates, so same-detector stamps
+    share a common physical realization where their detector coordinates
+    overlap.
+    """
+
+    normalized_source_id = _strict_source_id(source_id, name="source_id")
+    if shard.raw_frame_count <= 0:
+        raise ValueError("physical RNG audit requires a non-empty time shard")
+    normalized_spec_sha256 = str(target_spec_sha256).strip().lower()
+    if len(normalized_spec_sha256) != 64:
+        raise ValueError("target_spec_sha256 must contain 64 hexadecimal characters")
+    try:
+        int(normalized_spec_sha256, 16)
+    except ValueError as error:
+        raise ValueError(
+            "target_spec_sha256 must contain 64 hexadecimal characters"
+        ) from error
+
+    first_scope = context.detector_rng_scope(
+        local_frame_index=shard.raw_start_index
+    )
+    last_scope = context.detector_rng_scope(
+        local_frame_index=shard.raw_stop_index - 1
+    )
+    if not isinstance(first_scope, Mapping) or not isinstance(last_scope, Mapping):
+        raise TypeError("SimulationContext detector_rng_scope must return mappings")
+    required_scope_keys = (
+        "science_realization_id",
+        "spacecraft_id",
+        "absolute_raw_frame_index",
+        "detector_id",
+        "scope_id",
+    )
+    try:
+        for key in required_scope_keys:
+            first_scope[key]
+            last_scope[key]
+    except KeyError as error:
+        raise ValueError(
+            "SimulationContext detector_rng_scope lacks a canonical physical key"
+        ) from error
+    canonical_scope = {
+        "science_realization_id": int(first_scope["science_realization_id"]),
+        "spacecraft_id": str(first_scope["spacecraft_id"]),
+        "detector_id": str(first_scope["detector_id"]),
+        "scope_id": int(first_scope["scope_id"]),
+    }
+    if not canonical_scope["spacecraft_id"] or not canonical_scope["detector_id"]:
+        raise ValueError("SimulationContext physical RNG scope has an empty identifier")
+    for key in canonical_scope:
+        if first_scope[key] != last_scope[key]:
+            raise ValueError(
+                "a Galaxy time shard cannot change canonical physical RNG scope"
+            )
+    absolute_start = int(first_scope["absolute_raw_frame_index"])
+    absolute_stop = int(last_scope["absolute_raw_frame_index"]) + 1
+    if absolute_stop - absolute_start != shard.raw_frame_count:
+        raise ValueError(
+            "SimulationContext absolute raw-frame interval does not match time shard"
+        )
+    context_absolute_start = int(context.absolute_raw_frame_start_index)
+    if absolute_start != context_absolute_start + shard.raw_start_index:
+        raise ValueError(
+            "SimulationContext absolute raw-frame formula does not match time shard"
+        )
+
+    return {
+        "schema_id": "et_mainsim.galaxy_physical_rng_pairing.v1",
+        "schema_version": 1,
+        "seed_tree_run_seed": int(context.seed_tree.run_seed),
+        "canonical_context_scope": canonical_scope,
+        "absolute_raw_frame_index": {
+            "formula": "absolute_raw_frame_start_index + local_frame_index",
+            "absolute_raw_frame_start_index": context_absolute_start,
+            "selected_shard_absolute_frame_interval": {
+                "start_index": absolute_start,
+                "stop_index": absolute_stop,
+            },
+        },
+        "selected_time_shard": shard.to_manifest_dict(),
+        "target_spec_sha256": normalized_spec_sha256,
+        "source_id_comparison_label": normalized_source_id,
+        "source_id_in_physical_rng_identity": False,
+        "case_not_in_physical_rng_identity": True,
+        "rng_trace_scope_role": "execution_label_only",
+    }
+
+
 def _finite_positive(value: Any, *, name: str) -> float:
     if isinstance(value, (bool, np.bool_)):
         raise ValueError(f"{name} must be finite and positive")
@@ -1031,6 +1135,11 @@ def run_galaxy_independent_target(
         "enable_scattered_light": True,
         "enable_dark_current": True,
     }
+    rng_trace_scope = {
+        "workflow": "galaxy-independent-stamp-production",
+        "run_id": str(manifest["run_id"]),
+        "case": case,
+    }
     target_spec_json = target_spec.to_json_dict()
     target_spec_sha256 = _canonical_json_sha256(target_spec_json)
     runtime_provenance = collect_provenance(Path(__file__).resolve().parents[2])
@@ -1045,16 +1154,18 @@ def run_galaxy_independent_target(
             source_variability=source_variability,
             include_neighbors=False,
             renderer_options=renderer_options,
-            rng_trace_scope={
-                "workflow": "galaxy-independent-stamp-production",
-                "run_id": str(manifest["run_id"]),
-                "case": case,
-            },
+            rng_trace_scope=rng_trace_scope,
         )
 
     reports: list[dict[str, Any]] = []
     output_root = run_root / "cases" / case
     for shard in shards:
+        physical_rng_pairing = _galaxy_physical_rng_pairing_metadata(
+            context=context,
+            source_id=source_id,
+            shard=shard,
+            target_spec_sha256=target_spec_sha256,
+        )
         request = IndependentStampShardRequest(
             output_root=output_root,
             target_source_id=source_id,
@@ -1064,6 +1175,8 @@ def run_galaxy_independent_target(
             manifest={
                 "run_id": str(manifest["run_id"]),
                 "case": case,
+                "rng_trace_scope": dict(rng_trace_scope),
+                "physical_rng_pairing": dict(physical_rng_pairing),
                 "galaxy_production_manifest": str(Path(manifest_path).resolve()),
                 "target_input_truth": source_truth,
                 "simulation_spec_sha256": target_spec_sha256,
@@ -1082,6 +1195,7 @@ def run_galaxy_independent_target(
                 "runtime_focalplane_registry_attestation_verification": dict(
                     runtime_registry_verification
                 ),
+                "physical_rng_pairing": dict(physical_rng_pairing),
             },
             batch_size=int(batch_size),
             overwrite=False,
