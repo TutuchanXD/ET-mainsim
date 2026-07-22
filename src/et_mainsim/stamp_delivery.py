@@ -20,12 +20,13 @@ fixed-aperture/CDPP reduction to use the exact delivered calibration planes.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import shutil
 import uuid
 from typing import Any, Iterator, Literal
 
@@ -703,6 +704,169 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def _normalise_shard_set_member(value: Path | str) -> Path:
+    """Return one safe, relative member name for a staged shard directory."""
+
+    candidate = Path(value)
+    if (
+        candidate.is_absolute()
+        or not candidate.parts
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+    ):
+        raise StampDeliveryBundleContractError(
+            "shard-set members must be non-empty relative paths without '..'"
+        )
+    return candidate
+
+
+class StampDeliveryShardSet:
+    """Atomically publish a complete set of bundle files as one shard directory.
+
+    Each member bundle retains its own file-level atomic write/readback
+    contract.  This publisher adds the production-level guarantee that the
+    final ``shard_<id>`` directory becomes visible only after *every* expected
+    member exists in a private sibling staging directory.  Directory rename is
+    atomic on the one filesystem containing the target and staging paths; a
+    failure before that rename removes the entire staged set and leaves no
+    final member visible.
+
+    Existing formal shard directories are intentionally never replaced.  A
+    completed shard is non-resumable, and replacing a non-empty directory
+    cannot provide the same all-members-at-once publication guarantee.
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        expected_members: Sequence[Path | str],
+        overwrite: bool = False,
+    ) -> None:
+        self._target = Path(path)
+        self._target.parent.mkdir(parents=True, exist_ok=True)
+        if self._target.name in {"", ".", ".."}:
+            raise StampDeliveryBundleContractError(
+                "path must name a final shard directory"
+            )
+        members = tuple(_normalise_shard_set_member(value) for value in expected_members)
+        if not members:
+            raise StampDeliveryBundleContractError(
+                "a shard set must declare at least one expected member"
+            )
+        if len(set(members)) != len(members):
+            raise StampDeliveryBundleContractError(
+                "a shard set must not declare duplicate member paths"
+            )
+        self._expected_members = members
+        self._overwrite = bool(overwrite)
+        self._partial = self._target.with_name(
+            f".{self._target.name}.{uuid.uuid4().hex}.partial"
+        )
+        self._lock_context = _exclusive_output_lock(self._target)
+        self._lock_held = False
+        self._state = "new"
+
+        try:
+            self._lock_context.__enter__()
+            self._lock_held = True
+            if self._target.exists():
+                overwrite_note = (
+                    "; overwrite is not supported for shard sets"
+                    if self._overwrite
+                    else ""
+                )
+                raise FileExistsError(
+                    "stamp delivery shard set already exists: "
+                    f"{self._target}; use a new shard identity instead of resuming it"
+                    f"{overwrite_note}"
+                )
+            self._partial.mkdir()
+            self._state = "open"
+        except BaseException:
+            self.abort()
+            raise
+
+    @property
+    def path(self) -> Path:
+        """Return the final shard directory, invisible until ``publish()``."""
+
+        return self._target
+
+    @property
+    def staging_root(self) -> Path:
+        """Return the private staging directory while the set is open."""
+
+        if self._state != "open":
+            raise RuntimeError("stamp delivery shard set is not open")
+        return self._partial
+
+    def _release_lock(self) -> None:
+        if self._lock_held:
+            self._lock_context.__exit__(None, None, None)
+            self._lock_held = False
+
+    def member_path(self, member: Path | str) -> Path:
+        """Return the private staged pathname for one declared member."""
+
+        if self._state != "open":
+            raise RuntimeError("stamp delivery shard set is not open")
+        normalised = _normalise_shard_set_member(member)
+        if normalised not in self._expected_members:
+            raise StampDeliveryBundleContractError(
+                f"undeclared shard-set member: {normalised}"
+            )
+        return self._partial / normalised
+
+    def publish(self) -> Path:
+        """Atomically rename the fully staged member directory into place."""
+
+        if self._state != "open":
+            raise RuntimeError("stamp delivery shard set is not open")
+        missing = [
+            str(member)
+            for member in self._expected_members
+            if not (self._partial / member).is_file()
+        ]
+        if missing:
+            raise StampDeliveryBundleContractError(
+                "cannot publish an incomplete stamp delivery shard set; missing "
+                + ", ".join(missing)
+            )
+        try:
+            os.replace(self._partial, self._target)
+        except BaseException:
+            self.abort()
+            raise
+        self._state = "completed"
+        try:
+            _fsync_directory(self._target.parent)
+        finally:
+            self._release_lock()
+        return self._target
+
+    def abort(self) -> None:
+        """Discard every unpublished member in the private staging directory."""
+
+        if self._state == "completed":
+            return
+        try:
+            shutil.rmtree(self._partial)
+        except FileNotFoundError:
+            pass
+        self._state = "aborted"
+        self._release_lock()
+
+    def __enter__(self) -> "StampDeliveryShardSet":
+        if self._state != "open":
+            raise RuntimeError("stamp delivery shard set is not open")
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        if self._state == "open":
+            self.abort()
+        return False
+
+
 def _validate_appender_stamp_shape(value: tuple[int, int]) -> tuple[int, int]:
     if not isinstance(value, tuple) or len(value) != 2:
         raise StampDeliveryBundleContractError(
@@ -944,11 +1108,11 @@ class StampDeliveryBundleAppender:
             raise StampDeliveryBundleContractError(
                 "streamed batches overlap or reverse time_start_seconds"
             )
-        if self._last_raw_stop is not None and int(bundle.raw_frame_start_index[0]) < (
+        if self._last_raw_stop is not None and int(bundle.raw_frame_start_index[0]) != (
             self._last_raw_stop
         ):
             raise StampDeliveryBundleContractError(
-                "streamed batches overlap or reverse raw-frame intervals"
+                "streamed batch raw-frame start must equal previous batch stop"
             )
 
     def append(self, bundle: StampDeliveryBundle) -> int:
@@ -1217,22 +1381,226 @@ def read_stamp_delivery_bundle(path: Path | str) -> StampDeliveryBundle:
         return result
 
 
-def validate_stamp_delivery_bundle(path: Path | str) -> StampDeliveryBundleValidation:
-    """Open, validate, and summarize a complete formal delivery bundle."""
+def _streaming_gain_for_chunk(
+    gain_dataset: Any | None,
+    gain_attribute: ArrayLike | None,
+    *,
+    frame_slice: slice,
+    n_frames: int,
+    ny: int,
+    nx: int,
+) -> NDArray[np.generic] | ArrayLike:
+    """Read only the gain calibration needed for one validation chunk."""
 
+    if gain_dataset is None:
+        assert gain_attribute is not None
+        return gain_attribute
+    shape = tuple(int(size) for size in gain_dataset.shape)
+    allowed_shapes = {(), (ny, nx), (n_frames, ny, nx)}
+    if shape not in allowed_shapes:
+        raise StampDeliveryBundleContractError(
+            "gain_e_per_dn must be scalar, (ny, nx), or (n_frames, ny, nx); "
+            f"got {shape}"
+        )
+    if shape == ():
+        return np.asarray(gain_dataset[()])
+    if shape == (ny, nx):
+        return np.asarray(gain_dataset)
+    return np.asarray(gain_dataset[frame_slice])
+
+
+def _stream_validate_stamp_delivery_bundle(
+    path: Path | str,
+    *,
+    batch_frames: int = 16,
+) -> StampDeliveryBundleValidation:
+    """Validate a complete HDF5 bundle in bounded frame batches.
+
+    The public reader intentionally returns full image cubes for downstream
+    analysis.  Completion-time validation has a different job: it must prove
+    the on-disk contract without creating another full in-memory cube.  This
+    routine therefore reuses ``StampDeliveryBundle.from_arrays`` on small
+    frame slices and checks cross-slice monotonicity plus persisted derived
+    masks explicitly.
+    """
+
+    if isinstance(batch_frames, (bool, np.bool_)) or not isinstance(
+        batch_frames,
+        (int, np.integer),
+    ) or int(batch_frames) <= 0:
+        raise ValueError("batch_frames must be a positive integer")
     source = Path(path)
-    bundle = read_stamp_delivery_bundle(source)
-    _, ny, nx = bundle.shape
+    if not source.is_file():
+        raise FileNotFoundError(f"stamp delivery bundle does not exist: {source}")
+    h5py = _h5py()
+    with h5py.File(source, "r") as handle:
+        schema_id = _attr(handle, "schema_id")
+        if schema_id != STAMP_DELIVERY_SCHEMA_ID:
+            raise StampDeliveryBundleContractError(
+                f"unsupported delivery schema_id {schema_id!r}"
+            )
+        schema_version = _as_schema_version(_attr(handle, "schema_version"))
+        if schema_version != STAMP_DELIVERY_SCHEMA_VERSION:
+            raise StampDeliveryBundleContractError(
+                f"unsupported delivery schema_version {schema_version!r}"
+            )
+        complete = _as_binary_attribute(_attr(handle, "complete"), name="complete")
+        if complete is not True:
+            raise StampDeliveryBundleContractError("delivery bundle is not complete")
+        product_kind = _normalise_product_kind(_attr(handle, "product_kind"))
+        coadd_factor = _normalise_coadd_factor(
+            _attr(handle, "coadd_factor"),
+            product_kind=product_kind,
+        )
+        observation_product = _attr(handle, "observation_product")
+        if observation_product != STAMP_DELIVERY_OBSERVATION_PRODUCT:
+            raise StampDeliveryBundleContractError(
+                "delivery root observation_product must be 'final_dn'"
+            )
+        if _as_binary_attribute(
+            _attr(handle, "background_realization_used"),
+            name="background_realization_used",
+        ) is not False:
+            raise StampDeliveryBundleContractError(
+                "delivery root background_realization_used must be false"
+            )
+
+        for name in _REQUIRED_DATASETS:
+            if name not in handle:
+                raise StampDeliveryBundleContractError(
+                    f"delivery bundle is missing required dataset {name!r}"
+                )
+        if "gain_e_per_dn" in handle and "gain_e_per_dn" in handle.attrs:
+            raise StampDeliveryBundleContractError(
+                "gain_e_per_dn must be stored as either one dataset or one root attribute"
+            )
+        gain_dataset: Any | None
+        gain_attribute: ArrayLike | None
+        if "gain_e_per_dn" in handle:
+            gain_dataset = handle["gain_e_per_dn"]
+            gain_attribute = None
+        elif "gain_e_per_dn" in handle.attrs:
+            gain_dataset = None
+            gain_attribute = _attr(handle, "gain_e_per_dn")
+        else:
+            raise StampDeliveryBundleContractError(
+                "delivery bundle is missing gain_e_per_dn calibration metadata"
+            )
+
+        manifest = _load_json_dataset(handle, "manifest_json")
+        provenance = _load_json_dataset(handle, "provenance_json")
+        final_dataset = handle["final_dn"]
+        final_shape = tuple(int(size) for size in final_dataset.shape)
+        if len(final_shape) != 3 or any(size <= 0 for size in final_shape):
+            raise StampDeliveryBundleContractError(
+                "final_dn must have shape (n_frames, ny, nx) with positive dimensions"
+            )
+        n_frames, ny, nx = final_shape
+        final_dtype = np.dtype(final_dataset.dtype)
+        if final_dtype.kind != "u":
+            raise StampDeliveryBundleContractError(
+                f"final_dn must use an unsigned integer DN dtype, got {final_dtype}"
+            )
+        if product_kind == "coadd" and final_dtype != np.dtype(np.uint64):
+            raise StampDeliveryBundleContractError(
+                "coadd final_dn must use uint64 so summed raw DN cannot overflow"
+            )
+
+        previous_time_start: float | None = None
+        previous_raw_start: int | None = None
+        for frame_start in range(0, n_frames, int(batch_frames)):
+            frame_stop = min(frame_start + int(batch_frames), n_frames)
+            frame_slice = slice(frame_start, frame_stop)
+            bundle = StampDeliveryBundle.from_arrays(
+                product_kind=product_kind,
+                coadd_factor=coadd_factor,
+                final_dn=np.asarray(final_dataset[frame_slice]),
+                background_expectation_e=np.asarray(
+                    handle["background_expectation_e"][frame_slice]
+                ),
+                bias_level_sum_dn=np.asarray(
+                    handle["bias_level_sum_dn"][frame_slice]
+                ),
+                column_noise_sum_dn_by_x=np.asarray(
+                    handle["column_noise_sum_dn_by_x"][frame_slice]
+                ),
+                valid_mask=np.asarray(handle["valid_mask"][frame_slice]),
+                fullwell_count=np.asarray(handle["fullwell_count"][frame_slice]),
+                adc_low_count=np.asarray(handle["adc_low_count"][frame_slice]),
+                adc_high_count=np.asarray(handle["adc_high_count"][frame_slice]),
+                cosmic_count=np.asarray(handle["cosmic_count"][frame_slice]),
+                time_start_seconds=np.asarray(
+                    handle["time_start_seconds"][frame_slice]
+                ),
+                exposure_seconds=np.asarray(handle["exposure_seconds"][frame_slice]),
+                raw_frame_start_index=np.asarray(
+                    handle["raw_frame_start_index"][frame_slice]
+                ),
+                raw_frame_stop_index_exclusive=np.asarray(
+                    handle["raw_frame_stop_index_exclusive"][frame_slice]
+                ),
+                gain_e_per_dn=_streaming_gain_for_chunk(
+                    gain_dataset,
+                    gain_attribute,
+                    frame_slice=frame_slice,
+                    n_frames=n_frames,
+                    ny=ny,
+                    nx=nx,
+                ),
+                manifest=manifest,
+                provenance=provenance,
+            )
+            persisted_saturated = _as_binary_mask(
+                np.asarray(handle["saturated_mask"][frame_slice]),
+                name="saturated_mask",
+                shape=bundle.shape,
+            )
+            persisted_cosmic = _as_binary_mask(
+                np.asarray(handle["cosmic_mask"][frame_slice]),
+                name="cosmic_mask",
+                shape=bundle.shape,
+            )
+            if not np.array_equal(persisted_saturated, bundle.saturated_mask):
+                raise StampDeliveryBundleContractError(
+                    "saturated_mask must equal fullwell/ADC quality counts > 0"
+                )
+            if not np.array_equal(persisted_cosmic, bundle.cosmic_mask):
+                raise StampDeliveryBundleContractError(
+                    "cosmic_mask must equal cosmic_count > 0"
+                )
+            if (
+                previous_time_start is not None
+                and float(bundle.time_start_seconds[0]) <= previous_time_start
+            ):
+                raise StampDeliveryBundleContractError(
+                    "time_start_seconds must be strictly increasing"
+                )
+            if (
+                previous_raw_start is not None
+                and int(bundle.raw_frame_start_index[0]) <= previous_raw_start
+            ):
+                raise StampDeliveryBundleContractError(
+                    "raw_frame_start_index must be strictly increasing"
+                )
+            previous_time_start = float(bundle.time_start_seconds[-1])
+            previous_raw_start = int(bundle.raw_frame_start_index[-1])
+
     return StampDeliveryBundleValidation(
         path=source,
         complete=True,
-        product_kind=bundle.product_kind,
-        coadd_factor=bundle.coadd_factor,
-        frame_count=bundle.shape[0],
+        product_kind=product_kind,
+        coadd_factor=coadd_factor,
+        frame_count=n_frames,
         stamp_shape=(ny, nx),
-        final_dn_dtype=str(bundle.final_dn.dtype),
+        final_dn_dtype=str(final_dtype),
         observation_product=STAMP_DELIVERY_OBSERVATION_PRODUCT,
     )
+
+
+def validate_stamp_delivery_bundle(path: Path | str) -> StampDeliveryBundleValidation:
+    """Stream-validate and summarize a complete formal delivery bundle."""
+
+    return _stream_validate_stamp_delivery_bundle(path)
 
 
 __all__ = [
@@ -1242,6 +1610,7 @@ __all__ = [
     "StampDeliveryBundle",
     "StampDeliveryBundleAppender",
     "StampDeliveryBundleContractError",
+    "StampDeliveryShardSet",
     "StampDeliveryBundleValidation",
     "read_stamp_delivery_bundle",
     "validate_stamp_delivery_bundle",

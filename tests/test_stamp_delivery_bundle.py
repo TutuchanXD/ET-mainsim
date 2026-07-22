@@ -111,6 +111,31 @@ def test_atomic_write_readback_and_reference_adapter(tmp_path) -> None:
     )
 
 
+def test_validation_streams_hdf5_without_materializing_the_bundle(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Appender/readback validation must not depend on the full-array reader."""
+
+    import et_mainsim.stamp_delivery as delivery
+
+    path = tmp_path / "stream-validate.h5"
+    delivery.write_stamp_delivery_bundle(
+        path,
+        delivery.StampDeliveryBundle.from_arrays(**_bundle_payload()),
+    )
+
+    def fail_full_reader(*args, **kwargs):
+        raise AssertionError("full-array reader must not be used by validation")
+
+    monkeypatch.setattr(delivery, "read_stamp_delivery_bundle", fail_full_reader)
+    report = delivery.validate_stamp_delivery_bundle(path)
+
+    assert report.path == path
+    assert report.complete is True
+    assert report.frame_count == 2
+
+
 def test_coadd_requires_uint64_final_dn_and_bounded_quality_counts(tmp_path) -> None:
     from et_mainsim.stamp_delivery import (
         StampDeliveryBundle,
@@ -255,6 +280,64 @@ def test_streaming_appender_keeps_partial_invisible_until_complete(tmp_path) -> 
     assert read_stamp_delivery_bundle(path).shape == (2, 3, 4)
     with pytest.raises(RuntimeError, match="already completed"):
         appender.append(one_frame(0))
+
+
+def test_streaming_appender_rejects_a_gap_between_raw_batches(tmp_path) -> None:
+    """A streamed bundle may not silently skip raw-frame coverage at a batch edge."""
+
+    from et_mainsim.stamp_delivery import (
+        StampDeliveryBundle,
+        StampDeliveryBundleAppender,
+        StampDeliveryBundleContractError,
+    )
+
+    payload = _bundle_payload()
+    frame_fields = (
+        "final_dn",
+        "background_expectation_e",
+        "bias_level_sum_dn",
+        "column_noise_sum_dn_by_x",
+        "valid_mask",
+        "fullwell_count",
+        "adc_low_count",
+        "adc_high_count",
+        "cosmic_count",
+        "time_start_seconds",
+        "exposure_seconds",
+        "raw_frame_start_index",
+        "raw_frame_stop_index_exclusive",
+    )
+
+    first = dict(payload)
+    second = dict(payload)
+    for name in frame_fields:
+        first[name] = np.asarray(first[name])[:1]
+        second[name] = np.asarray(second[name])[1:2]
+    # The first bundle ends at raw index 41.  A raw index 42 start leaves one
+    # frame uncovered and must be rejected at the appender boundary.
+    second["raw_frame_start_index"] = np.array([42], dtype=np.int64)
+    second["raw_frame_stop_index_exclusive"] = np.array([43], dtype=np.int64)
+    second["time_start_seconds"] = np.array([20.0])
+
+    path = tmp_path / "gap-raw.h5"
+    with StampDeliveryBundleAppender(
+        path,
+        product_kind="raw",
+        coadd_factor=1,
+        stamp_shape=(3, 4),
+        gain_e_per_dn=2.0,
+        manifest=payload["manifest"],
+        provenance=payload["provenance"],
+    ) as appender:
+        appender.append(StampDeliveryBundle.from_arrays(**first))
+        with pytest.raises(
+            StampDeliveryBundleContractError,
+            match="must equal previous batch stop",
+        ):
+            appender.append(StampDeliveryBundle.from_arrays(**second))
+
+    assert not path.exists()
+    assert not list(tmp_path.glob("*.partial"))
 
 
 def test_streaming_appender_aborts_a_partial_product_on_context_exit(tmp_path) -> None:
