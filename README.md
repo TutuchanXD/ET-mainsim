@@ -149,4 +149,6 @@ artifacts can be read without rerunning via `tools/artifact_readback/`.
 The removed script layout is preserved by Git tag `legacy-scripts-final`.
 See [migration](docs/main_rd_photsim7_migration.md) for command and artifact
 mapping. Current details are in [full frame](docs/full_frame_workflow.md),
-[stamp](docs/stamp_workflow.md), and [legacy](docs/legacy_workflow.md).
+[stamp](docs/stamp_workflow.md), [stamp science delivery
+bundles](docs/stamp_science_delivery_zh.md), and
+[legacy](docs/legacy_workflow.md).
