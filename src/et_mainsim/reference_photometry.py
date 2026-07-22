@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+import json
+import math
 from pathlib import Path
 from typing import Any, Literal
 
@@ -341,6 +343,8 @@ class ReferencePhotometryResult:
     exposure_seconds: NDArray[np.float64] | None
     cdpp_by_window_minutes: Mapping[int, CadenceCDPP]
     product_semantics: Mapping[str, str | bool]
+    raw_frame_start_index: NDArray[np.int64] | None = None
+    raw_frame_stop_index_exclusive: NDArray[np.int64] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -350,11 +354,38 @@ class ReferencePhotometryResult:
             "aperture_pixel_count": self.aperture_pixel_count,
             "valid_cadence_count": int(np.count_nonzero(self.aperture_valid)),
             "cadence_count": int(self.aperture_valid.size),
+            "has_raw_frame_intervals": self.raw_frame_start_index is not None,
             "cdpp_by_window_minutes": {
                 str(window): metric.to_dict()
                 for window, metric in self.cdpp_by_window_minutes.items()
             },
             "product_semantics": dict(self.product_semantics),
+        }
+
+
+@dataclass(frozen=True)
+class InjectedModelResidualResult:
+    """A delivery light curve after removing its known injected source model."""
+
+    raw_factor_sum: NDArray[np.float64]
+    fitted_flux_e: NDArray[np.float64]
+    residual_e: NDArray[np.float64]
+    residual_ppm: NDArray[np.float64]
+    fit_scale_e_per_raw_factor: float
+    fit_intercept_e: float
+    valid_mask: NDArray[np.bool_]
+    cdpp_by_window_minutes: Mapping[int, CadenceCDPP]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_id": "et_mainsim.injected_model_residual.v1",
+            "fit_scale_e_per_raw_factor": self.fit_scale_e_per_raw_factor,
+            "fit_intercept_e": self.fit_intercept_e,
+            "valid_cadence_count": int(np.count_nonzero(self.valid_mask)),
+            "cdpp_by_window_minutes": {
+                str(window): metric.to_dict()
+                for window, metric in self.cdpp_by_window_minutes.items()
+            },
         }
 
 
@@ -690,6 +721,204 @@ def compute_cadence_aware_cdpp(
     return metrics
 
 
+def _compute_model_residual_cdpp(
+    *,
+    time_seconds: ArrayLike,
+    residual_e: ArrayLike,
+    fitted_flux_e: ArrayLike,
+    valid_mask: ArrayLike,
+    exposure_seconds: ArrayLike,
+    windows_minutes: Iterable[int],
+    bin_origin_seconds: float,
+    minimum_complete_bins: int,
+) -> dict[int, CadenceCDPP]:
+    """CDPP of residual/model fractions after complete exposure aggregation."""
+
+    time, residual, valid, exposure = _validate_cdpp_inputs(
+        time_seconds=time_seconds,
+        flux_e=residual_e,
+        aperture_valid=valid_mask,
+        exposure_seconds=exposure_seconds,
+    )
+    fitted = _as_finite_float_array(fitted_flux_e, field_name="fitted_flux_e")
+    if fitted.shape != time.shape or np.any(fitted <= 0.0):
+        raise ReferencePhotometryContractError(
+            "fitted_flux_e must be positive and match time_seconds"
+        )
+    if isinstance(minimum_complete_bins, (bool, np.bool_)) or int(
+        minimum_complete_bins
+    ) < 2:
+        raise ReferencePhotometryContractError("minimum_complete_bins must be at least two")
+    windows = _coerce_windows_minutes(windows_minutes)
+    origin = float(bin_origin_seconds)
+    if not np.isfinite(origin):
+        raise ReferencePhotometryContractError("bin_origin_seconds must be finite")
+    coverage_start = float(time[0])
+    coverage_end = float(np.max(time + exposure))
+    tolerance = 1e-8
+    metrics: dict[int, CadenceCDPP] = {}
+    for window_minutes in windows:
+        window_seconds = float(window_minutes * 60)
+        first_full_bin = int(np.ceil((coverage_start - origin) / window_seconds - tolerance))
+        last_full_bin_exclusive = int(
+            np.floor((coverage_end - origin) / window_seconds + tolerance)
+        )
+        fractions: list[float] = []
+        accepted_samples = 0
+        rejected_bins = 0
+        for bin_id in range(first_full_bin, last_full_bin_exclusive):
+            lower = origin + bin_id * window_seconds
+            upper = lower + window_seconds
+            selection = (time >= lower) & (time < upper)
+            usable = selection & valid
+            covered = _covered_duration_seconds(
+                time[usable],
+                exposure[usable],
+                lower=lower,
+                upper=upper,
+            )
+            if covered < window_seconds - tolerance:
+                rejected_bins += 1
+                continue
+            denominator = float(np.sum(fitted[usable], dtype=np.float64))
+            if not np.isfinite(denominator) or denominator <= 0.0:
+                rejected_bins += 1
+                continue
+            fractions.append(float(np.sum(residual[usable], dtype=np.float64)) / denominator)
+            accepted_samples += int(np.count_nonzero(usable))
+        binned = np.asarray(fractions, dtype=np.float64)
+        if binned.size < int(minimum_complete_bins):
+            cdpp_ppm = float("nan")
+        else:
+            centered = binned - float(np.mean(binned))
+            cdpp_ppm = float(1.4826 * np.mean(np.abs(centered)) * 1_000_000.0)
+        metrics[window_minutes] = CadenceCDPP(
+            window_minutes=window_minutes,
+            cdpp_ppm=cdpp_ppm,
+            complete_bin_count=int(binned.size),
+            rejected_bin_count=rejected_bins,
+            accepted_sample_count=accepted_samples,
+            estimator="injected_model_residual_mad_times_1.4826",
+            aggregation="sum_complete_exposure_residual_over_fitted_model",
+        )
+    return metrics
+
+
+def compute_injected_model_residual_v1(
+    reference: ReferencePhotometryResult,
+    *,
+    raw_frame_factors: ArrayLike,
+    raw_exposure_seconds: float,
+    windows_minutes: Iterable[int] = STANDARD_CDPP_WINDOWS_MINUTES,
+    bin_origin_seconds: float = 0.0,
+    minimum_complete_bins: int = 10,
+) -> InjectedModelResidualResult:
+    """Fit and remove a known injected ``q(t)`` model before reporting CDPP.
+
+    This is appropriate for variable sources.  The ordinary fixed-aperture
+    CDPP remains a useful observed-light-curve statistic, but it includes the
+    astrophysical variation by construction and must not be labelled as an
+    instrumental-noise metric.  ``raw_frame_factors`` are the frozen 10-s
+    exposure-averaged factors, not native FITS node samples.
+    """
+
+    if not isinstance(reference, ReferencePhotometryResult):
+        raise TypeError("reference must be a ReferencePhotometryResult")
+    if (
+        reference.raw_frame_start_index is None
+        or reference.raw_frame_stop_index_exclusive is None
+        or reference.exposure_seconds is None
+    ):
+        raise ReferencePhotometryContractError(
+            "injected-model residuals require formal raw-frame intervals and exposure_seconds"
+        )
+    try:
+        raw_exposure = float(raw_exposure_seconds)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ReferencePhotometryContractError(
+            "raw_exposure_seconds must be finite and positive"
+        ) from error
+    if not np.isfinite(raw_exposure) or raw_exposure <= 0.0:
+        raise ReferencePhotometryContractError(
+            "raw_exposure_seconds must be finite and positive"
+        )
+    factors = _as_finite_float_array(raw_frame_factors, field_name="raw_frame_factors")
+    if factors.ndim != 1 or np.any(factors <= 0.0):
+        raise ReferencePhotometryContractError(
+            "raw_frame_factors must be a one-dimensional positive array"
+        )
+    start = np.asarray(reference.raw_frame_start_index, dtype=np.int64)
+    stop = np.asarray(reference.raw_frame_stop_index_exclusive, dtype=np.int64)
+    if start.shape != reference.time_seconds.shape or stop.shape != start.shape:
+        raise ReferencePhotometryContractError(
+            "reference raw-frame intervals must match the light-curve cadence axis"
+        )
+    if (
+        np.any(start < 0)
+        or np.any(stop <= start)
+        or np.any(stop > factors.size)
+        or (start.size > 1 and not np.all(start[1:] == stop[:-1]))
+    ):
+        raise ReferencePhotometryContractError("reference raw-frame intervals are invalid")
+    exposure = np.asarray(reference.exposure_seconds, dtype=np.float64)
+    raw_width = stop - start
+    if not np.allclose(
+        exposure,
+        raw_width.astype(np.float64) * raw_exposure,
+        rtol=0.0,
+        atol=1e-8,
+    ):
+        raise ReferencePhotometryContractError(
+            "reference exposure_seconds conflict with raw-frame intervals"
+        )
+    prefix = np.concatenate(([0.0], np.cumsum(factors, dtype=np.float64)))
+    raw_factor_sum = prefix[stop] - prefix[start]
+    valid = np.asarray(reference.aperture_valid, dtype=bool) & np.isfinite(reference.flux_e)
+    if int(np.count_nonzero(valid)) < 2:
+        raise ReferencePhotometryContractError(
+            "at least two valid cadences are required for injected-model fitting"
+        )
+    # The formal calibration has already subtracted the background expectation,
+    # so the injected target model is physically proportional to q(t) and has
+    # no free additive flux term.  A two-parameter intercept fit is nearly
+    # singular for low-amplitude variables (q is close to one) and would let a
+    # regression absorb meaningful detector residuals.
+    model_valid = raw_factor_sum[valid]
+    flux_valid = np.asarray(reference.flux_e, dtype=np.float64)[valid]
+    denominator = float(np.dot(model_valid, model_valid))
+    scale = float(np.dot(model_valid, flux_valid) / denominator)
+    intercept = 0.0
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ReferencePhotometryContractError("injected-model fit produced a non-positive scale")
+    fitted = scale * raw_factor_sum + intercept
+    if np.any(fitted <= 0.0) or not np.all(np.isfinite(fitted)):
+        raise ReferencePhotometryContractError("injected-model fitted flux is invalid")
+    residual_e = np.full(reference.flux_e.shape, np.nan, dtype=np.float64)
+    residual_e[valid] = np.asarray(reference.flux_e, dtype=np.float64)[valid] - fitted[valid]
+    residual_ppm = np.full(reference.flux_e.shape, np.nan, dtype=np.float64)
+    residual_ppm[valid] = residual_e[valid] / fitted[valid] * 1_000_000.0
+    cdpp = _compute_model_residual_cdpp(
+        time_seconds=reference.time_seconds,
+        residual_e=np.nan_to_num(residual_e, nan=0.0),
+        fitted_flux_e=fitted,
+        valid_mask=valid,
+        exposure_seconds=exposure,
+        windows_minutes=windows_minutes,
+        bin_origin_seconds=bin_origin_seconds,
+        minimum_complete_bins=minimum_complete_bins,
+    )
+    return InjectedModelResidualResult(
+        raw_factor_sum=raw_factor_sum,
+        fitted_flux_e=fitted,
+        residual_e=residual_e,
+        residual_ppm=residual_ppm,
+        fit_scale_e_per_raw_factor=float(scale),
+        fit_intercept_e=float(intercept),
+        valid_mask=valid,
+        cdpp_by_window_minutes=cdpp,
+    )
+
+
 def reduce_reference_photometry_v1(
     delivery: ReferencePhotometryInput,
     *,
@@ -810,4 +1039,478 @@ def reduce_reference_photometry_bundle_v1(
         ),
         cdpp_windows_minutes=cdpp_windows_minutes,
         bin_origin_seconds=bin_origin_seconds,
+    )
+
+
+def reduce_stamp_delivery_bundle_v1(
+    bundle_path: Path | str,
+    *,
+    cdpp_windows_minutes: Iterable[int] = STANDARD_CDPP_WINDOWS_MINUTES,
+    bin_origin_seconds: float = 0.0,
+) -> ReferencePhotometryResult:
+    """Reduce one formal ``StampDeliveryBundle`` without legacy schema guesses.
+
+    The formal delivery schema stores physical interval starts as
+    ``time_start_seconds`` rather than the historical composite-bundle
+    ``time_index`` field.  Going through its supported adapter preserves that
+    distinction and deliberately exposes no sampled background realization.
+    """
+
+    from .stamp_delivery import read_stamp_delivery_bundle
+
+    bundle = read_stamp_delivery_bundle(bundle_path)
+    delivery = ReferencePhotometryInput.from_arrays(
+        **bundle.to_reference_photometry_payload()
+    )
+    return reduce_reference_photometry_v1(
+        delivery,
+        cdpp_windows_minutes=cdpp_windows_minutes,
+        bin_origin_seconds=bin_origin_seconds,
+    )
+
+
+@dataclass(frozen=True)
+class _FormalDeliveryHeader:
+    """Small formal-bundle identity needed before streaming a series."""
+
+    path: Path
+    product_kind: str
+    coadd_factor: int
+    frame_count: int
+    stamp_shape: tuple[int, int]
+    gain_e_per_dn: NDArray[np.float64]
+    manifest_identity: str
+    provenance_identity: str
+    first_raw_frame_start: int
+    last_raw_frame_stop: int
+    first_time_start_seconds: float
+    last_time_end_seconds: float
+
+
+_FORMAL_REQUIRED_DATASETS = (
+    "final_dn",
+    "background_expectation_e",
+    "bias_level_sum_dn",
+    "column_noise_sum_dn_by_x",
+    "valid_mask",
+    "fullwell_count",
+    "adc_low_count",
+    "adc_high_count",
+    "cosmic_count",
+    "saturated_mask",
+    "cosmic_mask",
+    "time_start_seconds",
+    "exposure_seconds",
+    "raw_frame_start_index",
+    "raw_frame_stop_index_exclusive",
+    "manifest_json",
+    "provenance_json",
+)
+
+
+def _h5_scalar_string(value: Any, *, name: str) -> str:
+    if isinstance(value, np.ndarray):
+        if value.shape != ():
+            raise ReferencePhotometryContractError(f"{name} must be scalar")
+        value = value.item()
+    if isinstance(value, (bytes, np.bytes_)):
+        value = bytes(value).decode("utf-8")
+    if not isinstance(value, str):
+        raise ReferencePhotometryContractError(f"{name} must be a UTF-8 string")
+    return value
+
+
+def _formal_json_dataset(handle: Any, name: str) -> dict[str, Any]:
+    try:
+        value = _h5_scalar_string(handle[name][()], name=name)
+        decoded = json.loads(value)
+    except (KeyError, json.JSONDecodeError) as error:
+        raise ReferencePhotometryContractError(
+            f"formal delivery bundle has invalid {name}"
+        ) from error
+    if not isinstance(decoded, dict):
+        raise ReferencePhotometryContractError(f"formal delivery {name} must be an object")
+    return decoded
+
+
+def _formal_identity_json(value: Mapping[str, Any], *, omit: frozenset[str]) -> str:
+    candidate = {key: item for key, item in value.items() if key not in omit}
+    try:
+        return json.dumps(
+            candidate,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise ReferencePhotometryContractError(
+            "formal delivery manifest/provenance must be JSON serializable"
+        ) from error
+
+
+def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
+    """Read only header/small vectors; never materialize delivery image cubes."""
+
+    try:
+        import h5py
+    except ImportError as error:  # pragma: no cover - packaging guard.
+        raise RuntimeError("h5py is required to read formal stamp delivery bundles") from error
+
+    from .stamp_delivery import (
+        STAMP_DELIVERY_OBSERVATION_PRODUCT,
+        STAMP_DELIVERY_SCHEMA_ID,
+        STAMP_DELIVERY_SCHEMA_VERSION,
+    )
+
+    source = Path(path).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"formal delivery bundle does not exist: {source}")
+    with h5py.File(source, "r") as handle:
+        schema_id = _h5_scalar_string(handle.attrs.get("schema_id"), name="schema_id")
+        if schema_id != STAMP_DELIVERY_SCHEMA_ID:
+            raise ReferencePhotometryContractError("unsupported formal delivery schema")
+        if int(handle.attrs.get("schema_version", -1)) != STAMP_DELIVERY_SCHEMA_VERSION:
+            raise ReferencePhotometryContractError("unsupported formal delivery schema version")
+        if bool(handle.attrs.get("complete", False)) is not True:
+            raise ReferencePhotometryContractError("formal delivery bundle is not complete")
+        product_kind = _h5_scalar_string(
+            handle.attrs.get("product_kind"),
+            name="product_kind",
+        )
+        if product_kind not in {"raw", "coadd"}:
+            raise ReferencePhotometryContractError("formal delivery product_kind is invalid")
+        coadd_factor = int(handle.attrs.get("coadd_factor", 0))
+        if coadd_factor <= 0 or (product_kind == "raw" and coadd_factor != 1):
+            raise ReferencePhotometryContractError("formal delivery coadd_factor is invalid")
+        if product_kind == "coadd" and coadd_factor <= 1:
+            raise ReferencePhotometryContractError("formal delivery coadd_factor is invalid")
+        if (
+            _h5_scalar_string(
+                handle.attrs.get("observation_product"),
+                name="observation_product",
+            )
+            != STAMP_DELIVERY_OBSERVATION_PRODUCT
+        ):
+            raise ReferencePhotometryContractError(
+                "formal delivery observation_product must be final_dn"
+            )
+        if bool(handle.attrs.get("background_realization_used", True)):
+            raise ReferencePhotometryContractError(
+                "formal delivery must not expose a background realization"
+            )
+        missing = [name for name in _FORMAL_REQUIRED_DATASETS if name not in handle]
+        if missing:
+            raise ReferencePhotometryContractError(
+                f"formal delivery bundle is missing required datasets: {missing}"
+            )
+        final = handle["final_dn"]
+        if len(final.shape) != 3 or any(int(size) <= 0 for size in final.shape):
+            raise ReferencePhotometryContractError("formal final_dn shape is invalid")
+        if final.dtype.kind != "u":
+            raise ReferencePhotometryContractError("formal final_dn must use unsigned DN")
+        if product_kind == "coadd" and final.dtype != np.dtype(np.uint64):
+            raise ReferencePhotometryContractError("formal coadd final_dn must use uint64")
+        n_frames, ny, nx = (int(size) for size in final.shape)
+        expected_shapes = {
+            "background_expectation_e": (n_frames, ny, nx),
+            "valid_mask": (n_frames, ny, nx),
+            "fullwell_count": (n_frames, ny, nx),
+            "adc_low_count": (n_frames, ny, nx),
+            "adc_high_count": (n_frames, ny, nx),
+            "cosmic_count": (n_frames, ny, nx),
+            "saturated_mask": (n_frames, ny, nx),
+            "cosmic_mask": (n_frames, ny, nx),
+            "bias_level_sum_dn": (n_frames,),
+            "column_noise_sum_dn_by_x": (n_frames, nx),
+            "time_start_seconds": (n_frames,),
+            "exposure_seconds": (n_frames,),
+            "raw_frame_start_index": (n_frames,),
+            "raw_frame_stop_index_exclusive": (n_frames,),
+        }
+        for name, expected_shape in expected_shapes.items():
+            if tuple(handle[name].shape) != expected_shape:
+                raise ReferencePhotometryContractError(
+                    f"formal delivery {name} shape differs from final_dn"
+                )
+        if "gain_e_per_dn" in handle and "gain_e_per_dn" in handle.attrs:
+            raise ReferencePhotometryContractError(
+                "formal delivery gain_e_per_dn is stored twice"
+            )
+        if "gain_e_per_dn" in handle:
+            gain = np.asarray(handle["gain_e_per_dn"], dtype=np.float64)
+        elif "gain_e_per_dn" in handle.attrs:
+            gain = np.asarray(handle.attrs["gain_e_per_dn"], dtype=np.float64)
+        else:
+            raise ReferencePhotometryContractError("formal delivery lacks gain_e_per_dn")
+        if gain.shape not in {(), (ny, nx)} or not np.all(np.isfinite(gain)) or np.any(gain <= 0.0):
+            raise ReferencePhotometryContractError(
+                "streamed formal delivery gain must be positive scalar or stamp map"
+            )
+        starts = np.asarray(handle["time_start_seconds"], dtype=np.float64)
+        exposure = np.asarray(handle["exposure_seconds"], dtype=np.float64)
+        raw_start = np.asarray(handle["raw_frame_start_index"], dtype=np.int64)
+        raw_stop = np.asarray(handle["raw_frame_stop_index_exclusive"], dtype=np.int64)
+        if (
+            not np.all(np.isfinite(starts))
+            or not np.all(np.isfinite(exposure))
+            or np.any(exposure <= 0.0)
+            or np.any(raw_start < 0)
+            or np.any(raw_stop - raw_start != coadd_factor)
+            or (n_frames > 1 and not np.all(np.diff(starts) > 0.0))
+            or (n_frames > 1 and not np.all(raw_start[1:] == raw_stop[:-1]))
+        ):
+            raise ReferencePhotometryContractError(
+                "formal delivery has invalid frame intervals"
+            )
+        manifest = _formal_json_dataset(handle, "manifest_json")
+        provenance = _formal_json_dataset(handle, "provenance_json")
+    return _FormalDeliveryHeader(
+        path=source,
+        product_kind=product_kind,
+        coadd_factor=coadd_factor,
+        frame_count=n_frames,
+        stamp_shape=(ny, nx),
+        gain_e_per_dn=gain,
+        manifest_identity=_formal_identity_json(manifest, omit=frozenset({"time_shard"})),
+        provenance_identity=_formal_identity_json(provenance, omit=frozenset()),
+        first_raw_frame_start=int(raw_start[0]),
+        last_raw_frame_stop=int(raw_stop[-1]),
+        first_time_start_seconds=float(starts[0]),
+        last_time_end_seconds=float(starts[-1] + exposure[-1]),
+    )
+
+
+def reduce_stamp_delivery_series_v1(
+    bundle_paths: Iterable[Path | str],
+    *,
+    cdpp_windows_minutes: Iterable[int] = STANDARD_CDPP_WINDOWS_MINUTES,
+    bin_origin_seconds: float = 0.0,
+    batch_frames: int = 4_096,
+) -> ReferencePhotometryResult:
+    """Stream a target/product series across contiguous formal time shards.
+
+    This is the production reduction path: it reads only the central 13x13
+    aperture from each HDF5 image cube, verifies global raw-frame continuity,
+    and computes CDPP once over the entire series.  It never averages
+    shard-level CDPP values, which would be mathematically invalid for MAD.
+    """
+
+    if isinstance(batch_frames, (bool, np.bool_)) or int(batch_frames) <= 0:
+        raise ReferencePhotometryContractError("batch_frames must be positive")
+    headers = tuple(_read_formal_delivery_header(path) for path in bundle_paths)
+    if not headers:
+        raise ReferencePhotometryContractError("at least one formal delivery bundle is required")
+    headers = tuple(sorted(headers, key=lambda item: item.first_raw_frame_start))
+    first = headers[0]
+    ny, nx = first.stamp_shape
+    aperture_mask = _fixed_central_aperture_mask(ny=ny, nx=nx)
+    y_indices, x_indices = np.nonzero(aperture_mask)
+    y0, y1 = int(np.min(y_indices)), int(np.max(y_indices)) + 1
+    x0, x1 = int(np.min(x_indices)), int(np.max(x_indices)) + 1
+    pixel_count = int(np.count_nonzero(aperture_mask))
+    previous_raw_stop: int | None = None
+    previous_time_end: float | None = None
+    for header in headers:
+        if (
+            header.product_kind != first.product_kind
+            or header.coadd_factor != first.coadd_factor
+            or header.stamp_shape != first.stamp_shape
+            or not np.array_equal(header.gain_e_per_dn, first.gain_e_per_dn)
+            or header.manifest_identity != first.manifest_identity
+            or header.provenance_identity != first.provenance_identity
+        ):
+            raise ReferencePhotometryContractError(
+                "formal delivery series contains incompatible shard identities"
+            )
+        if previous_raw_stop is not None and (
+            header.first_raw_frame_start != previous_raw_stop
+            or not math.isclose(
+                header.first_time_start_seconds,
+                float(previous_time_end),
+                rel_tol=0.0,
+                abs_tol=1e-8,
+            )
+        ):
+            raise ReferencePhotometryContractError(
+                "formal delivery shards are not globally continuous"
+            )
+        previous_raw_stop = header.last_raw_frame_stop
+        previous_time_end = header.last_time_end_seconds
+
+    try:
+        import h5py
+    except ImportError as error:  # pragma: no cover - packaging guard.
+        raise RuntimeError("h5py is required to stream formal delivery bundles") from error
+
+    time_parts: list[NDArray[np.float64]] = []
+    exposure_parts: list[NDArray[np.float64]] = []
+    flux_parts: list[NDArray[np.float64]] = []
+    valid_parts: list[NDArray[np.bool_]] = []
+    usable_count_parts: list[NDArray[np.int64]] = []
+    raw_start_parts: list[NDArray[np.int64]] = []
+    raw_stop_parts: list[NDArray[np.int64]] = []
+    expected_raw_start: int | None = None
+    expected_time_start: float | None = None
+    for header in headers:
+        with h5py.File(header.path, "r") as handle:
+            if header.gain_e_per_dn.shape == ():
+                gain_crop: float | NDArray[np.float64] = float(header.gain_e_per_dn)
+            else:
+                gain_crop = header.gain_e_per_dn[y0:y1, x0:x1]
+            for offset in range(0, header.frame_count, int(batch_frames)):
+                stop = min(offset + int(batch_frames), header.frame_count)
+                frame_slice = slice(offset, stop)
+                final = np.asarray(
+                    handle["final_dn"][frame_slice, y0:y1, x0:x1],
+                    dtype=np.float64,
+                )
+                background = np.asarray(
+                    handle["background_expectation_e"][frame_slice, y0:y1, x0:x1],
+                    dtype=np.float64,
+                )
+                bias = np.asarray(handle["bias_level_sum_dn"][frame_slice], dtype=np.float64)
+                column = np.asarray(
+                    handle["column_noise_sum_dn_by_x"][frame_slice, x0:x1],
+                    dtype=np.float64,
+                )
+                valid = np.asarray(
+                    handle["valid_mask"][frame_slice, y0:y1, x0:x1],
+                    dtype=bool,
+                )
+                fullwell = np.asarray(
+                    handle["fullwell_count"][frame_slice, y0:y1, x0:x1],
+                    dtype=np.uint16,
+                )
+                adc_low = np.asarray(
+                    handle["adc_low_count"][frame_slice, y0:y1, x0:x1],
+                    dtype=np.uint16,
+                )
+                adc_high = np.asarray(
+                    handle["adc_high_count"][frame_slice, y0:y1, x0:x1],
+                    dtype=np.uint16,
+                )
+                cosmic_count = np.asarray(
+                    handle["cosmic_count"][frame_slice, y0:y1, x0:x1],
+                    dtype=np.uint16,
+                )
+                saturated = np.asarray(
+                    handle["saturated_mask"][frame_slice, y0:y1, x0:x1],
+                    dtype=bool,
+                )
+                cosmic = np.asarray(
+                    handle["cosmic_mask"][frame_slice, y0:y1, x0:x1],
+                    dtype=bool,
+                )
+                time = np.asarray(handle["time_start_seconds"][frame_slice], dtype=np.float64)
+                exposure = np.asarray(handle["exposure_seconds"][frame_slice], dtype=np.float64)
+                raw_start = np.asarray(
+                    handle["raw_frame_start_index"][frame_slice], dtype=np.int64
+                )
+                raw_stop = np.asarray(
+                    handle["raw_frame_stop_index_exclusive"][frame_slice], dtype=np.int64
+                )
+                if (
+                    not np.all(np.isfinite(background))
+                    or np.any(background < 0.0)
+                    or not np.all(np.isfinite(bias))
+                    or not np.all(np.isfinite(column))
+                    or not np.all(np.isfinite(time))
+                    or not np.all(np.isfinite(exposure))
+                    or np.any(exposure <= 0.0)
+                    or np.any(raw_stop - raw_start != header.coadd_factor)
+                    or np.any(fullwell > header.coadd_factor)
+                    or np.any(adc_low > header.coadd_factor)
+                    or np.any(adc_high > header.coadd_factor)
+                    or np.any(cosmic_count > header.coadd_factor)
+                    or not np.array_equal(
+                        saturated,
+                        (fullwell > 0) | (adc_low > 0) | (adc_high > 0),
+                    )
+                    or not np.array_equal(cosmic, cosmic_count > 0)
+                ):
+                    raise ReferencePhotometryContractError(
+                        "formal delivery aperture planes violate the delivery contract"
+                    )
+                if expected_raw_start is not None and (
+                    int(raw_start[0]) != expected_raw_start
+                    or not math.isclose(
+                        float(time[0]),
+                        float(expected_time_start),
+                        rel_tol=0.0,
+                        abs_tol=1e-8,
+                    )
+                ):
+                    raise ReferencePhotometryContractError(
+                        "formal delivery frames are not globally continuous"
+                    )
+                if time.size > 1 and (
+                    not np.all(np.diff(time) > 0.0)
+                    or not np.all(raw_start[1:] == raw_stop[:-1])
+                ):
+                    raise ReferencePhotometryContractError(
+                        "formal delivery frames are not globally continuous"
+                    )
+                expected_raw_start = int(raw_stop[-1])
+                expected_time_start = float(time[-1] + exposure[-1])
+                usable = valid & ~saturated & ~cosmic
+                usable_counts = np.count_nonzero(
+                    usable.reshape(usable.shape[0], -1),
+                    axis=1,
+                ).astype(np.int64, copy=False)
+                aperture_valid = usable_counts == pixel_count
+                calibrated = (
+                    (final - bias[:, None, None] - column[:, None, :]) * gain_crop
+                    - background
+                )
+                flux = np.full(time.shape, np.nan, dtype=np.float64)
+                if np.any(aperture_valid):
+                    flux[aperture_valid] = np.sum(
+                        calibrated[aperture_valid],
+                        axis=(1, 2),
+                        dtype=np.float64,
+                    )
+                time_parts.append(time)
+                exposure_parts.append(exposure)
+                flux_parts.append(flux)
+                valid_parts.append(aperture_valid)
+                usable_count_parts.append(usable_counts)
+                raw_start_parts.append(raw_start)
+                raw_stop_parts.append(raw_stop)
+
+    time_seconds = np.concatenate(time_parts)
+    exposure_seconds = np.concatenate(exposure_parts)
+    flux_e = np.concatenate(flux_parts)
+    aperture_valid = np.concatenate(valid_parts)
+    usable_counts = np.concatenate(usable_count_parts)
+    raw_frame_start_index = np.concatenate(raw_start_parts)
+    raw_frame_stop_index_exclusive = np.concatenate(raw_stop_parts)
+    cdpp_by_window_minutes = compute_cadence_aware_cdpp(
+        time_seconds=time_seconds,
+        flux_e=np.nan_to_num(flux_e, nan=0.0),
+        aperture_valid=aperture_valid,
+        exposure_seconds=exposure_seconds,
+        windows_minutes=cdpp_windows_minutes,
+        bin_origin_seconds=bin_origin_seconds,
+    )
+    return ReferencePhotometryResult(
+        time_seconds=time_seconds,
+        flux_e=flux_e,
+        aperture_valid=aperture_valid,
+        aperture_usable_pixel_count=usable_counts,
+        aperture_mask=aperture_mask,
+        aperture_shape=FIXED_APERTURE_SHAPE,
+        aperture_pixel_count=pixel_count,
+        exposure_seconds=exposure_seconds,
+        cdpp_by_window_minutes=cdpp_by_window_minutes,
+        product_semantics={
+            "observation_product": "final_dn",
+            "calibrated_electron_product": "derived",
+            "background_subtraction": "background_expectation_e_only",
+            "background_realization_used": False,
+            "mask_policy": "invalidate_whole_fixed_aperture_cadence",
+            "input_mode": "streamed_formal_delivery_shards",
+        },
+        raw_frame_start_index=raw_frame_start_index,
+        raw_frame_stop_index_exclusive=raw_frame_stop_index_exclusive,
     )
