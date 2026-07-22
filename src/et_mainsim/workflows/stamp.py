@@ -23,6 +23,9 @@ from et_mainsim.config import (
 from et_mainsim.manifest import RunManifestStore
 from et_mainsim.presets import resource_path
 from et_mainsim.provenance import collect_provenance
+from et_mainsim.selection_schemas import (
+    is_supported_cadence_selection_truth_schema,
+)
 from et_mainsim.stamp_inputs import (
     StampTarget,
     file_identity,
@@ -1410,9 +1413,10 @@ def _validate_selection_sidecars(
         "index_content_sha256",
     }:
         return False
-    if cadence.get("schema_id") != "photsim7.cadence_selection_truth.v1":
-        return False
-    if int(cadence.get("schema_version", 0)) != 1:
+    if not is_supported_cadence_selection_truth_schema(
+        cadence.get("schema_id"),
+        cadence.get("schema_version"),
+    ):
         return False
     if cadence.get("relative_directory") != "selection_truth/cadence":
         return False
@@ -1454,6 +1458,10 @@ def _validate_selection_sidecars(
             target_dir / relative,
             artifact_root=target_dir,
         )
+        if truth.schema_id != cadence["schema_id"]:
+            return False
+        if truth.schema_version != int(cadence["schema_version"]):
+            return False
         if truth.local_frame_index != local_frame_index:
             return False
         if truth.absolute_raw_frame_index != absolute_raw_frame_index:
@@ -2364,6 +2372,12 @@ def _catalog_manifest(prepared: PreparedStampInputs, plan: StampRunPlan) -> dict
 
 
 def _stamp_product_contract() -> dict[str, Any]:
+    from photsim7.psf.selection_truth import PSF_SELECTION_TRUTH_SCHEMA_ID
+    from photsim7.selection_artifacts import (
+        CADENCE_SELECTION_TRUTH_SCHEMA_ID,
+        CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
+    )
+
     return {
         "target_artifact_schema_id": "et_mainsim.stamp_target_artifacts",
         "target_artifact_schema_version": _TARGET_ARTIFACT_SCHEMA_VERSION,
@@ -2373,11 +2387,10 @@ def _stamp_product_contract() -> dict[str, Any]:
         "source_geometry_truth_schema_id": (
             "photsim7.source_geometry_truth.v1"
         ),
-        "psf_selection_truth_schema_id": (
-            "photsim7.psf_selection_truth.v2"
-        ),
-        "cadence_selection_truth_schema_id": (
-            "photsim7.cadence_selection_truth.v1"
+        "psf_selection_truth_schema_id": PSF_SELECTION_TRUTH_SCHEMA_ID,
+        "cadence_selection_truth_schema_id": CADENCE_SELECTION_TRUTH_SCHEMA_ID,
+        "cadence_selection_truth_schema_version": (
+            CADENCE_SELECTION_TRUTH_SCHEMA_VERSION
         ),
     }
 
