@@ -984,6 +984,19 @@ def run_standard_stamp_analysis_v1(
 
     bundle_stat_fingerprints = _bundle_stat_fingerprints(resolved.bundle_paths)
     bundle_receipts = _validate_and_identify_bundles(resolved.bundle_paths)
+    # Discovery reads this context first so notebooks can report readiness.
+    # Read it again inside the receipt/fingerprint window: otherwise a valid
+    # but wrong HDF5 replacement between discovery and reduction could evade
+    # the manifest/time/source binding while still satisfying the generic
+    # delivery-bundle schema.
+    _verify_bundle_context(
+        bundle_paths=resolved.bundle_paths,
+        time_plan=resolved.time_plan,
+        source_id=resolved.source_id,
+        case=resolved.case,
+        run_id=str(resolved.production_manifest["run_id"]),
+        expected_factor_snapshot_identity=resolved.factor_snapshot_identity,
+    )
     reference = reduce_stamp_delivery_series_v1(
         resolved.bundle_paths,
         cdpp_windows_minutes=request.cdpp_windows_minutes,

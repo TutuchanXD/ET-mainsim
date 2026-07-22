@@ -387,6 +387,61 @@ def test_standard_analysis_validates_every_selected_delivery_bundle(
     assert [path.parent.name for path in calls] == ["shard_00000", "shard_00001"]
 
 
+def test_standard_analysis_rechecks_delivery_context_after_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid-but-wrong bundle replacement must not cross the TOCTOU gap."""
+
+    import et_mainsim.standard_stamp_analysis as analysis_module
+
+    manifest_path = _write_formal_galaxy_run(tmp_path, case="injected")
+    first_bundle = (
+        tmp_path
+        / "formal_run"
+        / "cases"
+        / "injected"
+        / "stamps"
+        / f"target_{SOURCE_ID}"
+        / "delivery"
+        / "shard_00000"
+        / "coadd_30s.h5"
+    )
+    original_discover = analysis_module.discover_standard_stamp_analysis_input
+
+    def replace_after_initial_discovery(request):
+        resolved = original_discover(request)
+        with h5py.File(first_bundle, "r+") as handle:
+            raw = handle["manifest_json"][()]
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            bundle_manifest = json.loads(raw)
+            bundle_manifest["target_source_id_int64"] = SOURCE_ID + 1
+            handle["manifest_json"][()] = json.dumps(bundle_manifest)
+        return resolved
+
+    monkeypatch.setattr(
+        analysis_module,
+        "discover_standard_stamp_analysis_input",
+        replace_after_initial_discovery,
+    )
+    output_dir = tmp_path / "analysis"
+    with pytest.raises(
+        analysis_module.StandardStampAnalysisError,
+        match="formal delivery target does not match request",
+    ):
+        analysis_module.run_standard_stamp_analysis_v1(
+            analysis_module.StandardStampAnalysisRequest(
+                production_manifest_path=manifest_path,
+                source_id=SOURCE_ID,
+                case="injected",
+                cadence_seconds=CADENCE_SECONDS,
+                output_dir=output_dir,
+            )
+        )
+    assert not output_dir.exists()
+
+
 def test_standard_analysis_rejects_a_delivery_input_changed_during_reduction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
