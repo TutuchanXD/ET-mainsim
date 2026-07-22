@@ -129,5 +129,100 @@ derived_aperture_flux_e = scale * sum(raw_frame_factor)
 and reports residual ppm plus 30/90/390-minute complete-window CDPP.  The fit
 has no free intercept because background expectation has already been removed
 from the derived electron image; adding one is ill-conditioned for small
-variability and can absorb real detector residuals.  This residual CDPP is the
-standard instrument-like metric for the Galaxy injected production.
+variability and can absorb real detector residuals.  This residual CDPP is an
+undetrended instrument-like residual diagnostic for the Galaxy injected
+production.  它不是 legacy PCA/SG/detrend 标准流程的 CDPP；若将来需要该另一套
+科学指标，必须先冻结趋势模型、训练/拟合样本与不确定度口径，不能把它与本模块的
+reference/residual MAD 指标混称。
+
+## Formal standard-analysis CLI/API
+
+`et_mainsim.standard_stamp_analysis` packages the above primitive functions
+into the maintained post-processing entry point for a completed formal Galaxy
+production.  It is intentionally scoped to
+`et_mainsim.galaxy_stamp_production.v1` manifest schema version 2: the caller
+provides a production manifest, target, case, and delivery cadence; it does
+not hard-code a run-root path or enumerate shards by directory globbing.
+
+```bash
+python -m et_mainsim.standard_stamp_analysis \
+  --production-manifest /path/to/production_manifest.json \
+  --source-id 2119800835728275584 \
+  --case injected \
+  --cadence-seconds 60 \
+  --output-dir /path/to/standard_analysis/source_2119800835728275584/injected/coadd_60s
+```
+
+Its Python API is equivalent:
+
+```python
+from et_mainsim.standard_stamp_analysis import (
+    StandardStampAnalysisRequest,
+    run_standard_stamp_analysis_v1,
+)
+
+result = run_standard_stamp_analysis_v1(
+    StandardStampAnalysisRequest(
+        production_manifest_path="/path/to/production_manifest.json",
+        source_id=2119800835728275584,
+        case="injected",
+        cadence_seconds=60,
+        output_dir="/path/to/analysis-output",
+    )
+)
+print(result.analysis_manifest_path)
+```
+
+公开 API 如下；内部 JSON/path helpers 不属于稳定接口。
+
+| API | 用途 | 关键输入/输出 |
+| --- | --- | --- |
+| `StandardStampAnalysisRequest(...)` | 冻结一次分析请求。 | `production_manifest_path`、signed-int64 `source_id`、`case`、整数倍 raw exposure 的 `cadence_seconds`、`output_dir`；默认 CDPP window 为 30/90/390 min。 |
+| `discover_standard_stamp_analysis_input(request)` | 只做 manifest、time plan、发布完整性和 injected snapshot 的验证。 | 返回 manifest-relative HDF5 path 列表；若尚未完整发布则抛出 `StandardStampAnalysisNotReadyError`。 |
+| `run_standard_stamp_analysis_v1(request)` | 流式产生 CSV 与 JSON analysis manifest。 | 返回 `StandardStampAnalysisResult`，其中有两个最终文件路径和 cadence 计数。 |
+| `StandardStampAnalysisError` | 正式输入或语义合同不成立。 | 包含 schema、identity、cadence、delivery caller provenance 等失败。 |
+| `StandardStampAnalysisNotReadyError` | 正式 run 仍缺预期 final HDF5 shard。 | 不读取 partial；等待生产补齐后以同一 request 重试。 |
+
+`--batch-frames` 只限制 HDF5 中心 aperture 的流式读取 batch；它不改变仿真、
+coadd、RNG 或 CDPP 时间定义。分析输出是一个不可变的目录级交付：已有
+`complete: true` 的标准分析即使指定 `--overwrite` 也绝不覆盖。若路径残留的是不完整
+目录，`--overwrite` 只会将该目录原样归档为同级
+`.output-name.incomplete-<uuid>`，并写入 `INCOMPLETE_ARCHIVE.json`
+（`complete: false`、`discovery_policy: not_a_standard_analysis_product`），随后发布
+新的完整目录；它不会修改任何 HDF5 delivery，也不会删除旧派生文件。
+
+发现阶段会读取 manifest-relative 的 time-shard plan，验证 plan 的 SHA-256
+identity，并要求该 `target × case × cadence` 的**每一个**预期 HDF5 final member
+已经发布。缺任何 shard 时抛出 `StandardStampAnalysisNotReadyError`，不会读取
+partial/staging 文件、不会输出半条 light curve，也不会把一日快看误称为完整正式
+分析。对 `injected`，它还验证 target 的 frozen factor snapshot 本身以及每个
+delivery bundle 写入的 snapshot identity；因此结果不能把别的输入曲线残差误标为
+该目标的注入恢复。
+
+开始 reduction 前，CLI 对所选 cadence 的每一个 final HDF5 调用
+`validate_stamp_delivery_bundle()`，再流式计算整个文件的 SHA-256。最终
+`analysis_manifest.json` 的 `delivery.bundle_receipts[]` 记录相对路径、完整文件
+`size_bytes`、`sha256` 和 schema readback 摘要；分析完成后还会比较文件的
+device/inode/size/mtime 状态，若输入在验证或 reduction 期间被替换/改写则失败，不
+发布分析文件。全文件 hash 是有意的可复现性成本，特别是 raw 10 s 交付会明显增加
+后处理 I/O；它不改变任何 HDF5 或仿真随机数。
+
+成功时 `output_dir` 只产生两个小型派生分析文件：
+
+| 文件 | 内容 |
+| --- | --- |
+| `reference_lightcurve.csv` | 中心 `13×13` fixed aperture 的每 cadence 派生电子 flux、绝对时间/原始帧半开区间、`aperture_valid`、可用像元数和不可用像元数。injected case 另外有 frozen-factor sum、through-origin model flux、residual e-/ppm 与 residual valid flag。空的 `flux_derived_e` 或 residual 值表示该 cadence 因质量口径无效，不是零 flux。 |
+| `analysis_manifest.json` | 输入 production/交付 identity receipt、固定 aperture 与质量汇总、顶层 `observed_cdpp`、injected-model residual CDPP、输出字段与统计口径。任何无法估计的 CDPP 以 JSON `null` 表示，绝不写非标准 `NaN`。 |
+
+这两个文件不会分别暴露给读者：它们先在 `output_dir` 同级的私有
+`.output-name.staging-*` 目录中完成单文件原子写入与 `fsync`，再以同一文件系统上的
+目录 rename 一次性发布。若 CSV 后的 manifest 生成/写入失败，staging 目录会清理，最终
+`output_dir` 不存在；因此普通消费者看到的已发布目录总是同时包含 CSV 和
+`complete: true` manifest。
+
+`ordinary_cdpp_label` 在 variable injected case 固定为
+`undetrended_astrophysical_plus_instrument_legacy_compatible_diagnostic`；它包括真实
+的内禀光变，不能作为纯仪器指标。`injected_model_residual_cdpp_label` 标记对应冻结
+`q(t)` 的未趋势去除残差诊断。两者都采用完整物理曝光窗口和 legacy-compatible
+mean-MAD normalization；这只复用统计口径，正式链路明确不调用 legacy pickle、
+PCA、Savitzky--Golay 或 `bin_lcs`，也绝不将该输出称为 legacy-standard CDPP。
