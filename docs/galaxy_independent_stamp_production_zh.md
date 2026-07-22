@@ -185,6 +185,15 @@ python scripts/run_galaxy_independent_stamp_production.py run-target \
 目标一日基准，记录 wall time、RSS、写入量和完整读回时间，再决定每个任务合并多少
 个连续日 shard。
 
+全部渲染 array 成功后，使用
+`scripts/galaxy_standard_stamp_analysis_array_slurm.sh` 提交一个
+`0-9%1` 的 CPU array，并对渲染 array 施加 `afterok` 依赖。它从冻结 manifest 的
+target 顺序解析 source ID，严格要求恰好 10 个目标；每个成员固定分析 injected 的
+60 s coadd，且仍由 `standard_stamp_analysis` 再次确认该 source 的 90 个 final HDF5、
+time-plan、factor snapshot、SHA-256 和 schema。它不会读取 partial/staging 文件，
+也不会替换已完成的 analysis 目录。`%1` 是有意的：全文件 validation/hash 会访问
+共享存储，串行执行避免在渲染结束后制造不受控的 I/O 峰值。
+
 ## 7. 其他科学团队输入的当前状态
 
 ### SN 团队
