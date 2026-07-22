@@ -38,6 +38,13 @@ if [[ ! -f "${ET_STAMP_MANIFEST}" ]]; then
   exit 2
 fi
 
+# shellcheck disable=SC1091
+source /cluster/apps/anaconda3/2024.02/etc/profile.d/conda.sh
+conda activate etbase-clu
+
+export ET_DATA_DIR="${ET_STAMP_DATA_ROOT}"
+export PYTHONPATH="${ET_STAMP_CODE_ROOT}/src:${ET_STAMP_PHOTSIM_ROOT}:${ET_STAMP_ET_COORD_ROOT}/src:${PYTHONPATH:-}"
+
 read -r SOURCE_ID TARGET_COUNT <<<"$(
   python - "${ET_STAMP_MANIFEST}" "${ARRAY_INDEX}" <<'PY'
 import json
@@ -65,13 +72,6 @@ PY
 
 RUN_ROOT="$(cd "$(dirname "${ET_STAMP_MANIFEST}")" && pwd -P)"
 OUTPUT_DIR="${RUN_ROOT}/analysis/source_${SOURCE_ID}/injected/coadd_60s"
-
-# shellcheck disable=SC1091
-source /cluster/apps/anaconda3/2024.02/etc/profile.d/conda.sh
-conda activate etbase-clu
-
-export ET_DATA_DIR="${ET_STAMP_DATA_ROOT}"
-export PYTHONPATH="${ET_STAMP_CODE_ROOT}/src:${ET_STAMP_PHOTSIM_ROOT}:${ET_STAMP_ET_COORD_ROOT}/src:${PYTHONPATH:-}"
 
 echo "job_id=${SLURM_JOB_ID:-unknown} host=$(hostname)"
 echo "array_index=${ARRAY_INDEX} source_id=${SOURCE_ID} target_count=${TARGET_COUNT} case=injected cadence_seconds=60"

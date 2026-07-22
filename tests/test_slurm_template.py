@@ -81,6 +81,9 @@ def test_galaxy_standard_analysis_array_launcher_is_serial_and_manifest_driven()
     assert "#SBATCH --array=0-9%1" in script
     assert "#SBATCH --gres=" not in script
     assert 'ARRAY_INDEX="${SLURM_ARRAY_TASK_ID:?This launcher must be submitted as an array job}"' in script
+    assert script.index("conda activate etbase-clu") < script.index(
+        'python - "${ET_STAMP_MANIFEST}" "${ARRAY_INDEX}"'
+    )
     assert "if len(targets) != 10:" in script
     assert "source_id = int(targets[array_index][\"source_id_int64\"])" in script
     assert 'python -m et_mainsim.standard_stamp_analysis' in script
