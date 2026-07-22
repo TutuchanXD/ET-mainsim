@@ -12,6 +12,7 @@ authors = [{name = "ET simulation maintainers"}]
 dependencies = [
   "astropy>=6",
   "et-coord>=0.1.1,<0.2",
+  "h5py>=3.15,<4",
   "numpy>=1.26",
   "photsim7>=0.2.3,<0.3",
 ]
