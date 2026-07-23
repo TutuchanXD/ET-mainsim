@@ -29,14 +29,67 @@ def _write_minimal_task_manifest(tmp_path: Path) -> Path:
             {
                 "schema_id": "et_mainsim.science_stamp_production.v1",
                 "schema_version": 1,
+                "run_id": "varlc-task-list-test",
                 "production_track": "varlc",
                 "delivery": {
                     "time_plan_relative_path": "inputs/time_shards.json",
                     "time_plan_identity": file_identity(time_plan_path),
                 },
                 "targets": [
-                    {"source_id_int64": 101},
-                    {"source_id_int64": 202},
+                    {
+                        "source_id": "101",
+                        "source_id_int64": 101,
+                        "external_source_id": "source-101",
+                        "source_id_namespace": "varlc-test",
+                    },
+                    {
+                        "source_id": "202",
+                        "source_id_int64": 202,
+                        "external_source_id": "source-202",
+                        "source_id_namespace": "varlc-test",
+                    },
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def _write_minimal_galaxy_task_manifest(
+    tmp_path: Path,
+    *,
+    schema_version: int,
+) -> Path:
+    from et_mainsim.stamp_inputs import file_identity
+    from et_mainsim.time_shards import plan_continuous_time_shards
+
+    run_root = tmp_path / f"galaxy-v{schema_version}"
+    time_plan = plan_continuous_time_shards(
+        raw_start_index=0,
+        raw_stop_index=6,
+        coadd_sizes=(3,),
+        raw_exposure_seconds=10.0,
+        max_raw_frames_per_shard=3,
+    )
+    time_plan_path = time_plan.write_manifest(run_root / "inputs/time_shards.json")
+    manifest_path = run_root / "production_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_id": "et_mainsim.galaxy_stamp_production.v1",
+                "schema_version": schema_version,
+                "run_id": f"galaxy-independent-v{schema_version}",
+                "delivery": {
+                    "time_plan_relative_path": "inputs/time_shards.json",
+                    "time_plan_identity": file_identity(time_plan_path),
+                },
+                "targets": [
+                    {
+                        "source_id": "2104827888243104128",
+                        "source_id_int64": 2104827888243104128,
+                    }
                 ],
             },
             sort_keys=True,
@@ -85,6 +138,86 @@ def test_write_science_task_list_binds_exact_manifest_case_and_selection(
         "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
         "size_bytes": output_path.stat().st_size,
     }
+
+
+@pytest.mark.parametrize("schema_version", (2, 3))
+def test_write_science_task_list_supports_bound_galaxy_production_manifests(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    from et_mainsim.science_stamp_production import (
+        write_science_stamp_task_list,
+    )
+
+    manifest_path = _write_minimal_galaxy_task_manifest(
+        tmp_path,
+        schema_version=schema_version,
+    )
+    output_path = tmp_path / f"galaxy-v{schema_version}-static.json"
+
+    result = write_science_stamp_task_list(
+        manifest_path,
+        case="static",
+        tasks=((2104827888243104128, 0),),
+        output_path=output_path,
+    )
+
+    manifest_raw = manifest_path.read_bytes()
+    assert json.loads(output_path.read_text(encoding="utf-8")) == {
+        "schema_id": "et_mainsim.science_stamp_task_list.v1",
+        "schema_version": 1,
+        "case": "static",
+        "production_manifest_identity": {
+            "sha256": hashlib.sha256(manifest_raw).hexdigest(),
+            "size_bytes": len(manifest_raw),
+        },
+        "tasks": [
+            {"source_id": 2104827888243104128, "shard_id": 0},
+        ],
+    }
+    assert result.task_count == 1
+
+
+def test_write_science_task_list_rejects_incomplete_namespaced_identity(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.science_stamp_production import (
+        write_science_stamp_task_list,
+    )
+
+    manifest_path = _write_minimal_task_manifest(tmp_path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del payload["targets"][0]["source_id_namespace"]
+    manifest_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="namespaced source identity"):
+        write_science_stamp_task_list(
+            manifest_path,
+            case="static",
+            tasks=((101, 0),),
+            output_path=tmp_path / "tasks.json",
+        )
+
+
+def test_write_science_task_list_rejects_boolean_manifest_version(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.science_stamp_production import (
+        write_science_stamp_task_list,
+    )
+
+    manifest_path = _write_minimal_task_manifest(tmp_path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = True
+    manifest_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported science stamp production"):
+        write_science_stamp_task_list(
+            manifest_path,
+            case="static",
+            tasks=((101, 0),),
+            output_path=tmp_path / "tasks.json",
+        )
 
 
 @pytest.mark.parametrize(

@@ -29,6 +29,7 @@ from .galaxy_stamp_production import (
     DEFAULT_MAX_RAW_FRAMES_PER_SHARD,
     DEFAULT_RAW_EXPOSURE_SECONDS,
     DEFAULT_STAMP_SHAPE,
+    GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
     STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE,
     _atomic_json,
     _canonical_json_sha256,
@@ -69,6 +70,7 @@ SCIENCE_STAMP_PRODUCTION_SCHEMA_ID = "et_mainsim.science_stamp_production.v1"
 SCIENCE_STAMP_PRODUCTION_SCHEMA_VERSION = 1
 SCIENCE_STAMP_TASK_LIST_SCHEMA_ID = "et_mainsim.science_stamp_task_list.v1"
 SCIENCE_STAMP_TASK_LIST_SCHEMA_VERSION = 1
+_SUPPORTED_GALAXY_TASK_LIST_MANIFEST_VERSIONS = frozenset({2, 3})
 SCIENCE_PRODUCTION_TRACKS = ("aster", "varlc", "wdlc")
 REFERENCE_DETECTOR_ID = "main_rd"
 REFERENCE_PSF_ID = 6
@@ -338,17 +340,31 @@ def write_science_stamp_task_list(
         raise ValueError("science production manifest is not valid JSON") from error
     if not isinstance(manifest, dict):
         raise ValueError("science production manifest must be an object")
-    if (
-        manifest.get("schema_id") != SCIENCE_STAMP_PRODUCTION_SCHEMA_ID
-        or isinstance(manifest.get("schema_version"), bool)
-        or manifest.get("schema_version") != SCIENCE_STAMP_PRODUCTION_SCHEMA_VERSION
-    ):
+    schema_id = manifest.get("schema_id")
+    schema_version = manifest.get("schema_version")
+    is_science_manifest = (
+        schema_id == SCIENCE_STAMP_PRODUCTION_SCHEMA_ID
+        and type(schema_version) is int
+        and schema_version == SCIENCE_STAMP_PRODUCTION_SCHEMA_VERSION
+    )
+    is_galaxy_manifest = (
+        schema_id == GALAXY_STAMP_PRODUCTION_SCHEMA_ID
+        and type(schema_version) is int
+        and schema_version in _SUPPORTED_GALAXY_TASK_LIST_MANIFEST_VERSIONS
+    )
+    if not is_science_manifest and not is_galaxy_manifest:
         raise ValueError("unsupported science stamp production manifest")
+    run_id = manifest.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("production manifest run_id must be non-empty")
+    if is_science_manifest:
+        _normalise_track(manifest.get("production_track"))
 
     target_entries = manifest.get("targets")
     if not isinstance(target_entries, list) or not target_entries:
         raise ValueError("production manifest has no formal targets")
     source_ids: set[int] = set()
+    namespaced_source_ids: set[tuple[str, str]] = set()
     for index, target in enumerate(target_entries):
         if not isinstance(target, Mapping):
             raise ValueError(f"target {index} must be an object")
@@ -358,6 +374,28 @@ def write_science_stamp_task_list(
         )
         if source_id in source_ids:
             raise ValueError("production manifest contains duplicate source identities")
+        if target.get("source_id") != str(source_id):
+            raise ValueError(
+                f"target {index} source_id differs from source_id_int64"
+            )
+        if is_science_manifest:
+            namespace = target.get("source_id_namespace")
+            external_source_id = target.get("external_source_id")
+            if (
+                not isinstance(namespace, str)
+                or not namespace.strip()
+                or not isinstance(external_source_id, str)
+                or not external_source_id.strip()
+            ):
+                raise ValueError(
+                    f"target {index} lacks a complete namespaced source identity"
+                )
+            namespaced_identity = (namespace, external_source_id)
+            if namespaced_identity in namespaced_source_ids:
+                raise ValueError(
+                    "production manifest contains duplicate namespaced source identities"
+                )
+            namespaced_source_ids.add(namespaced_identity)
         source_ids.add(source_id)
 
     time_plan = _load_time_plan(resolved_manifest.parent, manifest)
