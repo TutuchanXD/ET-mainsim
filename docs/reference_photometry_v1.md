@@ -5,6 +5,15 @@ formal stamp-delivery HDF5 bundles.  It is deliberately conservative:
 the only detector observation is `final_dn`; every electron-domain quantity
 emitted by this reducer is a calibration-derived analysis product.
 
+> **Scope boundary.** This document describes the reusable fixed-aperture
+> reduction primitive and its API. It is not by itself the current Galaxy
+> formal science-delivery decision path. Galaxy raw 10 s delivery must proceed
+> through campaign QC, `raw_10s_strict`, `raw_10s_coverage_v2`, and the
+> immutable ten-source summary; see
+> [Galaxy raw-coverage science delivery](galaxy_raw_coverage_science_delivery_zh.md).
+> In particular, the historical 60 s CLI example below is not the authoritative
+> v3 coverage-aware product.
+
 ## Required bundle contract
 
 The selected HDF5 group (the root by default) must contain these datasets.
