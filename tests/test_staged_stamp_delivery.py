@@ -59,11 +59,17 @@ def _make_staged_shard(tmp_path):
         json.dumps(
             {
                 "run_id": "staged-fixture",
-                "delivery": {"time_plan_relative_path": "inputs/time_shards.json"},
+                "delivery": {
+                    "execution_mode": "staged_local_scratch_v1",
+                    "time_plan_relative_path": "inputs/time_shards.json",
+                },
             }
         ),
         encoding="utf-8",
     )
+    from et_mainsim.stamp_inputs import file_identity
+
+    production_manifest_identity = file_identity(production_manifest)
     request = IndependentStampShardRequest(
         output_root=staged_case_root,
         target_source_id=42,
@@ -74,6 +80,10 @@ def _make_staged_shard(tmp_path):
             "run_id": "staged-fixture",
             "case": "injected",
             "galaxy_production_manifest": str(production_manifest.resolve()),
+            "galaxy_production_manifest_identity": {
+                "sha256": production_manifest_identity["sha256"],
+                "size_bytes": production_manifest_identity["size_bytes"],
+            },
         },
         provenance={"code": "test"},
         batch_size=2,
@@ -94,7 +104,7 @@ def test_publish_staged_shard_copies_verifies_and_atomically_publishes(tmp_path)
     from et_mainsim.stamp_delivery import read_stamp_delivery_bundle
 
     production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
-    formal_case_root = tmp_path / "formal" / "cases" / "injected"
+    formal_case_root = production_manifest.parent / "cases" / "injected"
 
     result = publish_staged_independent_stamp_shard(
         StagedStampShardPublishRequest(
@@ -128,7 +138,7 @@ def test_publish_staged_shard_refuses_existing_final_without_modifying_it(tmp_pa
     )
 
     production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
-    formal_case_root = tmp_path / "formal" / "cases" / "injected"
+    formal_case_root = production_manifest.parent / "cases" / "injected"
     request = StagedStampShardPublishRequest(
         staged_case_root=staged_case_root,
         formal_case_root=formal_case_root,
@@ -156,8 +166,18 @@ def test_publish_staged_shard_rejects_a_different_production_manifest(tmp_path) 
 
     production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
     different_manifest = tmp_path / "different_manifest.json"
-    different_manifest.write_text(json.dumps({"run_id": "different"}), encoding="utf-8")
-    formal_case_root = tmp_path / "formal" / "cases" / "injected"
+    different_manifest.write_text(
+        json.dumps(
+            {
+                "run_id": "different",
+                "delivery": {
+                    "execution_mode": "staged_local_scratch_v1",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    formal_case_root = production_manifest.parent / "cases" / "injected"
 
     with pytest.raises(StagedStampShardPublishError, match="run_id"):
         publish_staged_independent_stamp_shard(
@@ -174,6 +194,106 @@ def test_publish_staged_shard_rejects_a_different_production_manifest(tmp_path) 
     assert not (formal_case_root / "stamps" / "target_42" / "delivery" / "shard_00000").exists()
 
 
+@pytest.mark.parametrize(
+    "execution_mode",
+    (None, "direct_shared_filesystem"),
+)
+def test_publish_staged_shard_rejects_nonstaged_manifest_mode(
+    tmp_path,
+    execution_mode,
+) -> None:
+    from et_mainsim.staged_stamp_delivery import (
+        StagedStampShardPublishError,
+        StagedStampShardPublishRequest,
+        publish_staged_independent_stamp_shard,
+    )
+
+    production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
+    payload = json.loads(production_manifest.read_text(encoding="utf-8"))
+    if execution_mode is None:
+        payload["delivery"].pop("execution_mode")
+    else:
+        payload["delivery"]["execution_mode"] = execution_mode
+    production_manifest.write_text(json.dumps(payload), encoding="utf-8")
+    formal_case_root = production_manifest.parent / "cases" / "injected"
+
+    with pytest.raises(StagedStampShardPublishError, match="execution_mode"):
+        publish_staged_independent_stamp_shard(
+            StagedStampShardPublishRequest(
+                staged_case_root=staged_case_root,
+                formal_case_root=formal_case_root,
+                production_manifest_path=production_manifest,
+                target_source_id=42,
+                shard=shard,
+                case="injected",
+            )
+        )
+
+    assert not (
+        formal_case_root / "stamps" / "target_42" / "delivery" / "shard_00000"
+    ).exists()
+
+
+def test_publish_staged_shard_rejects_noncanonical_formal_case_root(tmp_path) -> None:
+    from et_mainsim.staged_stamp_delivery import (
+        StagedStampShardPublishError,
+        StagedStampShardPublishRequest,
+        publish_staged_independent_stamp_shard,
+    )
+
+    production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
+    canonical_case_root = production_manifest.parent / "cases" / "injected"
+    other_case_root = tmp_path / "other-run" / "cases" / "injected"
+
+    with pytest.raises(StagedStampShardPublishError, match="formal_case_root"):
+        publish_staged_independent_stamp_shard(
+            StagedStampShardPublishRequest(
+                staged_case_root=staged_case_root,
+                formal_case_root=other_case_root,
+                production_manifest_path=production_manifest,
+                target_source_id=42,
+                shard=shard,
+                case="injected",
+            )
+        )
+
+    assert not (
+        canonical_case_root / "stamps" / "target_42" / "delivery" / "shard_00000"
+    ).exists()
+
+
+def test_publish_staged_shard_rejects_changed_production_manifest_identity(
+    tmp_path,
+) -> None:
+    from et_mainsim.staged_stamp_delivery import (
+        StagedStampShardPublishError,
+        StagedStampShardPublishRequest,
+        publish_staged_independent_stamp_shard,
+    )
+
+    production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
+    payload = json.loads(production_manifest.read_text(encoding="utf-8"))
+    payload["post_render_revision"] = "different-content-same-path"
+    production_manifest.write_text(json.dumps(payload), encoding="utf-8")
+    formal_case_root = production_manifest.parent / "cases" / "injected"
+
+    with pytest.raises(StagedStampShardPublishError, match="content identity"):
+        publish_staged_independent_stamp_shard(
+            StagedStampShardPublishRequest(
+                staged_case_root=staged_case_root,
+                formal_case_root=formal_case_root,
+                production_manifest_path=production_manifest,
+                target_source_id=42,
+                shard=shard,
+                case="injected",
+            )
+        )
+
+    assert not (
+        formal_case_root / "stamps" / "target_42" / "delivery" / "shard_00000"
+    ).exists()
+
+
 def test_publish_staged_shard_removes_incoming_directory_when_copy_fails(
     tmp_path,
     monkeypatch,
@@ -181,7 +301,7 @@ def test_publish_staged_shard_removes_incoming_directory_when_copy_fails(
     import et_mainsim.staged_stamp_delivery as staged_delivery
 
     production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
-    formal_case_root = tmp_path / "formal" / "cases" / "injected"
+    formal_case_root = production_manifest.parent / "cases" / "injected"
     request = staged_delivery.StagedStampShardPublishRequest(
         staged_case_root=staged_case_root,
         formal_case_root=formal_case_root,
@@ -210,13 +330,50 @@ def test_publish_staged_shard_removes_incoming_directory_when_copy_fails(
     assert not list(final_parent.glob(".shard_00000.*"))
 
 
+def test_publish_staged_shard_keeps_a_qc_visible_lock_if_postrename_fsync_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.staged_stamp_delivery as staged_delivery
+
+    production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
+    formal_case_root = production_manifest.parent / "cases" / "injected"
+    request = staged_delivery.StagedStampShardPublishRequest(
+        staged_case_root=staged_case_root,
+        formal_case_root=formal_case_root,
+        production_manifest_path=production_manifest,
+        target_source_id=42,
+        shard=shard,
+        case="injected",
+    )
+    final_parent = formal_case_root / "stamps" / "target_42" / "delivery"
+    original_fsync_directory = staged_delivery._fsync_directory
+
+    def _fail_after_rename(path):
+        if path == final_parent:
+            raise OSError("synthetic post-rename directory fsync failure")
+        return original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        staged_delivery,
+        "_fsync_directory",
+        _fail_after_rename,
+    )
+
+    with pytest.raises(OSError, match="post-rename"):
+        staged_delivery.publish_staged_independent_stamp_shard(request)
+
+    assert (final_parent / "shard_00000").is_dir()
+    assert (final_parent / ".shard_00000.staged-publish.lock").is_dir()
+
+
 def test_publish_cli_resolves_the_frozen_time_shard_from_production_manifest(
     tmp_path,
 ) -> None:
     from et_mainsim.staged_stamp_delivery import main
 
     production_manifest, staged_case_root, _ = _make_staged_shard(tmp_path)
-    formal_case_root = tmp_path / "formal" / "cases" / "injected"
+    formal_case_root = production_manifest.parent / "cases" / "injected"
 
     assert (
         main(

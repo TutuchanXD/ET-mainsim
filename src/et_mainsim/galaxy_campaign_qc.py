@@ -696,10 +696,39 @@ def _unexpected_files(
             if path.resolve() not in expected_paths
         )
     )
-    partial_members = tuple(
-        sorted(str(path) for path in stamps_root.rglob("*.partial"))
-    )
-    return final_members, partial_members
+    expected_members_by_shard: dict[Path, set[str]] = {}
+    expected_shards_by_delivery_root: dict[Path, set[str]] = {}
+    for path in expected_paths:
+        shard_root = path.parent.resolve()
+        expected_members_by_shard.setdefault(shard_root, set()).add(path.name)
+        expected_shards_by_delivery_root.setdefault(shard_root.parent, set()).add(
+            shard_root.name
+        )
+
+    residuals: set[str] = set()
+    for delivery_root, expected_shard_names in expected_shards_by_delivery_root.items():
+        if not delivery_root.exists():
+            continue
+        if not delivery_root.is_dir() or delivery_root.is_symlink():
+            residuals.add(str(delivery_root))
+            continue
+        for child in delivery_root.iterdir():
+            if child.name not in expected_shard_names or child.is_symlink():
+                residuals.add(str(child))
+
+    for shard_root, expected_member_names in expected_members_by_shard.items():
+        if not shard_root.exists():
+            continue
+        if not shard_root.is_dir() or shard_root.is_symlink():
+            residuals.add(str(shard_root))
+            continue
+        for member in shard_root.iterdir():
+            if member.name not in expected_member_names or member.is_symlink():
+                residuals.add(str(member))
+
+    for pattern in ("*.partial", "*.incoming", "*.lock"):
+        residuals.update(str(path) for path in stamps_root.rglob(pattern))
+    return final_members, tuple(sorted(residuals))
 
 
 def audit_galaxy_campaign_delivery_v1(

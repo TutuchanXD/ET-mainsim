@@ -56,8 +56,15 @@ array_index = int(array_index_text)
 with open(manifest_path, encoding="utf-8") as stream:
     manifest = json.load(stream)
 targets = manifest.get("targets")
-shards = manifest.get("delivery", {}).get("time_plan_identity")
-time_plan_relative = manifest.get("delivery", {}).get("time_plan_relative_path")
+delivery = manifest.get("delivery")
+if not isinstance(delivery, dict):
+    raise SystemExit("manifest lacks delivery object")
+execution_mode = delivery.get("execution_mode", "direct_shared_filesystem")
+if execution_mode != "direct_shared_filesystem":
+    raise SystemExit(
+        "direct launcher requires delivery.execution_mode='direct_shared_filesystem'"
+    )
+time_plan_relative = delivery.get("time_plan_relative_path")
 if not isinstance(targets, list) or not isinstance(time_plan_relative, str):
     raise SystemExit("manifest lacks formal v2 target/time-plan fields")
 from pathlib import Path

@@ -26,7 +26,12 @@ from uuid import uuid4
 
 import numpy as np
 
+from .galaxy_stamp_production import (
+    STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE,
+    delivery_execution_mode_from_manifest,
+)
 from .independent_stamp_production import _read_staged_bundle_coverage
+from .stamp_inputs import file_identity
 from .time_shards import ContinuousTimeShard, ContinuousTimeShardPlan
 
 
@@ -174,6 +179,44 @@ def _load_run_id(path: Path) -> str:
     return run_id
 
 
+def _production_manifest_content_identity(path: Path) -> dict[str, Any]:
+    """Return the exact relocatable content receipt carried by scratch HDF5."""
+
+    identity = file_identity(path)
+    return {
+        "sha256": identity["sha256"],
+        "size_bytes": identity["size_bytes"],
+    }
+
+
+def _require_staged_manifest_and_canonical_formal_root(
+    request: StagedStampShardPublishRequest,
+) -> Mapping[str, Any]:
+    """Reject mixed writer modes and cross-run publication before I/O begins."""
+
+    payload = _load_production_manifest(Path(request.production_manifest_path))
+    try:
+        execution_mode = delivery_execution_mode_from_manifest(payload)
+    except ValueError as error:
+        raise StagedStampShardPublishError(
+            "production manifest delivery.execution_mode is invalid"
+        ) from error
+    if execution_mode != STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE:
+        raise StagedStampShardPublishError(
+            "staged publisher requires "
+            "delivery.execution_mode='staged_local_scratch_v1'"
+        )
+    expected_formal_case_root = (
+        Path(request.production_manifest_path).parent / "cases" / request.case
+    ).resolve()
+    if Path(request.formal_case_root).resolve() != expected_formal_case_root:
+        raise StagedStampShardPublishError(
+            "formal_case_root must equal the canonical production "
+            "manifest cases/<case> root"
+        )
+    return payload
+
+
 def _load_frozen_time_shard(
     production_manifest_path: Path,
     *,
@@ -294,6 +337,7 @@ def _validate_shard_contract(
     *,
     request: StagedStampShardPublishRequest,
     run_id: str,
+    production_manifest_identity: Mapping[str, Any],
 ) -> None:
     _require_exact_members(root, shard=request.shard)
     canonical_caller: Mapping[str, Any] | None = None
@@ -325,6 +369,15 @@ def _validate_shard_contract(
         if not isinstance(caller_manifest, str) or Path(caller_manifest).expanduser().resolve() != request.production_manifest_path:
             raise StagedStampShardPublishError(
                 f"staged delivery member {name} does not cite the canonical production manifest"
+            )
+        caller_manifest_identity = caller.get("galaxy_production_manifest_identity")
+        if (
+            not isinstance(caller_manifest_identity, Mapping)
+            or dict(caller_manifest_identity) != dict(production_manifest_identity)
+        ):
+            raise StagedStampShardPublishError(
+                f"staged delivery member {name} production manifest content identity "
+                "does not match publication input"
             )
         caller_dict = dict(caller)
         if canonical_caller is None:
@@ -364,9 +417,18 @@ def publish_staged_independent_stamp_shard(
 
     if not isinstance(request, StagedStampShardPublishRequest):
         raise TypeError("request must be a StagedStampShardPublishRequest")
+    _require_staged_manifest_and_canonical_formal_root(request)
     run_id = _load_run_id(Path(request.production_manifest_path))
+    production_manifest_identity = _production_manifest_content_identity(
+        Path(request.production_manifest_path)
+    )
     source_root = request.staged_shard_root
-    _validate_shard_contract(source_root, request=request, run_id=run_id)
+    _validate_shard_contract(
+        source_root,
+        request=request,
+        run_id=run_id,
+        production_manifest_identity=production_manifest_identity,
+    )
 
     final_root = request.final_shard_root
     parent = final_root.parent
@@ -382,6 +444,7 @@ def publish_staged_independent_stamp_shard(
         ) from error
 
     staging_root = parent / f".{final_root.name}.{uuid4().hex}.incoming"
+    published = False
     try:
         if final_root.exists() or final_root.is_symlink():
             raise FileExistsError(f"formal shard delivery already exists: {final_root}")
@@ -391,16 +454,23 @@ def publish_staged_independent_stamp_shard(
             staging_root,
             shard=request.shard,
         )
-        _validate_shard_contract(staging_root, request=request, run_id=run_id)
+        _validate_shard_contract(
+            staging_root,
+            request=request,
+            run_id=run_id,
+            production_manifest_identity=production_manifest_identity,
+        )
         _fsync_directory(staging_root)
         os.replace(staging_root, final_root)
+        published = True
         _fsync_directory(parent)
     except BaseException:
-        if staging_root.exists() or staging_root.is_symlink():
-            shutil.rmtree(staging_root)
+        if not published:
+            if staging_root.exists() or staging_root.is_symlink():
+                shutil.rmtree(staging_root)
+            lock.rmdir()
         raise
-    finally:
-        lock.rmdir()
+    lock.rmdir()
     return StagedStampShardPublishResult(
         final_shard_root=final_root,
         member_sha256=dict(identities),

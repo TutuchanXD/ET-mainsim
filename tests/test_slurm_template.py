@@ -215,6 +215,8 @@ def test_galaxy_staged_render_launcher_renders_locally_then_publishes_atomically
     assert "#SBATCH --cpus-per-task=16" in script
     assert ': "${ET_STAMP_MANIFEST:?Set ET_STAMP_MANIFEST to production_manifest.json}"' in script
     assert ': "${ET_STAMP_CODE_ROOT:?Set ET_STAMP_CODE_ROOT to the deployed ET-mainsim checkout}"' in script
+    assert "staged_local_scratch_v1" in script
+    assert "formal shard residue prevents staged production" in script
     assert 'LOCAL_CASE_ROOT="${JOB_SCRATCH}/cases/${ET_STAMP_CASE}"' in script
     assert '"${ET_STAMP_CODE_ROOT}/scripts/run_galaxy_independent_stamp_production.py" run-target' in script
     assert '--output-root "${LOCAL_CASE_ROOT}"' in script
@@ -222,3 +224,20 @@ def test_galaxy_staged_render_launcher_renders_locally_then_publishes_atomically
     assert '--staged-case-root "${LOCAL_CASE_ROOT}"' in script
     assert '--formal-case-root "${RUN_ROOT}/cases/${ET_STAMP_CASE}"' in script
     assert 'rm -rf -- "${JOB_SCRATCH}"' in script
+    assert script.index("formal shard residue prevents staged production") < script.index(
+        '"${ET_STAMP_CODE_ROOT}/scripts/run_galaxy_independent_stamp_production.py" run-target'
+    )
+
+
+def test_galaxy_direct_render_launcher_rejects_staged_manifests_before_rendering() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "galaxy_independent_stamp_slurm_array.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "direct_shared_filesystem" in script
+    assert "direct launcher requires delivery.execution_mode" in script
+    assert script.index("direct launcher requires delivery.execution_mode") < script.index(
+        '"${ET_STAMP_CODE_ROOT}/scripts/run_galaxy_independent_stamp_production.py" run-target'
+    )
