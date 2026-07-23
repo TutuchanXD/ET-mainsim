@@ -10,6 +10,7 @@ dist/
 outputs/
 results/
 cache/
+notebook/galaxy_v3_delivery/
 *.npy
 *.npz
 *.pkl

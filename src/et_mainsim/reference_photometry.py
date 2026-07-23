@@ -16,6 +16,7 @@ requires complete exposure coverage for each CDPP window.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import json
@@ -1199,6 +1200,151 @@ def _formal_identity_json(value: Mapping[str, Any], *, omit: frozenset[str]) -> 
         ) from error
 
 
+def _remove_nested_identity_location(
+    record: dict[str, Any],
+    *path: str,
+) -> None:
+    """Remove one explicitly-approved execution-location field in-place."""
+
+    if not path:
+        return
+    current: dict[str, Any] = record
+    for key in path[:-1]:
+        child = current.get(key)
+        if not isinstance(child, dict):
+            return
+        current = child
+    current.pop(path[-1], None)
+
+
+def _normalize_formal_manifest_series_caller(caller: dict[str, Any]) -> None:
+    """Project only location-only fields out of a formal manifest caller."""
+
+    # This is a resolved location of the frozen production receipt.  The
+    # campaign QC gate validates its content identity at the run root; it is
+    # intentionally not a per-shard scientific identity.
+    caller.pop("galaxy_production_manifest", None)
+    caller.pop("production_manifest", None)
+
+    for path in (
+        ("galaxy_production_manifest_identity", "path"),
+        ("production_manifest_identity", "path"),
+        ("target_input_truth", "target_table_identity", "path"),
+        (
+            "target_input_truth",
+            "variability",
+            "source_factor_snapshot",
+            "input_identity",
+            "path",
+        ),
+        (
+            "target_input_truth",
+            "variability",
+            "source_factor_snapshot_identity",
+            "path",
+        ),
+        ("target_input_truth", "psf", "bundle", "file_identity", "path"),
+        ("target_input_truth", "focalplane_registry_identity", "registry_data_dir"),
+        ("target_input_truth", "focalplane_registry_identity", "path"),
+        (
+            "target_input_truth",
+            "runtime_focalplane_registry_identity",
+            "registry_data_dir",
+        ),
+        (
+            "target_input_truth",
+            "runtime_focalplane_registry_identity",
+            "path",
+        ),
+        (
+            "target_input_truth",
+            "target_table_meta",
+            "focalplane_registry_identity",
+            "registry_data_dir",
+        ),
+        (
+            "target_input_truth",
+            "target_table_meta",
+            "focalplane_registry_identity",
+            "path",
+        ),
+    ):
+        _remove_nested_identity_location(caller, *path)
+
+
+def _normalize_formal_provenance_series_caller(caller: dict[str, Any]) -> None:
+    """Project only execution-local provenance fields out of a series caller."""
+
+    for path in (
+        ("factor_snapshot_identity", "path"),
+        ("runtime_focalplane_registry_identity", "registry_data_dir"),
+        ("runtime_focalplane_registry_identity", "path"),
+    ):
+        _remove_nested_identity_location(caller, *path)
+
+    software = caller.get("software")
+    if not isinstance(software, dict):
+        return
+
+    # Prefer Git commit plus clean/dirty state as the source identity.  An
+    # installed package may legitimately have no Git checkout; in that case
+    # its package version is the only remaining code identity and must be
+    # retained rather than projected away with execution-local disclosure.
+    software.pop("runtime", None)
+    for package in ("et_mainsim", "photsim7"):
+        record = software.get(package)
+        if isinstance(record, dict):
+            identity = {
+                key: record[key] for key in ("commit", "dirty") if key in record
+            }
+            commit = record.get("commit")
+            if commit is None or (isinstance(commit, str) and not commit.strip()):
+                version = record.get("version")
+                if not isinstance(version, str) or not version.strip():
+                    raise ReferencePhotometryContractError(
+                        f"formal delivery {package} provenance lacks both Git "
+                        "commit and package version"
+                    )
+                identity["version"] = version
+            software[package] = identity
+
+
+def _formal_series_identity_json(
+    value: Mapping[str, Any],
+    *,
+    caller_key: str,
+    omit_top_level_time_shard: bool,
+) -> str:
+    """Canonicalize a series identity while retaining its physical RNG contract.
+
+    Each formal HDF5 records the selected time shard both as a top-level
+    manifest field and inside its physical-RNG trace.  Those locations differ
+    by design across continuous shards: they identify *where* a bundle lives
+    in the raw-frame timeline, not the seed/scope/configuration of its random
+    field.  Formal production can also split shards between a local worker and
+    a cluster worker; approved projections remove only resolved locations and
+    runtime disclosure while retaining all content hashes, physics settings,
+    PSF/registry semantics, RNG seed/scope/target spec, and source commits.
+    """
+
+    candidate = copy.deepcopy(dict(value))
+    if omit_top_level_time_shard:
+        candidate.pop("time_shard", None)
+    caller = candidate.get(caller_key)
+    if isinstance(caller, dict):
+        pairing = caller.get("physical_rng_pairing")
+        if isinstance(pairing, dict):
+            pairing.pop("selected_time_shard", None)
+            absolute_index = pairing.get("absolute_raw_frame_index")
+            if isinstance(absolute_index, dict):
+                absolute_index.pop("selected_shard_absolute_frame_interval", None)
+        if caller_key == "caller_manifest":
+            _normalize_formal_manifest_series_caller(caller)
+        elif caller_key == "caller_provenance":
+            _normalize_formal_provenance_series_caller(caller)
+    return _formal_identity_json(candidate, omit=frozenset())
+
+
 def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
     """Read only header/small vectors; never materialize delivery image cubes."""
 
@@ -1356,8 +1502,16 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
         stamp_shape=(ny, nx),
         gain_mode=gain_mode,
         static_gain_e_per_dn=static_gain,
-        manifest_identity=_formal_identity_json(manifest, omit=frozenset({"time_shard"})),
-        provenance_identity=_formal_identity_json(provenance, omit=frozenset()),
+        manifest_identity=_formal_series_identity_json(
+            manifest,
+            caller_key="caller_manifest",
+            omit_top_level_time_shard=True,
+        ),
+        provenance_identity=_formal_series_identity_json(
+            provenance,
+            caller_key="caller_provenance",
+            omit_top_level_time_shard=False,
+        ),
         first_raw_frame_start=int(raw_start[0]),
         last_raw_frame_stop=int(raw_stop[-1]),
         first_time_start_seconds=float(starts[0]),
