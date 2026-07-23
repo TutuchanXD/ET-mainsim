@@ -173,3 +173,31 @@ def test_galaxy_campaign_qc_slurm_launcher_is_a_fail_closed_analysis_gate() -> N
         'OUTPUT_JSON="${RUN_ROOT}/quality_control/injected_campaign_delivery_qc.json"'
         in script
     )
+
+
+def test_galaxy_raw_coverage_campaign_summary_launcher_is_policy_gated() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "galaxy_raw_coverage_campaign_summary_slurm.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "#SBATCH --partition=cpu" in script
+    assert "#SBATCH --cpus-per-task=4" in script
+    assert "#SBATCH --mem=16G" in script
+    assert "#SBATCH --time=04:00:00" in script
+    assert "#SBATCH --array=" not in script
+    assert "#SBATCH --gres=" not in script
+    assert (
+        ': "${ET_STAMP_COVERAGE_POLICY_JSON:?Set ET_STAMP_COVERAGE_POLICY_JSON'
+        in script
+    )
+    assert "afterok:<coverage-array-job-id>" in script
+    assert "python -m et_mainsim.raw_coverage_campaign_summary" in script
+    assert '--campaign-qc "${ET_STAMP_CAMPAIGN_QC_JSON}"' in script
+    assert '--coverage-policy "${ET_STAMP_COVERAGE_POLICY_JSON}"' in script
+    assert (
+        'OUTPUT_DIR="${RUN_ROOT}/analysis/campaign/injected/raw_10s_coverage_v2_summary"'
+        in script
+    )
+    assert "--overwrite" not in script
