@@ -402,6 +402,134 @@ def test_publish_api_checks_time_plan_identity_before_parsing_it(tmp_path) -> No
     ).exists()
 
 
+def test_frozen_time_shard_uses_one_plan_byte_snapshot(tmp_path, monkeypatch) -> None:
+    import et_mainsim.staged_stamp_delivery as staged_delivery
+    from et_mainsim.time_shards import ContinuousTimeShard, ContinuousTimeShardPlan
+
+    production_manifest, _, shard = _make_staged_shard(tmp_path)
+    time_plan_path = production_manifest.parent / "inputs" / "time_shards.json"
+    original_time_plan_bytes = time_plan_path.read_bytes()
+    replacement_plan = ContinuousTimeShardPlan(
+        raw_start_index=18,
+        raw_stop_index=24,
+        accepted_raw_start_index=18,
+        accepted_raw_stop_index=24,
+        coadd_sizes=(3, 6),
+        raw_exposure_seconds=10.0,
+        max_raw_frames_per_shard=6,
+        shards=(
+            ContinuousTimeShard(
+                shard_id=0,
+                raw_start_index=18,
+                raw_stop_index=24,
+                coadd_sizes=(3, 6),
+                raw_exposure_seconds=10.0,
+            ),
+        ),
+    )
+    replacement_path = replacement_plan.write_manifest(tmp_path / "replacement.json")
+    replacement_time_plan_bytes = replacement_path.read_bytes()
+
+    def _return_snapshot_then_replace(path, *, label):
+        source = Path(path)
+        if source == time_plan_path:
+            time_plan_path.write_bytes(replacement_time_plan_bytes)
+            return original_time_plan_bytes
+        return source.read_bytes()
+
+    monkeypatch.setattr(
+        staged_delivery,
+        "_read_frozen_file_bytes",
+        _return_snapshot_then_replace,
+    )
+
+    assert staged_delivery._load_frozen_time_shard(
+        production_manifest,
+        shard_id=0,
+    ) == shard
+
+
+def test_publish_rejects_frozen_input_drift_after_copy_before_rename(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.staged_stamp_delivery as staged_delivery
+
+    production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
+    formal_case_root = production_manifest.parent / "cases" / "injected"
+    request = staged_delivery.StagedStampShardPublishRequest(
+        staged_case_root=staged_case_root,
+        formal_case_root=formal_case_root,
+        production_manifest_path=production_manifest,
+        target_source_id=42,
+        shard=shard,
+        case="injected",
+    )
+    time_plan_path = production_manifest.parent / "inputs" / "time_shards.json"
+    original_copy = staged_delivery._copy_members_and_verify
+
+    def _copy_then_drift(source_root, destination_root, *, shard):
+        result = original_copy(source_root, destination_root, shard=shard)
+        time_plan_path.write_bytes(time_plan_path.read_bytes() + b"\n")
+        return result
+
+    monkeypatch.setattr(
+        staged_delivery,
+        "_copy_members_and_verify",
+        _copy_then_drift,
+    )
+
+    with pytest.raises(
+        staged_delivery.StagedStampShardPublishError,
+        match="frozen publication inputs changed before formal publication",
+    ):
+        staged_delivery.publish_staged_independent_stamp_shard(request)
+
+    final_parent = formal_case_root / "stamps" / "target_42" / "delivery"
+    assert not (final_parent / "shard_00000").exists()
+    assert not list(final_parent.glob(".shard_00000.*"))
+
+
+def test_publish_rejects_frozen_manifest_drift_after_copy_before_rename(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.staged_stamp_delivery as staged_delivery
+
+    production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
+    formal_case_root = production_manifest.parent / "cases" / "injected"
+    request = staged_delivery.StagedStampShardPublishRequest(
+        staged_case_root=staged_case_root,
+        formal_case_root=formal_case_root,
+        production_manifest_path=production_manifest,
+        target_source_id=42,
+        shard=shard,
+        case="injected",
+    )
+    original_copy = staged_delivery._copy_members_and_verify
+
+    def _copy_then_drift(source_root, destination_root, *, shard):
+        result = original_copy(source_root, destination_root, shard=shard)
+        production_manifest.write_bytes(production_manifest.read_bytes() + b"\n")
+        return result
+
+    monkeypatch.setattr(
+        staged_delivery,
+        "_copy_members_and_verify",
+        _copy_then_drift,
+    )
+
+    with pytest.raises(
+        staged_delivery.StagedStampShardPublishError,
+        match="frozen publication inputs changed before formal publication",
+    ):
+        staged_delivery.publish_staged_independent_stamp_shard(request)
+
+    final_parent = formal_case_root / "stamps" / "target_42" / "delivery"
+    assert not (final_parent / "shard_00000").exists()
+    assert not list(final_parent.glob(".shard_00000.*"))
+
+
 def test_publish_staged_shard_removes_incoming_directory_when_copy_fails(
     tmp_path,
     monkeypatch,
@@ -505,6 +633,7 @@ def test_publish_staged_shard_tolerates_unsupported_parent_directory_fsync(
     result = staged_delivery.publish_staged_independent_stamp_shard(request)
 
     assert result.final_shard_root.is_dir()
+    assert result.parent_directory_fsync == "unsupported"
     assert not (final_parent / ".shard_00000.staged-publish.lock").exists()
 
 

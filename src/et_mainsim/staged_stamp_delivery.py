@@ -32,7 +32,6 @@ from .galaxy_stamp_production import (
     delivery_execution_mode_from_manifest,
 )
 from .independent_stamp_production import _read_staged_bundle_coverage
-from .stamp_inputs import file_identity
 from .time_shards import ContinuousTimeShard, ContinuousTimeShardPlan
 
 
@@ -89,24 +88,21 @@ def _fsync_file(path: Path) -> None:
         os.close(descriptor)
 
 
-def _fsync_directory(path: Path) -> None:
+def _fsync_directory(path: Path) -> bool:
     """Persist a rename, tolerating only filesystems without directory fsync."""
 
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        if error.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
-            return
-        raise
+    descriptor = os.open(path, flags)
     try:
         try:
             os.fsync(descriptor)
         except OSError as error:
-            if error.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
-                raise
+            if error.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+                return False
+            raise
     finally:
         os.close(descriptor)
+    return True
 
 
 @dataclass(frozen=True)
@@ -167,6 +163,25 @@ class StagedStampShardPublishResult:
 
     final_shard_root: Path
     member_sha256: Mapping[str, str]
+    parent_directory_fsync: str
+
+
+@dataclass(frozen=True)
+class _FrozenProductionManifest:
+    """One immutable production-manifest byte snapshot for a publication."""
+
+    path: Path
+    payload: Mapping[str, Any]
+    content_identity: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _FrozenTimeShard:
+    """One immutable time-plan byte snapshot and the selected canonical shard."""
+
+    path: Path
+    content_identity: Mapping[str, Any]
+    shard: ContinuousTimeShard
 
 
 def _expected_members(shard: ContinuousTimeShard) -> tuple[tuple[str, str, int], ...]:
@@ -179,37 +194,52 @@ def _expected_members(shard: ContinuousTimeShard) -> tuple[tuple[str, str, int],
     )
 
 
-def _load_production_manifest(path: Path) -> Mapping[str, Any]:
+def _content_identity_from_bytes(raw_bytes: bytes) -> dict[str, Any]:
+    """Return the portable file-content receipt for one exact byte snapshot."""
+
+    return {
+        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "size_bytes": len(raw_bytes),
+    }
+
+
+def _read_frozen_file_bytes(path: Path, *, label: str) -> bytes:
+    """Read one file once, so parsing and hashing share the same bytes."""
+
     try:
-        with path.open(encoding="utf-8") as stream:
-            payload = json.load(stream)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        return path.read_bytes()
+    except OSError as error:
+        raise StagedStampShardPublishError(f"cannot read {label}") from error
+
+
+def _json_object_from_bytes(raw_bytes: bytes, *, label: str) -> Mapping[str, Any]:
+    try:
+        payload = json.loads(raw_bytes)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise StagedStampShardPublishError(
-            "production_manifest_path must contain a JSON object"
+            f"{label} must contain a JSON object"
         ) from error
     if not isinstance(payload, Mapping):
         raise StagedStampShardPublishError(
-            "production_manifest_path must contain a JSON object"
+            f"{label} must contain a JSON object"
         )
     return payload
 
 
-def _load_run_id(path: Path) -> str:
-    payload = _load_production_manifest(path)
+def _freeze_production_manifest(path: Path) -> _FrozenProductionManifest:
+    raw_bytes = _read_frozen_file_bytes(path, label="production manifest")
+    return _FrozenProductionManifest(
+        path=path,
+        payload=_json_object_from_bytes(raw_bytes, label="production_manifest_path"),
+        content_identity=_content_identity_from_bytes(raw_bytes),
+    )
+
+
+def _run_id_from_manifest(payload: Mapping[str, Any]) -> str:
     run_id = payload.get("run_id")
     if not isinstance(run_id, str) or not run_id.strip():
         raise StagedStampShardPublishError("production manifest has no non-empty run_id")
     return run_id
-
-
-def _production_manifest_content_identity(path: Path) -> dict[str, Any]:
-    """Return the exact relocatable content receipt carried by scratch HDF5."""
-
-    identity = file_identity(path)
-    return {
-        "sha256": identity["sha256"],
-        "size_bytes": identity["size_bytes"],
-    }
 
 
 def _same_file_content_identity(
@@ -226,13 +256,13 @@ def _same_file_content_identity(
 
 def _require_staged_manifest_and_canonical_formal_root(
     request: StagedStampShardPublishRequest,
-) -> Mapping[str, Any]:
+    payload: Mapping[str, Any],
+) -> None:
     """Reject mixed writer modes and cross-run publication before I/O begins."""
 
-    payload = _load_production_manifest(Path(request.production_manifest_path))
     try:
         execution_mode = delivery_execution_mode_from_manifest(payload)
-    except ValueError as error:
+    except (TypeError, ValueError) as error:
         raise StagedStampShardPublishError(
             "production manifest delivery.execution_mode is invalid"
         ) from error
@@ -249,15 +279,16 @@ def _require_staged_manifest_and_canonical_formal_root(
             "formal_case_root must equal the canonical production "
             "manifest cases/<case> root"
         )
-    return payload
 
 
-def _load_frozen_time_shard(
+def _frozen_time_shard_from_manifest(
     production_manifest_path: Path,
+    payload: Mapping[str, Any],
     *,
     shard_id: int,
-) -> ContinuousTimeShard:
-    payload = _load_production_manifest(production_manifest_path)
+) -> _FrozenTimeShard:
+    """Load one canonical shard from a single identity-checked plan snapshot."""
+
     delivery = payload.get("delivery")
     if not isinstance(delivery, Mapping):
         raise StagedStampShardPublishError(
@@ -276,13 +307,12 @@ def _load_frozen_time_shard(
         raise StagedStampShardPublishError(
             "production time-shard plan must stay below the production manifest root"
         ) from error
+    time_plan_bytes = _read_frozen_file_bytes(
+        time_plan_path,
+        label="the frozen production time-shard plan",
+    )
+    actual_identity = _content_identity_from_bytes(time_plan_bytes)
     expected_identity = delivery.get("time_plan_identity")
-    try:
-        actual_identity = file_identity(time_plan_path)
-    except OSError as error:
-        raise StagedStampShardPublishError(
-            "cannot read the frozen production time-shard plan"
-        ) from error
     if not isinstance(expected_identity, Mapping) or not _same_file_content_identity(
         actual_identity, expected_identity
     ):
@@ -290,21 +320,70 @@ def _load_frozen_time_shard(
             "time shard plan identity changed after production preparation"
         )
     try:
-        with time_plan_path.open(encoding="utf-8") as stream:
-            time_plan_payload = json.load(stream)
-        if not isinstance(time_plan_payload, Mapping):
-            raise ValueError("time plan is not an object")
-        plan = ContinuousTimeShardPlan.from_manifest_dict(time_plan_payload)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        plan = ContinuousTimeShardPlan.from_manifest_dict(
+            _json_object_from_bytes(time_plan_bytes, label="frozen production time-shard plan")
+        )
+    except (TypeError, ValueError) as error:
         raise StagedStampShardPublishError(
             "cannot read the frozen production time-shard plan"
         ) from error
     for shard in plan.shards:
         if shard.shard_id == _strict_source_id(shard_id):
-            return shard
+            return _FrozenTimeShard(
+                path=time_plan_path,
+                content_identity=actual_identity,
+                shard=shard,
+            )
     raise StagedStampShardPublishError(
         f"production time-shard plan has no shard_id={int(shard_id)}"
     )
+
+
+def _load_frozen_time_shard(
+    production_manifest_path: Path,
+    *,
+    shard_id: int,
+) -> ContinuousTimeShard:
+    frozen_manifest = _freeze_production_manifest(production_manifest_path)
+    return _frozen_time_shard_from_manifest(
+        production_manifest_path,
+        frozen_manifest.payload,
+        shard_id=shard_id,
+    ).shard
+
+
+def _require_frozen_inputs_unchanged(
+    *,
+    frozen_manifest: _FrozenProductionManifest,
+    frozen_time_shard: _FrozenTimeShard,
+) -> None:
+    """Reject a mutable input drift before making a formal shard visible."""
+
+    current_manifest_identity = _content_identity_from_bytes(
+        _read_frozen_file_bytes(
+            frozen_manifest.path,
+            label="production manifest",
+        )
+    )
+    current_time_plan_identity = _content_identity_from_bytes(
+        _read_frozen_file_bytes(
+            frozen_time_shard.path,
+            label="the frozen production time-shard plan",
+        )
+    )
+    if not (
+        _same_file_content_identity(
+            current_manifest_identity,
+            frozen_manifest.content_identity,
+        )
+        and _same_file_content_identity(
+            current_time_plan_identity,
+            frozen_time_shard.content_identity,
+        )
+    ):
+        raise StagedStampShardPublishError(
+            "frozen publication inputs changed before formal publication"
+        )
 
 
 def _require_exact_members(root: Path, *, shard: ContinuousTimeShard) -> None:
@@ -465,19 +544,23 @@ def publish_staged_independent_stamp_shard(
 
     if not isinstance(request, StagedStampShardPublishRequest):
         raise TypeError("request must be a StagedStampShardPublishRequest")
-    _require_staged_manifest_and_canonical_formal_root(request)
-    frozen_shard = _load_frozen_time_shard(
-        Path(request.production_manifest_path),
+    production_manifest_path = Path(request.production_manifest_path)
+    frozen_manifest = _freeze_production_manifest(production_manifest_path)
+    _require_staged_manifest_and_canonical_formal_root(
+        request,
+        frozen_manifest.payload,
+    )
+    frozen_time_shard = _frozen_time_shard_from_manifest(
+        production_manifest_path,
+        frozen_manifest.payload,
         shard_id=request.shard.shard_id,
     )
-    if request.shard != frozen_shard:
+    if request.shard != frozen_time_shard.shard:
         raise StagedStampShardPublishError(
             "request shard does not match the frozen production time-shard plan"
         )
-    run_id = _load_run_id(Path(request.production_manifest_path))
-    production_manifest_identity = _production_manifest_content_identity(
-        Path(request.production_manifest_path)
-    )
+    run_id = _run_id_from_manifest(frozen_manifest.payload)
+    production_manifest_identity = frozen_manifest.content_identity
     source_root = request.staged_shard_root
     _validate_shard_contract(
         source_root,
@@ -517,9 +600,15 @@ def publish_staged_independent_stamp_shard(
             production_manifest_identity=production_manifest_identity,
         )
         _fsync_directory(staging_root)
+        _require_frozen_inputs_unchanged(
+            frozen_manifest=frozen_manifest,
+            frozen_time_shard=frozen_time_shard,
+        )
         os.replace(staging_root, final_root)
         published = True
-        _fsync_directory(parent)
+        parent_directory_fsync = (
+            "completed" if _fsync_directory(parent) else "unsupported"
+        )
     except BaseException:
         if not published:
             if staging_root.exists() or staging_root.is_symlink():
@@ -530,6 +619,7 @@ def publish_staged_independent_stamp_shard(
     return StagedStampShardPublishResult(
         final_shard_root=final_root,
         member_sha256=dict(identities),
+        parent_directory_fsync=parent_directory_fsync,
     )
 
 
@@ -573,6 +663,7 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "final_shard_root": str(result.final_shard_root),
                 "member_sha256": dict(result.member_sha256),
+                "parent_directory_fsync": result.parent_directory_fsync,
             },
             ensure_ascii=False,
             sort_keys=True,
