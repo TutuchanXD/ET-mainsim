@@ -431,6 +431,108 @@ def test_publish_staged_shard_never_replaces_a_racing_final_path(
     assert not list(request.final_shard_root.parent.glob(".shard_00000.*"))
 
 
+def test_atomic_publish_fails_closed_when_plain_rename_replaces_empty_directory(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.staged_stamp_delivery as staged_delivery
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    (source / "complete").write_text("payload", encoding="utf-8")
+
+    def unsupported_noreplace(_source, _destination):
+        raise OSError(errno.EINVAL, "RENAME_NOREPLACE unsupported")
+
+    monkeypatch.setattr(
+        staged_delivery,
+        "_renameat2_noreplace",
+        unsupported_noreplace,
+    )
+
+    with pytest.raises(
+        staged_delivery.StagedStampShardPublishError,
+        match="plain directory rename does not provide no-replace semantics",
+    ):
+        staged_delivery._atomic_publish_directory_noreplace(source, destination)
+
+    assert (source / "complete").read_text(encoding="utf-8") == "payload"
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".rename-noreplace-probe-*"))
+
+
+def test_atomic_publish_uses_capability_checked_plain_rename_fallback(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.staged_stamp_delivery as staged_delivery
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    (source / "complete").write_text("payload", encoding="utf-8")
+
+    monkeypatch.setattr(
+        staged_delivery,
+        "_renameat2_noreplace",
+        lambda *_args: (_ for _ in ()).throw(
+            OSError(errno.EINVAL, "RENAME_NOREPLACE unsupported")
+        ),
+    )
+    monkeypatch.setattr(
+        staged_delivery,
+        "_plain_directory_rename_is_noreplace",
+        lambda _parent: True,
+    )
+
+    staged_delivery._atomic_publish_directory_noreplace(source, destination)
+
+    assert not source.exists()
+    assert (destination / "complete").read_text(encoding="utf-8") == "payload"
+
+
+def test_atomic_plain_rename_fallback_preserves_a_racing_destination(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.staged_stamp_delivery as staged_delivery
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    (source / "source-marker").write_text("source", encoding="utf-8")
+    (destination / "owner-marker").write_text("owner", encoding="utf-8")
+    original_rename = os.rename
+
+    monkeypatch.setattr(
+        staged_delivery,
+        "_renameat2_noreplace",
+        lambda *_args: (_ for _ in ()).throw(
+            OSError(errno.EINVAL, "RENAME_NOREPLACE unsupported")
+        ),
+    )
+    monkeypatch.setattr(
+        staged_delivery,
+        "_plain_directory_rename_is_noreplace",
+        lambda _parent: True,
+    )
+
+    def beegfs_rename(source_path, destination_path):
+        if Path(destination_path) == destination:
+            raise OSError(errno.EEXIST, "destination exists")
+        return original_rename(source_path, destination_path)
+
+    monkeypatch.setattr(staged_delivery.os, "rename", beegfs_rename)
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        staged_delivery._atomic_publish_directory_noreplace(source, destination)
+
+    assert (source / "source-marker").read_text(encoding="utf-8") == "source"
+    assert (destination / "owner-marker").read_text(encoding="utf-8") == "owner"
+
+
 def test_publish_staged_shard_rejects_a_symlinked_formal_parent_component(
     tmp_path,
 ) -> None:

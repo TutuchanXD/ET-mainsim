@@ -116,14 +116,12 @@ def _fsync_directory(path: Path) -> bool:
     return True
 
 
-def _atomic_publish_directory_noreplace(source: Path, destination: Path) -> None:
-    """Atomically publish a directory while refusing every existing target."""
+def _renameat2_noreplace(source: Path, destination: Path) -> None:
+    """Invoke Linux RENAME_NOREPLACE or raise the exact operating-system error."""
 
     renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
     if renameat2 is None:
-        raise StagedStampShardPublishError(
-            "atomic no-replace directory publication is unavailable"
-        )
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable")
     renameat2.argtypes = (
         ctypes.c_int,
         ctypes.c_char_p,
@@ -144,26 +142,99 @@ def _atomic_publish_directory_noreplace(source: Path, destination: Path) -> None
     if status == 0:
         return
     error_number = ctypes.get_errno()
-    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-        raise FileExistsError(
-            error_number,
-            f"formal shard delivery already exists: {destination}",
-            str(destination),
-        )
-    if error_number in {
-        errno.EINVAL,
-        errno.ENOSYS,
-        errno.ENOTSUP,
-        errno.EOPNOTSUPP,
-    }:
-        raise StagedStampShardPublishError(
-            "filesystem does not support atomic no-replace directory publication"
-        )
     raise OSError(
         error_number,
         os.strerror(error_number),
         str(destination),
     )
+
+
+def _plain_directory_rename_is_noreplace(parent: Path) -> bool:
+    """Probe whether this filesystem rejects replacing an empty directory.
+
+    BeeGFS currently rejects a plain directory rename when *any* destination
+    directory exists, including an empty one, even though it reports EINVAL for
+    Linux ``RENAME_NOREPLACE``.  An empty directory is the only destination
+    type that ordinary local POSIX rename may replace; non-empty directories
+    and non-directory entries are already rejected.  The isolated same-parent
+    probe therefore establishes whether plain rename is a safe atomic
+    no-replace primitive on the actual publication filesystem.
+    """
+
+    token = uuid4().hex
+    probe_source = parent / f".rename-noreplace-probe-source-{token}"
+    probe_destination = parent / f".rename-noreplace-probe-destination-{token}"
+    probe_source.mkdir()
+    probe_destination.mkdir()
+    try:
+        try:
+            os.rename(probe_source, probe_destination)
+        except OSError as error:
+            return bool(
+                error.errno in {errno.EEXIST, errno.ENOTEMPTY}
+                and probe_source.is_dir()
+                and not probe_source.is_symlink()
+                and probe_destination.is_dir()
+                and not probe_destination.is_symlink()
+            )
+        return False
+    finally:
+        if probe_source.is_dir() and not probe_source.is_symlink():
+            probe_source.rmdir()
+        if probe_destination.is_dir() and not probe_destination.is_symlink():
+            probe_destination.rmdir()
+
+
+def _formal_destination_exists_error(
+    destination: Path,
+    error: OSError,
+) -> FileExistsError:
+    return FileExistsError(
+        error.errno,
+        f"formal shard delivery already exists: {destination}",
+        str(destination),
+    )
+
+
+def _atomic_publish_directory_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish a directory while refusing every existing target."""
+
+    source_parent = source.parent.resolve()
+    destination_parent = destination.parent.resolve()
+    if source_parent != destination_parent:
+        raise StagedStampShardPublishError(
+            "atomic shard publication requires one shared parent directory"
+        )
+    try:
+        _renameat2_noreplace(source, destination)
+        return
+    except OSError as error:
+        if error.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise _formal_destination_exists_error(destination, error) from error
+        if error.errno not in {
+            errno.EINVAL,
+            errno.ENOSYS,
+            errno.ENOTSUP,
+            errno.EOPNOTSUPP,
+        }:
+            raise
+
+    if not _plain_directory_rename_is_noreplace(destination_parent):
+        raise StagedStampShardPublishError(
+            "filesystem lacks RENAME_NOREPLACE and plain directory rename "
+            "does not provide no-replace semantics"
+        )
+    try:
+        os.rename(source, destination)
+    except OSError as error:
+        if error.errno in {
+            errno.EEXIST,
+            errno.ENOTEMPTY,
+            errno.ENOTDIR,
+            errno.EISDIR,
+        }:
+            raise _formal_destination_exists_error(destination, error) from error
+        raise
 
 
 def _require_no_symlink_directory_components(path: Path, *, run_root: Path) -> None:
