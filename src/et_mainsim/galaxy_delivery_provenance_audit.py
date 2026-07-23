@@ -34,6 +34,15 @@ GALAXY_DELIVERY_PROVENANCE_AUDIT_SCHEMA_ID = (
 GALAXY_DELIVERY_PROVENANCE_AUDIT_SCHEMA_VERSION = 1
 _FLOAT_TOLERANCE = 1e-7
 _PACKAGES = ("et_mainsim", "photsim7")
+_REGISTRY_ATTESTATION_SCHEMA_ID = (
+    "et_coord.semantic_registry_owner_attestation_verification.v1"
+)
+_REGISTRY_ATTESTATION_TRUE_FIELDS = (
+    "semantic_content_sha256_matches",
+    "previous_candidate_identity_sha256_matches",
+    "attestation_record_sha256_matches",
+    "bundled_attestation_matches",
+)
 
 
 class GalaxyDeliveryProvenanceAuditError(ValueError):
@@ -262,6 +271,75 @@ def _validate_target_truth(
     return chosen_id, expected_node_angle
 
 
+def _registry_attestation_fingerprint(
+    value: Any, *, label: str
+) -> tuple[str, str]:
+    """Validate one runtime registry-attestation verification record.
+
+    The owner attestation deliberately uses semantic-content equality rather
+    than a cryptographic signature.  The ``cryptographic_signature_verified``
+    field is therefore disclosure-only: the verified boolean and all four
+    recorded runtime equality checks are the fail-closed contract here.
+    """
+
+    attestation = _mapping(value, label=label)
+    if attestation.get("schema_id") != _REGISTRY_ATTESTATION_SCHEMA_ID:
+        raise GalaxyDeliveryProvenanceAuditError(
+            "runtime focal-plane registry attestation has an unsupported schema"
+        )
+    if attestation.get("verified") is not True:
+        raise GalaxyDeliveryProvenanceAuditError(
+            "runtime focal-plane registry attestation must be verified"
+        )
+    for field in _REGISTRY_ATTESTATION_TRUE_FIELDS:
+        if attestation.get(field) is not True:
+            raise GalaxyDeliveryProvenanceAuditError(
+                f"runtime focal-plane registry attestation {field} must be true"
+            )
+    errors = attestation.get("errors")
+    if not isinstance(errors, list) or errors:
+        raise GalaxyDeliveryProvenanceAuditError(
+            "runtime focal-plane registry attestation must have no errors"
+        )
+    actual_semantic = _text(
+        attestation.get("actual_semantic_content_sha256"),
+        label="runtime focal-plane registry attestation actual_semantic_content_sha256",
+    )
+    attested_semantic = _text(
+        attestation.get("attested_semantic_content_sha256"),
+        label="runtime focal-plane registry attestation attested_semantic_content_sha256",
+    )
+    if actual_semantic != attested_semantic:
+        raise GalaxyDeliveryProvenanceAuditError(
+            "runtime focal-plane registry attestation semantic SHA-256 conflicts"
+        )
+    record_sha256 = _text(
+        attestation.get("calculated_attestation_record_sha256"),
+        label="runtime focal-plane registry attestation calculated_attestation_record_sha256",
+    )
+    return actual_semantic, record_sha256
+
+
+def _validate_runtime_registry_attestation(
+    truth: Mapping[str, Any], *, caller_provenance: Mapping[str, Any]
+) -> tuple[str, str]:
+    """Require matching verified registry-attestation records in both headers."""
+
+    truth_fingerprint = _registry_attestation_fingerprint(
+        truth.get("runtime_focalplane_registry_attestation_verification"),
+        label="target_input_truth.runtime_focalplane_registry_attestation_verification",
+    )
+    provenance_fingerprint = _registry_attestation_fingerprint(
+        caller_provenance.get("runtime_focalplane_registry_attestation_verification"),
+        label="caller_provenance.runtime_focalplane_registry_attestation_verification",
+    )
+    if truth_fingerprint != provenance_fingerprint:
+        raise GalaxyDeliveryProvenanceAuditError(
+            "runtime focal-plane registry attestation conflicts between delivery headers"
+        )
+    return truth_fingerprint
+
+
 def _validate_header(
     path: Path,
     *,
@@ -270,7 +348,7 @@ def _validate_header(
     run_id: str,
     case: str,
     expected_software: Mapping[str, Mapping[str, Any]],
-) -> tuple[int, float, Mapping[str, str | None]]:
+) -> tuple[int, float, Mapping[str, str | None], tuple[str, str]]:
     try:
         import h5py
     except ImportError as error:  # pragma: no cover - package guard
@@ -289,14 +367,18 @@ def _validate_header(
             raise GalaxyDeliveryProvenanceAuditError(
                 "delivery caller manifest conflicts with frozen campaign"
             )
+        truth = _mapping(caller.get("target_input_truth"), label="caller target_input_truth")
         chosen_psf_id, node_angle_deg = _validate_target_truth(
-            _mapping(caller.get("target_input_truth"), label="caller target_input_truth"),
+            truth,
             source_id=source_id,
             target=target,
         )
         provenance = _json_scalar(handle, "provenance_json")
         caller_provenance = _mapping(
             provenance.get("caller_provenance"), label="delivery caller_provenance"
+        )
+        registry_attestation = _validate_runtime_registry_attestation(
+            truth, caller_provenance=caller_provenance
         )
         _same_identity(
             caller_provenance.get("factor_snapshot_identity"),
@@ -331,7 +413,7 @@ def _validate_header(
                 )
             version = actual.get("version")
             versions[package] = version if isinstance(version, str) else None
-    return chosen_psf_id, node_angle_deg, versions
+    return chosen_psf_id, node_angle_deg, versions, registry_attestation
 
 
 @dataclass(frozen=True)
@@ -463,6 +545,9 @@ def audit_galaxy_delivery_provenance_v1(
             "invalid_bundle_count": 0,
             "chosen_psf_id": None,
             "node_angle_deg": None,
+            "runtime_registry_attestation_verified": None,
+            "runtime_registry_semantic_content_sha256": None,
+            "runtime_registry_attestation_record_sha256": None,
         }
         for source_id in source_ids
     }
@@ -480,7 +565,7 @@ def audit_galaxy_delivery_provenance_v1(
             missing.append(bundle.record())
             continue
         try:
-            chosen_psf_id, node_angle_deg, versions = _validate_header(
+            chosen_psf_id, node_angle_deg, versions, registry_attestation = _validate_header(
                 bundle.path,
                 source_id=bundle.source_id,
                 target=target_records[bundle.source_id],
@@ -499,6 +584,9 @@ def audit_galaxy_delivery_provenance_v1(
         if summary["chosen_psf_id"] is None:
             summary["chosen_psf_id"] = chosen_psf_id
             summary["node_angle_deg"] = node_angle_deg
+            summary["runtime_registry_attestation_verified"] = True
+            summary["runtime_registry_semantic_content_sha256"] = registry_attestation[0]
+            summary["runtime_registry_attestation_record_sha256"] = registry_attestation[1]
         elif (
             summary["chosen_psf_id"] != chosen_psf_id
             or not math.isclose(
@@ -511,6 +599,18 @@ def audit_galaxy_delivery_provenance_v1(
             summary["invalid_bundle_count"] += 1
             record = bundle.record()
             record["error"] = "source PSF selection is inconsistent across delivery members"
+            invalid.append(record)
+            continue
+        elif (
+            summary["runtime_registry_attestation_verified"] is not True
+            or summary["runtime_registry_semantic_content_sha256"] != registry_attestation[0]
+            or summary["runtime_registry_attestation_record_sha256"] != registry_attestation[1]
+        ):
+            summary["invalid_bundle_count"] += 1
+            record = bundle.record()
+            record["error"] = (
+                "runtime focal-plane registry attestation is inconsistent across delivery members"
+            )
             invalid.append(record)
             continue
         summary["valid_bundle_count"] += 1
