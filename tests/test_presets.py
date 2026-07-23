@@ -71,6 +71,18 @@ def test_project_requires_semantic_registry_identity_release() -> None:
     assert "et-coord>=0.1.1,<0.2" in payload["project"]["dependencies"]
 
 
+def test_project_declares_matplotlib_for_formal_analysis_figures() -> None:
+    payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "matplotlib>=3.10,<4" in payload["project"]["dependencies"]
+
+
+def test_project_declares_torch_for_formal_analysis_apertures() -> None:
+    payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "torch>=2.7,<3" in payload["project"]["dependencies"]
+
+
 def test_required_photsim7_runtime_capabilities_are_importable() -> None:
     from et_mainsim.workflows.full_frame import _science_api
 
