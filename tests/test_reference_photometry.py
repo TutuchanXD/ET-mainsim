@@ -306,8 +306,9 @@ def test_reduce_stamp_delivery_series_normalizes_shard_and_execution_local_field
         seed: int = 12345,
         target_spec_sha256: str = "stable-target-spec",
         target_table_sha256: str = "stable-target-table",
-        et_mainsim_commit: str = "stable-et-mainsim-commit",
-        et_mainsim_dirty: bool = False,
+        et_mainsim_commit: str | None = "stable-et-mainsim-commit",
+        et_mainsim_dirty: bool | None = False,
+        et_mainsim_version: str = "execution-local-version",
     ) -> None:
         trace = {
             "schema_id": "et_mainsim.galaxy_physical_rng_pairing.v1",
@@ -348,6 +349,10 @@ def test_reduce_stamp_delivery_series_normalizes_shard_and_execution_local_field
                     f"{execution_root}/results/formal-run/production_manifest.json"
                 ),
                 "galaxy_production_manifest_identity": {
+                    "path": (
+                        f"{execution_root}/results/formal-run/"
+                        "production_manifest.json"
+                    ),
                     "sha256": "stable-production-manifest",
                     "size_bytes": 123,
                 },
@@ -361,11 +366,13 @@ def test_reduce_stamp_delivery_series_normalizes_shard_and_execution_local_field
                     "target_table_meta": {
                         "focalplane_registry_identity": {
                             "registry_data_dir": f"{execution_root}/et_focalplane/data",
+                            "path": f"{execution_root}/et_focalplane/data",
                             "semantic_content_sha256": "stable-registry",
                         },
                     },
                     "focalplane_registry_identity": {
                         "registry_data_dir": f"{execution_root}/et_focalplane/data",
+                        "path": f"{execution_root}/et_focalplane/data",
                         "semantic_content_sha256": "stable-registry",
                     },
                     "variability": {
@@ -393,6 +400,7 @@ def test_reduce_stamp_delivery_series_normalizes_shard_and_execution_local_field
                     },
                     "runtime_focalplane_registry_identity": {
                         "registry_data_dir": f"{execution_root}/et_focalplane/data",
+                        "path": f"{execution_root}/et_focalplane/data",
                         "semantic_content_sha256": "stable-registry",
                     },
                 },
@@ -406,6 +414,7 @@ def test_reduce_stamp_delivery_series_normalizes_shard_and_execution_local_field
                 },
                 "runtime_focalplane_registry_identity": {
                     "registry_data_dir": f"{execution_root}/et_focalplane/data",
+                    "path": f"{execution_root}/et_focalplane/data",
                     "semantic_content_sha256": "stable-registry",
                 },
                 "software": {
@@ -414,7 +423,7 @@ def test_reduce_stamp_delivery_series_normalizes_shard_and_execution_local_field
                         "dirty": et_mainsim_dirty,
                         "root": f"{execution_root}/ET-mainsim",
                         "branch": "execution-local-branch",
-                        "version": "execution-local-version",
+                        "version": et_mainsim_version,
                     },
                     "photsim7": {
                         "commit": "stable-photsim7-commit",
@@ -498,6 +507,78 @@ def test_reduce_stamp_delivery_series_normalizes_shard_and_execution_local_field
     )
     with pytest.raises(ReferencePhotometryContractError, match="incompatible shard identities"):
         reduce_stamp_delivery_series_v1((first, changed_dirty_state), batch_frames=1)
+
+    installed_first = _write_formal_raw_bundle(
+        tmp_path, "installed-first.h5", n_frames=2, start=0
+    )
+    installed_second = _write_formal_raw_bundle(
+        tmp_path, "installed-second.h5", n_frames=2, start=2
+    )
+    attach_rng_trace(
+        installed_first,
+        shard_id=0,
+        start=0,
+        execution_root="/installed-a",
+        et_mainsim_commit=None,
+        et_mainsim_dirty=None,
+        et_mainsim_version="1.2.3",
+    )
+    attach_rng_trace(
+        installed_second,
+        shard_id=1,
+        start=2,
+        execution_root="/installed-b",
+        et_mainsim_commit=None,
+        et_mainsim_dirty=None,
+        et_mainsim_version="9.8.7",
+    )
+    with pytest.raises(
+        ReferencePhotometryContractError,
+        match="incompatible shard identities",
+    ):
+        reduce_stamp_delivery_series_v1(
+            (installed_first, installed_second),
+            batch_frames=1,
+        )
+
+    installed_same_version = _write_formal_raw_bundle(
+        tmp_path, "installed-same-version.h5", n_frames=2, start=2
+    )
+    attach_rng_trace(
+        installed_same_version,
+        shard_id=1,
+        start=2,
+        execution_root="/installed-c",
+        et_mainsim_commit=None,
+        et_mainsim_dirty=None,
+        et_mainsim_version="1.2.3",
+    )
+    result = reduce_stamp_delivery_series_v1(
+        (installed_first, installed_same_version),
+        batch_frames=1,
+    )
+    assert result.aperture_valid.tolist() == [True, True, True, True]
+
+    installed_unknown_version = _write_formal_raw_bundle(
+        tmp_path, "installed-unknown-version.h5", n_frames=2, start=2
+    )
+    attach_rng_trace(
+        installed_unknown_version,
+        shard_id=1,
+        start=2,
+        execution_root="/installed-d",
+        et_mainsim_commit=None,
+        et_mainsim_dirty=None,
+        et_mainsim_version="",
+    )
+    with pytest.raises(
+        ReferencePhotometryContractError,
+        match="lacks both Git commit and package version",
+    ):
+        reduce_stamp_delivery_series_v1(
+            (installed_first, installed_unknown_version),
+            batch_frames=1,
+        )
 
 
 def test_reduce_stamp_delivery_series_rejects_a_gap_between_shards(tmp_path) -> None:
