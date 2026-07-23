@@ -628,6 +628,7 @@ def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
         focalplane_registry=registry,
         device="cpu",
     )
+    scratch_case_root = tmp_path / "node-local-scratch" / "injected"
     production.run_galaxy_independent_target(
         manifest_path,
         source_id=303,
@@ -635,6 +636,7 @@ def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
         data_root=data_root,
         focalplane_registry=registry,
         device="cpu",
+        output_root=scratch_case_root,
     )
 
     assert [request.manifest["case"] for request in requests] == [
@@ -756,3 +758,7 @@ def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
     ] == 202
     assert requests[3].manifest["physical_rng_pairing"][
         "canonical_context_scope"]["detector_id"] == "main_ld"
+    assert requests[3].output_root == scratch_case_root
+    assert requests[3].manifest["galaxy_production_manifest"] == str(
+        manifest_path.resolve()
+    )

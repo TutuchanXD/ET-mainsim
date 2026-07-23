@@ -939,13 +939,17 @@ def run_galaxy_independent_target(
     focalplane_registry: Path | str | None = None,
     device: str | None = None,
     batch_size: int = 32,
+    output_root: Path | str | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Render one target for complete globally aligned shards without resume.
 
     A worker builds its physical services exactly once for the whole requested
     duration.  It then passes absolute raw frame indices unchanged into every
     shard callback.  Re-running an already-published target/shard is rejected
-    by the atomic delivery writer rather than silently resuming it.
+    by the atomic delivery writer rather than silently resuming it.  When
+    ``output_root`` is supplied it is a case root (for example a node-local
+    ``.../injected`` scratch directory), while the immutable production
+    manifest and all HDF5 caller-manifest provenance remain canonical.
     """
 
     source_id = _strict_source_id(source_id, name="source_id")
@@ -954,6 +958,15 @@ def run_galaxy_independent_target(
         raise ValueError("batch_size must be a positive integer")
     resolved_manifest_path, manifest = _load_manifest(manifest_path)
     run_root = resolved_manifest_path.parent
+    delivery_output_root = (
+        run_root / "cases" / case
+        if output_root is None
+        else Path(output_root).expanduser().resolve()
+    )
+    if delivery_output_root.exists() and (
+        not delivery_output_root.is_dir() or delivery_output_root.is_symlink()
+    ):
+        raise ValueError("output_root must be a directory path when it exists")
     target_record = _manifest_target(manifest, source_id)
     time_plan = _load_time_plan(run_root, manifest)
     (
@@ -1158,7 +1171,6 @@ def run_galaxy_independent_target(
         )
 
     reports: list[dict[str, Any]] = []
-    output_root = run_root / "cases" / case
     for shard in shards:
         physical_rng_pairing = _galaxy_physical_rng_pairing_metadata(
             context=context,
@@ -1167,7 +1179,7 @@ def run_galaxy_independent_target(
             target_spec_sha256=target_spec_sha256,
         )
         request = IndependentStampShardRequest(
-            output_root=output_root,
+            output_root=delivery_output_root,
             target_source_id=source_id,
             stamp_shape=run_config.workload.stamp_shape,
             shard=shard,
@@ -1177,7 +1189,7 @@ def run_galaxy_independent_target(
                 "case": case,
                 "rng_trace_scope": dict(rng_trace_scope),
                 "physical_rng_pairing": dict(physical_rng_pairing),
-                "galaxy_production_manifest": str(Path(manifest_path).resolve()),
+                "galaxy_production_manifest": str(resolved_manifest_path),
                 "target_input_truth": source_truth,
                 "simulation_spec_sha256": target_spec_sha256,
                 "renderer_options": renderer_options,
