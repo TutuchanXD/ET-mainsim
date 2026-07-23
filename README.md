@@ -33,12 +33,13 @@ catalogs, or external assets.
 
 ### Developer: continuous time-shard planning
 
-Long-duration stamp production needs globally contiguous raw-frame shards,
-rather than the current target-only worker partition. The renderer is not
-changed yet; the standalone planning API fixes the global raw index, complete
-coadd boundaries, midpoint timestamps, and tail-rejection manifest contract.
-See [continuous time-shard planning](docs/continuous_time_shards.md) for the
-10 s -> 30 s/1 min/2 min/5 min example and the minimal future scheduler hook.
+The generic `et-stamp` CLI still uses its historical target-worker model, but
+the Galaxy formal producer now implements globally contiguous raw-frame shards,
+atomic raw/coadd delivery and a frozen time-plan contract. See
+[Galaxy raw-coverage science delivery](docs/galaxy_raw_coverage_science_delivery_zh.md)
+for the operational product path, and
+[continuous time-shard planning](docs/continuous_time_shards.md) for the
+generic API and future scheduler hook.
 
 ## Quick Start
 
@@ -86,9 +87,9 @@ et-mainsim run et-stamp \
 provide ICRS/J2000 `ra_deg` plus `dec_deg` for focal-plane mapping and nearest
 radial PSF selection, or omit sky coordinates and provide an explicit
 `psf_id`. In explicit-PSF mode, optional `detector_xpix` plus
-`detector_ypix` default together to the physical detector center. The current
-documented conversion is `et_mag (AB) = gaia_g_mag (Vega)` for G2V-like
-sources.
+`detector_ypix` default together to the physical detector center. The input
+semantic is Gaia G Vega; an AB number must not be silently treated as a Gaia G
+Vega magnitude in a formal science campaign.
 
 Frame-aligned intrinsic variability is an optional second long-format table:
 

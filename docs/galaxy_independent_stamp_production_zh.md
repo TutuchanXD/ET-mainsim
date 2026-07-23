@@ -6,6 +6,13 @@
 时间轴和动态效应（温度、指向、legacy-aligned PSF breathing 等）；"independent" 绝不
 表示每个目标拥有彼此独立的物理随机场。
 
+> **正式分析路径更新。** 本文的第 1--4 节定义 Galaxy 输入、物理配置和 delivery
+> 语义。对当前 raw 10 s formal product，标准测光、coverage-aware CDPP、legacy
+> compatibility boundary 和最终放行规则以
+> [galaxy_raw_coverage_science_delivery_zh.md](galaxy_raw_coverage_science_delivery_zh.md)
+> 为唯一权威；本文后续遗留的 60 s coadd standard-analysis 命令仅为历史部署背景，
+> 不得用于新的正式 run 或最终科学交付。
+
 正式执行入口是：
 
 ```text

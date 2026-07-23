@@ -5,7 +5,8 @@
 这里的 ECSV/CSV contract 是通用 table-mode 输入。银河系团队最新的 FITS 已有一条
 单独的、正式可生产 profile：它保留输入曲线的相对节点间隔、去除绝对 epoch 后做
 10 s 曝光平均，并冻结为 `q(t)=1+DeltaF/F_ref` snapshot。其正式执行和交付语义见
-[galaxy_independent_stamp_production_zh.md](galaxy_independent_stamp_production_zh.md)。
+[galaxy_independent_stamp_production_zh.md](galaxy_independent_stamp_production_zh.md)
+与 [galaxy_raw_coverage_science_delivery_zh.md](galaxy_raw_coverage_science_delivery_zh.md)。
 
 第一版只接收 **Gaia G Vega 基准星等**与无量纲相对流量。通用 ECSV
 table-mode 要求数据提供方先把曲线转换成仿真 raw frame 序列；其物理时间不会被

@@ -87,7 +87,13 @@ shards[] = ordered, non-overlapping [start, stop) intervals
 coadd size 的完整 coadd 数。`validate_time_shard_coverage()` 显式拒绝
 gap、overlap、错误顺序、非连续 shard ID 或不同的 coadd 定义。
 
-## 与现有调度入口的最小接入点（尚未实现）
+## 与通用 `et-stamp` 调度入口的最小接入点（历史设计）
+
+> 本节描述通用 `et-stamp` CLI 仍未实现的接入工作，不描述 Galaxy 专用 formal
+> producer。Galaxy 已实现等价的连续全局 raw-frame、`final_dn` raw/coadd 和完整
+> delivery contract；其实际使用规则见
+> [galaxy_raw_coverage_science_delivery_zh.md](galaxy_raw_coverage_science_delivery_zh.md)。
+> 不要把下述历史设计状态误读为 Galaxy formal production 缺少时间 worker。
 
 后续执行层应采用下面的边界；本模块刻意不在本提交中越过这些边界。
 
@@ -109,7 +115,7 @@ gap、overlap、错误顺序、非连续 shard ID 或不同的 coadd 定义。
    hash、目标输入身份、绝对 raw 区间和产品清单。最终汇总器必须先调用
    `validate_time_shard_coverage()`，再允许将分片暴露为完整时间序列。
 
-## 当前限制
+## 当前限制（通用 API）
 
 本模块只解决调度前的确定性时间规划。它尚未：
 
