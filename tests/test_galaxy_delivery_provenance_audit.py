@@ -230,7 +230,7 @@ def test_provenance_audit_accepts_full_manifest_anchored_delivery(tmp_path: Path
     assert payload["software"]["observed_versions"]["photsim7"] == {"0.1.0": 8}
 
 
-def test_provenance_audit_rejects_one_product_with_wrong_psf_or_commit(
+def test_provenance_audit_rejects_one_product_with_wrong_psf(
     tmp_path: Path,
 ) -> None:
     from et_mainsim.galaxy_delivery_provenance_audit import (
@@ -249,9 +249,6 @@ def test_provenance_audit_rejects_one_product_with_wrong_psf_or_commit(
             "chosen_psf_id"
         ] = 0
         _write_scalar_json(handle, "manifest_json", delivery_manifest)
-        provenance = json.loads(handle["provenance_json"][()].decode())
-        provenance["caller_provenance"]["software"]["photsim7"]["commit"] = "d" * 40
-        _write_scalar_json(handle, "provenance_json", provenance)
 
     result = audit_galaxy_delivery_provenance_v1(
         GalaxyDeliveryProvenanceAuditRequest(production_manifest_path=manifest_path)
@@ -261,6 +258,45 @@ def test_provenance_audit_rejects_one_product_with_wrong_psf_or_commit(
     assert result.invalid_bundle_count == 1
     assert result.valid_bundle_count == 7
     assert "chosen_psf_id" in result.invalid_bundles[0]["error"]
+
+
+def test_provenance_audit_rejects_wrong_detector_and_software_commit(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.galaxy_delivery_provenance_audit import (
+        GalaxyDeliveryProvenanceAuditRequest,
+        audit_galaxy_delivery_provenance_v1,
+    )
+
+    manifest_path = _write_fixture_run(tmp_path)
+    wrong_detector = (
+        manifest_path.parent
+        / "cases/injected/stamps/target_41/delivery/shard_00000/raw.h5"
+    )
+    wrong_commit = (
+        manifest_path.parent
+        / "cases/injected/stamps/target_42/delivery/shard_00001/coadd_30s.h5"
+    )
+    with h5py.File(wrong_detector, "r+") as handle:
+        provenance = json.loads(handle["provenance_json"][()].decode())
+        provenance["caller_provenance"]["simulation_spec"]["detector"][
+            "detector_id"
+        ] = "main_ld"
+        _write_scalar_json(handle, "provenance_json", provenance)
+    with h5py.File(wrong_commit, "r+") as handle:
+        provenance = json.loads(handle["provenance_json"][()].decode())
+        provenance["caller_provenance"]["software"]["photsim7"]["commit"] = "d" * 40
+        _write_scalar_json(handle, "provenance_json", provenance)
+
+    result = audit_galaxy_delivery_provenance_v1(
+        GalaxyDeliveryProvenanceAuditRequest(production_manifest_path=manifest_path)
+    )
+
+    assert result.ready is False
+    assert result.invalid_bundle_count == 2
+    errors = {record["error"] for record in result.invalid_bundles}
+    assert any("detector_id" in error for error in errors)
+    assert any("photsim7.commit" in error for error in errors)
 
 
 def test_provenance_audit_cli_writes_fail_closed_receipt(tmp_path: Path) -> None:
