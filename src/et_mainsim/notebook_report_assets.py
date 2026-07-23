@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 from typing import Any
 
@@ -393,15 +394,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    result = export_executed_notebook_png_assets_v1(
-        ExecutedNotebookReportAssetRequest(
-            executed_notebook_path=args.executed_notebook,
-            report_root=args.report_root,
-            production_manifest_path=args.production_manifest,
-            asset_specs=tuple(args.asset),
-            required_markers=tuple(args.required_marker),
+    try:
+        result = export_executed_notebook_png_assets_v1(
+            ExecutedNotebookReportAssetRequest(
+                executed_notebook_path=args.executed_notebook,
+                report_root=args.report_root,
+                production_manifest_path=args.production_manifest,
+                asset_specs=tuple(args.asset),
+                required_markers=tuple(args.required_marker),
+            )
         )
-    )
+    except (NotebookReportAssetError, OSError) as error:
+        print(f"report asset export failed: {error}", file=sys.stderr)
+        return 2
     print(
         json.dumps(
             {

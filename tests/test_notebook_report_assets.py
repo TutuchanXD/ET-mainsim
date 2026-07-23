@@ -139,3 +139,31 @@ def test_refuses_a_report_root_under_the_production_root(tmp_path: Path) -> None
         export_executed_notebook_png_assets_v1(unsafe_request)
 
     assert not (unsafe_request.report_root / "assets").exists()
+
+
+def test_cli_reports_a_pending_notebook_without_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from et_mainsim.notebook_report_assets import main
+
+    request = _request(tmp_path, marker="REPORT_GATE=PENDING")
+    exit_code = main(
+        [
+            "--executed-notebook",
+            str(request.executed_notebook_path),
+            "--report-root",
+            str(request.report_root),
+            "--production-manifest",
+            str(request.production_manifest_path),
+            "--asset",
+            "first-figure=one.png",
+            "--required-marker",
+            "REPORT_GATE=READY",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "report asset export failed" in captured.err
+    assert "Traceback" not in captured.err
+    assert not (request.report_root / "assets").exists()
