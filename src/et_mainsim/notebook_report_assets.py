@@ -46,6 +46,12 @@ _RAW_COVERAGE_POLICY_SCHEMA_VERSION = 1
 _PR_ASSET_WRITE_ENV = "ET_STAMP_WRITE_PR_ASSETS"
 _PR_ASSET_PRESENTATION_DIR_ENV = "ET_STAMP_PRESENTATION_DIR"
 _FORMAL_GALAXY_TARGET_COUNT = 10
+_GALAXY_CAMPAIGN_QC_RELATIVE_PATH = Path(
+    "quality_control/injected_campaign_delivery_qc.json"
+)
+_GALAXY_PROVENANCE_AUDIT_RELATIVE_PATH = Path(
+    "quality_control/injected_campaign_provenance_psf_audit.json"
+)
 
 
 class NotebookReportAssetError(ValueError):
@@ -341,6 +347,16 @@ def _manifest_contract(manifest_path: Path) -> tuple[Mapping[str, Any], str]:
     return manifest, run_id
 
 
+def _is_formal_galaxy_manifest(manifest: Mapping[str, Any]) -> bool:
+    """Return whether the manifest is the v2 formal Galaxy delivery contract."""
+
+    return (
+        manifest.get("schema_id") == _GALAXY_MANIFEST_SCHEMA_ID
+        and manifest.get("schema_version") == _GALAXY_MANIFEST_SCHEMA_VERSION
+        and manifest.get("observation_product") == "final_dn"
+    )
+
+
 def _integer(value: Any, *, label: str, minimum: int = 0) -> int:
     if isinstance(value, bool):
         raise NotebookReportAssetError(f"{label} must be an integer")
@@ -410,6 +426,39 @@ def _relative_file_within(
     return path
 
 
+def _canonical_formal_receipt_path(
+    path: Path,
+    *,
+    run_root: Path,
+    relative_path: Path,
+    label: str,
+) -> Path:
+    """Require one known immutable receipt path beneath the formal run root."""
+
+    expected = (run_root / relative_path).resolve()
+    if not _same_or_child(expected, run_root):
+        raise NotebookReportAssetError(
+            f"canonical {label} path must remain within the formal run root"
+        )
+    if path != expected:
+        raise NotebookReportAssetError(
+            f"{label} must use canonical {label} path: {expected}"
+        )
+    return path
+
+
+def _require_receipt_run_root(
+    receipt: Mapping[str, Any], *, run_root: Path, label: str
+) -> None:
+    receipt_run_root = Path(
+        _text(receipt.get("run_root"), label=f"{label} run_root")
+    ).expanduser().resolve()
+    if receipt_run_root != run_root:
+        raise NotebookReportAssetError(
+            f"{label} run_root conflicts with the production manifest"
+        )
+
+
 def _formal_source_ids(manifest: Mapping[str, Any]) -> tuple[str, ...]:
     targets = manifest.get("targets")
     if not isinstance(targets, list) or len(targets) != _FORMAL_GALAXY_TARGET_COUNT:
@@ -470,6 +519,7 @@ def _psf_id(value: Any, *, label: str) -> str | int:
 def _validate_campaign_qc(
     qc: Mapping[str, Any],
     *,
+    run_root: Path,
     run_id: str,
     manifest_identity: Mapping[str, Any],
     time_plan_identity: Mapping[str, Any],
@@ -483,6 +533,7 @@ def _validate_campaign_qc(
         raise NotebookReportAssetError("campaign QC has an unsupported schema version")
     if qc.get("ready") is not True:
         raise NotebookReportAssetError("campaign QC is not ready")
+    _require_receipt_run_root(qc, run_root=run_root, label="campaign QC")
     if _text(qc.get("run_id"), label="campaign QC run_id") != run_id:
         raise NotebookReportAssetError("campaign QC run_id conflicts with production manifest")
     if qc.get("case") != case:
@@ -502,6 +553,7 @@ def _validate_campaign_qc(
 def _validate_provenance_audit(
     audit: Mapping[str, Any],
     *,
+    run_root: Path,
     run_id: str,
     source_ids: tuple[str, ...],
     manifest_identity: Mapping[str, Any],
@@ -515,6 +567,9 @@ def _validate_provenance_audit(
         raise NotebookReportAssetError("provenance audit has an unsupported schema version")
     if audit.get("ready") is not True:
         raise NotebookReportAssetError("provenance audit is not ready")
+    _require_receipt_run_root(
+        audit, run_root=run_root, label="provenance audit"
+    )
     if _text(audit.get("run_id"), label="provenance audit run_id") != run_id:
         raise NotebookReportAssetError(
             "provenance audit run_id conflicts with production manifest"
@@ -749,6 +804,18 @@ def validate_galaxy_notebook_readiness_v1(
     run_id = _text(manifest.get("run_id"), label="production manifest run_id")
     if run_root.name != run_id:
         raise NotebookReportAssetError("production manifest run_id must equal its run-root name")
+    _canonical_formal_receipt_path(
+        campaign_qc_path,
+        run_root=run_root,
+        relative_path=_GALAXY_CAMPAIGN_QC_RELATIVE_PATH,
+        label="campaign QC",
+    )
+    _canonical_formal_receipt_path(
+        provenance_audit_path,
+        run_root=run_root,
+        relative_path=_GALAXY_PROVENANCE_AUDIT_RELATIVE_PATH,
+        label="provenance audit",
+    )
     source_ids = _formal_source_ids(manifest)
     manifest_identity = _content_identity(
         file_identity(manifest_path), label="production manifest file"
@@ -765,6 +832,7 @@ def validate_galaxy_notebook_readiness_v1(
     campaign_qc = _read_json(campaign_qc_path, label="campaign QC")
     _validate_campaign_qc(
         campaign_qc,
+        run_root=run_root,
         run_id=run_id,
         manifest_identity=manifest_identity,
         time_plan_identity=time_plan_identity,
@@ -773,6 +841,7 @@ def validate_galaxy_notebook_readiness_v1(
     provenance_audit = _read_json(provenance_audit_path, label="provenance audit")
     _validate_provenance_audit(
         provenance_audit,
+        run_root=run_root,
         run_id=run_id,
         source_ids=source_ids,
         manifest_identity=manifest_identity,
@@ -983,7 +1052,7 @@ def export_galaxy_pr_assets_v1(
         readiness_context["frozen_coverage_policy"] = {
             "identity": dict(readiness.coverage_policy_identity),
         }
-    return export_executed_notebook_png_assets_v1(
+    return _export_executed_notebook_png_assets_v1(
         ExecutedNotebookReportAssetRequest(
             executed_notebook_path=request.executed_notebook_path,
             report_root=report_root,
@@ -991,12 +1060,32 @@ def export_galaxy_pr_assets_v1(
             asset_specs=request.asset_specs,
             required_markers=request.required_markers,
             publication_context={"galaxy_readiness": readiness_context},
-        )
+        ),
+        allow_formal_galaxy=True,
     )
 
 
 def export_executed_notebook_png_assets_v1(
     request: ExecutedNotebookReportAssetRequest,
+) -> ExecutedNotebookReportAssetResult:
+    """Publish a non-Galaxy executed-notebook report asset bundle.
+
+    The generic exporter intentionally remains available to existing report
+    workflows.  A formal Galaxy v2 delivery is different: its final figures
+    must be bound to the campaign QC and provenance receipts, so callers must
+    use :func:`export_galaxy_pr_assets_v1` instead.
+    """
+
+    return _export_executed_notebook_png_assets_v1(
+        request,
+        allow_formal_galaxy=False,
+    )
+
+
+def _export_executed_notebook_png_assets_v1(
+    request: ExecutedNotebookReportAssetRequest,
+    *,
+    allow_formal_galaxy: bool,
 ) -> ExecutedNotebookReportAssetResult:
     """Atomically publish selected PNG output cells and their receipts.
 
@@ -1023,7 +1112,11 @@ def export_executed_notebook_png_assets_v1(
     )
     if not markers:
         raise NotebookReportAssetError("at least one required readiness marker is required")
-    _manifest, run_id = _manifest_contract(manifest_path)
+    manifest, run_id = _manifest_contract(manifest_path)
+    if _is_formal_galaxy_manifest(manifest) and not allow_formal_galaxy:
+        raise NotebookReportAssetError(
+            "formal Galaxy report assets require export_galaxy_pr_assets_v1"
+        )
     publication_context = _json_mapping_copy(request.publication_context)
     notebook = _read_json(notebook_path, label="executed notebook")
     output_text = _notebook_output_text(notebook)
@@ -1126,7 +1219,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Atomically export selected PNG outputs from an executed notebook."
     )
     parser.add_argument("--executed-notebook", required=True, type=Path)
-    parser.add_argument("--report-root", required=True, type=Path)
+    parser.add_argument(
+        "--report-root",
+        type=Path,
+        help="generic-export destination; required unless Galaxy receipt inputs are supplied",
+    )
     parser.add_argument("--production-manifest", required=True, type=Path)
     parser.add_argument(
         "--asset",
@@ -1141,21 +1238,103 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="TEXT",
     )
+    parser.add_argument(
+        "--galaxy-campaign-qc",
+        "--campaign-qc",
+        dest="galaxy_campaign_qc",
+        type=Path,
+        help="formal Galaxy injected campaign-QC receipt",
+    )
+    parser.add_argument(
+        "--galaxy-provenance-audit",
+        "--provenance-audit",
+        dest="galaxy_provenance_audit",
+        type=Path,
+        help="formal Galaxy injected provenance/PSF audit receipt",
+    )
+    parser.add_argument(
+        "--galaxy-campaign-summary",
+        "--campaign-summary",
+        dest="galaxy_campaign_summary",
+        type=Path,
+        help="optional formal Galaxy campaign-summary manifest",
+    )
+    parser.add_argument(
+        "--galaxy-coverage-policy",
+        "--coverage-policy",
+        dest="galaxy_coverage_policy",
+        type=Path,
+        help="frozen coverage policy paired with --galaxy-campaign-summary",
+    )
     return parser
+
+
+def _galaxy_cli_export_requested(args: argparse.Namespace) -> bool:
+    return any(
+        getattr(args, field) is not None
+        for field in (
+            "galaxy_campaign_qc",
+            "galaxy_provenance_audit",
+            "galaxy_campaign_summary",
+            "galaxy_coverage_policy",
+        )
+    )
+
+
+def _galaxy_pr_asset_export_request_from_args(
+    args: argparse.Namespace,
+) -> GalaxyPrAssetExportRequest:
+    if args.report_root is not None:
+        raise NotebookReportAssetError(
+            "--report-root is not accepted for formal Galaxy export; set "
+            f"{_PR_ASSET_PRESENTATION_DIR_ENV} with {_PR_ASSET_WRITE_ENV}=1"
+        )
+    if args.galaxy_campaign_qc is None or args.galaxy_provenance_audit is None:
+        raise NotebookReportAssetError(
+            "formal Galaxy export requires both --galaxy-campaign-qc and "
+            "--galaxy-provenance-audit"
+        )
+    return GalaxyPrAssetExportRequest(
+        readiness=GalaxyNotebookReadinessRequest(
+            production_manifest_path=args.production_manifest,
+            campaign_qc_path=args.galaxy_campaign_qc,
+            provenance_audit_path=args.galaxy_provenance_audit,
+            campaign_summary_manifest_path=args.galaxy_campaign_summary,
+            coverage_policy_path=args.galaxy_coverage_policy,
+        ),
+        executed_notebook_path=args.executed_notebook,
+        asset_specs=tuple(args.asset),
+        required_markers=tuple(args.required_marker),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        result = export_executed_notebook_png_assets_v1(
-            ExecutedNotebookReportAssetRequest(
-                executed_notebook_path=args.executed_notebook,
-                report_root=args.report_root,
-                production_manifest_path=args.production_manifest,
-                asset_specs=tuple(args.asset),
-                required_markers=tuple(args.required_marker),
+        if _galaxy_cli_export_requested(args):
+            result = export_galaxy_pr_assets_v1(
+                _galaxy_pr_asset_export_request_from_args(args)
             )
-        )
+            if result is None:
+                raise NotebookReportAssetError(
+                    "formal Galaxy asset export is disabled; set "
+                    f"{_PR_ASSET_WRITE_ENV}=1 and "
+                    f"{_PR_ASSET_PRESENTATION_DIR_ENV}"
+                )
+        else:
+            if args.report_root is None:
+                raise NotebookReportAssetError(
+                    "--report-root is required for generic report asset export"
+                )
+            result = export_executed_notebook_png_assets_v1(
+                ExecutedNotebookReportAssetRequest(
+                    executed_notebook_path=args.executed_notebook,
+                    report_root=args.report_root,
+                    production_manifest_path=args.production_manifest,
+                    asset_specs=tuple(args.asset),
+                    required_markers=tuple(args.required_marker),
+                )
+            )
     except (NotebookReportAssetError, OSError) as error:
         print(f"report asset export failed: {error}", file=sys.stderr)
         return 2
