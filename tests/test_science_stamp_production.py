@@ -332,6 +332,10 @@ def test_prepare_science_production_publishes_generic_reference_field_manifest(
     assert manifest["input"]["native_absolute_time_used"] is False
     assert manifest["delivery"]["execution_mode"] == "staged_local_scratch_v1"
     assert manifest["delivery"]["stamp_shape"] == [100, 300]
+    assert set(manifest["delivery"]["time_plan_identity"]) == {
+        "sha256",
+        "size_bytes",
+    }
     assert manifest["simulation_spec_base"]["dynamic_effects"]["dva"][
         "enabled"
     ] is False

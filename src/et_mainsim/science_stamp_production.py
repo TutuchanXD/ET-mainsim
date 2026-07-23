@@ -675,7 +675,7 @@ def prepare_science_independent_production(
                 "time_plan_relative_path": time_plan_path.relative_to(
                     run_root
                 ).as_posix(),
-                "time_plan_identity": file_identity(time_plan_path),
+                "time_plan_identity": _file_content_identity(time_plan_path),
                 "tail_policy": "reject_incomplete_global_coadd_tail",
             },
             "simulation_spec_base": spec_json,
