@@ -93,6 +93,61 @@ def test_galaxy_standard_analysis_array_launcher_is_serial_and_manifest_driven()
     assert "--overwrite" not in script
 
 
+def test_galaxy_raw_coverage_analysis_launchers_are_qc_gated_and_immutable() -> None:
+    root = Path(__file__).resolve().parents[1] / "scripts"
+    strict = (root / "galaxy_raw_strict_analysis_array_slurm.sh").read_text(
+        encoding="utf-8"
+    )
+    coverage = (root / "galaxy_raw_coverage_aware_analysis_array_slurm.sh").read_text(
+        encoding="utf-8"
+    )
+
+    for script in (strict, coverage):
+        assert "#SBATCH --partition=cpu" in script
+        assert "#SBATCH --array=0-9%1" in script
+        assert "#SBATCH --gres=" not in script
+        assert (
+            'ARRAY_INDEX="${SLURM_ARRAY_TASK_ID:?This launcher must be submitted as an array job}"'
+            in script
+        )
+        assert "if len(targets) != 10:" in script
+        assert 'source_id = int(targets[array_index]["source_id_int64"])' in script
+        assert "injected_campaign_delivery_qc.json" in script
+        assert 'qc.get("ready") is not True' in script
+        assert "--overwrite" not in script
+
+    assert "python -m et_mainsim.standard_stamp_analysis" in strict
+    assert "--case injected" in strict
+    assert "--cadence-seconds 10" in strict
+    assert (
+        'OUTPUT_DIR="${RUN_ROOT}/analysis/source_${SOURCE_ID}/injected/raw_10s_strict"'
+        in strict
+    )
+
+    assert (
+        ': "${ET_STAMP_MINIMUM_COVERAGE_FRACTION:?Set ET_STAMP_MINIMUM_COVERAGE_FRACTION'
+        in coverage
+    )
+    assert (
+        ': "${ET_STAMP_MINIMUM_ACCEPTED_BINS:?Set ET_STAMP_MINIMUM_ACCEPTED_BINS'
+        in coverage
+    )
+    assert "python -m et_mainsim.coverage_aware_stamp_analysis" in coverage
+    assert (
+        'REFERENCE_ANALYSIS_DIR="${RUN_ROOT}/analysis/source_${SOURCE_ID}/injected/raw_10s_strict"'
+        in coverage
+    )
+    assert (
+        'OUTPUT_DIR="${RUN_ROOT}/analysis/source_${SOURCE_ID}/injected/raw_10s_coverage_v2"'
+        in coverage
+    )
+    assert (
+        '--minimum-coverage-fraction "${ET_STAMP_MINIMUM_COVERAGE_FRACTION}"'
+        in coverage
+    )
+    assert '--minimum-accepted-bins "${ET_STAMP_MINIMUM_ACCEPTED_BINS}"' in coverage
+
+
 def test_galaxy_campaign_qc_slurm_launcher_is_a_fail_closed_analysis_gate() -> None:
     script = (
         Path(__file__).resolve().parents[1]
