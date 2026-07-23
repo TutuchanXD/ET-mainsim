@@ -95,6 +95,19 @@ def _write_fixture_run(tmp_path: Path) -> Path:
         source_id = target["source_id_int64"]
         field_angle = target["focalplane_mapping"]["field_angle_deg"]
         psf_id = min(node_angles, key=lambda key: abs(node_angles[key] - field_angle))
+        attestation = {
+            "schema_id": "et_coord.semantic_registry_owner_attestation_verification.v1",
+            "verified": True,
+            "verification_method": "runtime_semantic_content_sha256_equality",
+            "actual_semantic_content_sha256": "d" * 64,
+            "attested_semantic_content_sha256": "d" * 64,
+            "calculated_attestation_record_sha256": "e" * 64,
+            "attestation_record_sha256_matches": True,
+            "semantic_content_sha256_matches": True,
+            "previous_candidate_identity_sha256_matches": True,
+            "bundled_attestation_matches": True,
+            "errors": [],
+        }
         target_truth = {
             "schema_id": "et_mainsim.galaxy_target_truth.v1",
             "source_id": source_id,
@@ -119,6 +132,7 @@ def _write_fixture_run(tmp_path: Path) -> Path:
                     "node_angles_deg": node_angles,
                 },
             },
+            "runtime_focalplane_registry_attestation_verification": attestation,
         }
         for shard in plan.shards:
             for product_kind, factor, filename in (
@@ -188,6 +202,7 @@ def _write_fixture_run(tmp_path: Path) -> Path:
                                 },
                             },
                             "factor_snapshot_identity": target["factor_snapshot"],
+                            "runtime_focalplane_registry_attestation_verification": attestation,
                             "simulation_spec": {
                                 "detector": {
                                     "detector_id": target["focalplane_mapping"]["detector_id"]
@@ -227,6 +242,7 @@ def test_provenance_audit_accepts_full_manifest_anchored_delivery(tmp_path: Path
     assert result.invalid_bundle_count == 0
     payload = result.to_dict()
     assert payload["source_summaries"]["41"]["chosen_psf_id"] == 1
+    assert payload["source_summaries"]["41"]["runtime_registry_attestation_verified"] is True
     assert payload["software"]["observed_versions"]["photsim7"] == {"0.1.0": 8}
 
 
@@ -258,6 +274,35 @@ def test_provenance_audit_rejects_one_product_with_wrong_psf(
     assert result.invalid_bundle_count == 1
     assert result.valid_bundle_count == 7
     assert "chosen_psf_id" in result.invalid_bundles[0]["error"]
+
+
+def test_provenance_audit_rejects_an_unverified_runtime_registry_attestation(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.galaxy_delivery_provenance_audit import (
+        GalaxyDeliveryProvenanceAuditRequest,
+        audit_galaxy_delivery_provenance_v1,
+    )
+
+    manifest_path = _write_fixture_run(tmp_path)
+    malformed = (
+        manifest_path.parent
+        / "cases/injected/stamps/target_41/delivery/shard_00000/raw.h5"
+    )
+    with h5py.File(malformed, "r+") as handle:
+        delivery_manifest = json.loads(handle["manifest_json"][()].decode())
+        delivery_manifest["caller_manifest"]["target_input_truth"][
+            "runtime_focalplane_registry_attestation_verification"
+        ]["verified"] = False
+        _write_scalar_json(handle, "manifest_json", delivery_manifest)
+
+    result = audit_galaxy_delivery_provenance_v1(
+        GalaxyDeliveryProvenanceAuditRequest(production_manifest_path=manifest_path)
+    )
+
+    assert result.ready is False
+    assert result.invalid_bundle_count == 1
+    assert "runtime focal-plane registry attestation" in result.invalid_bundles[0]["error"]
 
 
 def test_provenance_audit_rejects_wrong_detector_and_software_commit(
