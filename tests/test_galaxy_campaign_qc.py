@@ -7,6 +7,7 @@ import sys
 
 import h5py
 import numpy as np
+import pytest
 
 
 RAW_EXPOSURE_SECONDS = 10.0
@@ -215,6 +216,54 @@ def test_campaign_qc_reports_missing_and_rejects_noncanonical_time_axis(
     assert result.invalid_bundle_count == 1
     assert result.missing_bundles[0]["path"] == str(missing)
     assert "raw_frame_start_index" in result.invalid_bundles[0]["error"]
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "as_directory"),
+    (
+        (".shard_00000.transfer.incoming", True),
+        (".shard_00000.staged-publish.lock", True),
+        (".shard_00000.lock", False),
+        ("unrecognised_delivery_sibling", True),
+    ),
+)
+def test_campaign_qc_rejects_staged_or_direct_delivery_residue(
+    tmp_path: Path,
+    artifact_name: str,
+    as_directory: bool,
+) -> None:
+    from et_mainsim.galaxy_campaign_qc import (
+        GalaxyCampaignDeliveryQCRequest,
+        audit_galaxy_campaign_delivery_v1,
+    )
+
+    manifest_path = _write_fixture_run(tmp_path)
+    delivery_root = (
+        manifest_path.parent
+        / "cases"
+        / "injected"
+        / "stamps"
+        / "target_41"
+        / "delivery"
+    )
+    artifact = delivery_root / artifact_name
+    if as_directory:
+        artifact.mkdir()
+    else:
+        artifact.write_text("unfinished direct writer\n", encoding="utf-8")
+
+    result = audit_galaxy_campaign_delivery_v1(
+        GalaxyCampaignDeliveryQCRequest(
+            production_manifest_path=manifest_path,
+            case="injected",
+        )
+    )
+
+    assert result.valid_bundle_count == result.expected_bundle_count == 12
+    assert result.missing_bundle_count == 0
+    assert result.invalid_bundle_count == 0
+    assert result.ready is False
+    assert str(artifact) in result.partial_artifacts
 
 
 def test_campaign_qc_cli_writes_receipt_and_require_complete_is_fail_closed(

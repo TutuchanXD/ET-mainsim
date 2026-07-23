@@ -13,7 +13,7 @@ realization product or re-anchor time at a shard boundary.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -26,7 +26,6 @@ from typing import Any, Literal
 import numpy as np
 
 from .galaxy_lightcurves import (
-    GalaxyFactorSnapshot,
     exposure_averaged_factors,
     load_galaxy_lightcurves,
     read_galaxy_factor_snapshot,
@@ -68,6 +67,54 @@ DEFAULT_MAX_RAW_FRAMES_PER_SHARD = 8_640  # one day at 10 s
 DEFAULT_STAMP_SHAPE = (100, 300)
 
 ProductionCase = Literal["static", "injected"]
+DeliveryExecutionMode = Literal[
+    "direct_shared_filesystem",
+    "staged_local_scratch_v1",
+]
+
+DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE: DeliveryExecutionMode = (
+    "direct_shared_filesystem"
+)
+STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE: DeliveryExecutionMode = (
+    "staged_local_scratch_v1"
+)
+
+
+def _normalise_delivery_execution_mode(value: object) -> DeliveryExecutionMode:
+    """Return one frozen writer mode; mixed-mode manifests are invalid."""
+
+    normalised = str(value).strip()
+    if normalised == DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE:
+        return DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE
+    if normalised == STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE:
+        return STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE
+    raise ValueError(
+        "delivery.execution_mode must be one of "
+        f"{DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE!r}, "
+        f"{STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE!r}"
+    )
+
+
+def delivery_execution_mode_from_manifest(
+    manifest: Mapping[str, Any],
+) -> DeliveryExecutionMode:
+    """Read the frozen writer mode with v2 direct-mode compatibility.
+
+    Historical v2 manifests predate writer-mode freezing and were all rendered
+    directly to their formal shared filesystem roots. They therefore retain
+    that exact interpretation, while every newly prepared manifest writes an
+    explicit mode.
+    """
+
+    delivery = manifest.get("delivery")
+    if not isinstance(delivery, Mapping):
+        raise ValueError("production manifest delivery must be an object")
+    return _normalise_delivery_execution_mode(
+        delivery.get(
+            "execution_mode",
+            DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE,
+        )
+    )
 
 
 def _strict_source_id(value: Any, *, name: str) -> int:
@@ -259,6 +306,16 @@ def _same_file_content_identity(
         return False
 
 
+def _file_content_identity(path: Path | str) -> dict[str, Any]:
+    """Return only the relocatable content portion of a file identity."""
+
+    identity = file_identity(path)
+    return {
+        "sha256": identity["sha256"],
+        "size_bytes": identity["size_bytes"],
+    }
+
+
 def _registry_identity_without_local_locator(
     identity: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -410,6 +467,9 @@ class GalaxyStampProductionConfig:
     stamp_shape: tuple[int, int] = DEFAULT_STAMP_SHAPE
     device: str = "cuda"
     run_seed: int = 20260714
+    delivery_execution_mode: DeliveryExecutionMode | str = (
+        DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE
+    )
 
     def __post_init__(self) -> None:
         input_fits = Path(self.input_fits).expanduser().resolve()
@@ -461,6 +521,9 @@ class GalaxyStampProductionConfig:
             raise ValueError("device must be 'cpu' or 'cuda'")
         if isinstance(self.run_seed, (bool, np.bool_)):
             raise ValueError("run_seed must be an integer")
+        delivery_execution_mode = _normalise_delivery_execution_mode(
+            self.delivery_execution_mode
+        )
 
         object.__setattr__(self, "input_fits", input_fits)
         object.__setattr__(self, "output_root", output_root)
@@ -479,6 +542,11 @@ class GalaxyStampProductionConfig:
         object.__setattr__(self, "stamp_shape", (ny, nx))
         object.__setattr__(self, "device", device)
         object.__setattr__(self, "run_seed", int(self.run_seed))
+        object.__setattr__(
+            self,
+            "delivery_execution_mode",
+            delivery_execution_mode,
+        )
 
     @property
     def n_raw_frames(self) -> int:
@@ -796,6 +864,7 @@ def prepare_galaxy_independent_production(
             "device": config.device,
         },
         "delivery": {
+            "execution_mode": config.delivery_execution_mode,
             "stamp_shape": list(config.stamp_shape),
             "raw_exposure_seconds": config.raw_exposure_seconds,
             "cadence_seconds": list(config.cadence_seconds),
@@ -939,13 +1008,17 @@ def run_galaxy_independent_target(
     focalplane_registry: Path | str | None = None,
     device: str | None = None,
     batch_size: int = 32,
+    output_root: Path | str | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Render one target for complete globally aligned shards without resume.
 
     A worker builds its physical services exactly once for the whole requested
     duration.  It then passes absolute raw frame indices unchanged into every
     shard callback.  Re-running an already-published target/shard is rejected
-    by the atomic delivery writer rather than silently resuming it.
+    by the atomic delivery writer rather than silently resuming it.  When
+    ``output_root`` is supplied it is a case root (for example a node-local
+    ``.../injected`` scratch directory), while the immutable production
+    manifest and all HDF5 caller-manifest provenance remain canonical.
     """
 
     source_id = _strict_source_id(source_id, name="source_id")
@@ -954,6 +1027,35 @@ def run_galaxy_independent_target(
         raise ValueError("batch_size must be a positive integer")
     resolved_manifest_path, manifest = _load_manifest(manifest_path)
     run_root = resolved_manifest_path.parent
+    delivery_execution_mode = delivery_execution_mode_from_manifest(manifest)
+    if (
+        delivery_execution_mode
+        == DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE
+        and output_root is not None
+    ):
+        raise ValueError(
+            "delivery.execution_mode='direct_shared_filesystem' requires "
+            "output_root to be omitted"
+        )
+    if (
+        delivery_execution_mode
+        == STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE
+        and output_root is None
+    ):
+        raise ValueError(
+            "delivery.execution_mode='staged_local_scratch_v1' requires "
+            "output_root to name the node-local case root"
+        )
+    production_manifest_identity = _file_content_identity(resolved_manifest_path)
+    delivery_output_root = (
+        run_root / "cases" / case
+        if output_root is None
+        else Path(output_root).expanduser().resolve()
+    )
+    if delivery_output_root.exists() and (
+        not delivery_output_root.is_dir() or delivery_output_root.is_symlink()
+    ):
+        raise ValueError("output_root must be a directory path when it exists")
     target_record = _manifest_target(manifest, source_id)
     time_plan = _load_time_plan(run_root, manifest)
     (
@@ -1158,7 +1260,6 @@ def run_galaxy_independent_target(
         )
 
     reports: list[dict[str, Any]] = []
-    output_root = run_root / "cases" / case
     for shard in shards:
         physical_rng_pairing = _galaxy_physical_rng_pairing_metadata(
             context=context,
@@ -1167,7 +1268,7 @@ def run_galaxy_independent_target(
             target_spec_sha256=target_spec_sha256,
         )
         request = IndependentStampShardRequest(
-            output_root=output_root,
+            output_root=delivery_output_root,
             target_source_id=source_id,
             stamp_shape=run_config.workload.stamp_shape,
             shard=shard,
@@ -1177,7 +1278,10 @@ def run_galaxy_independent_target(
                 "case": case,
                 "rng_trace_scope": dict(rng_trace_scope),
                 "physical_rng_pairing": dict(physical_rng_pairing),
-                "galaxy_production_manifest": str(Path(manifest_path).resolve()),
+                "galaxy_production_manifest": str(resolved_manifest_path),
+                "galaxy_production_manifest_identity": dict(
+                    production_manifest_identity
+                ),
                 "target_input_truth": source_truth,
                 "simulation_spec_sha256": target_spec_sha256,
                 "renderer_options": renderer_options,
@@ -1219,6 +1323,7 @@ def run_galaxy_independent_target(
 
 
 __all__ = [
+    "DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE",
     "DEFAULT_CADENCE_SECONDS",
     "DEFAULT_DURATION_DAYS",
     "DEFAULT_GALAXY_PRODUCTION_SOURCE_IDS",
@@ -1229,7 +1334,9 @@ __all__ = [
     "GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION",
     "GalaxyStampProductionConfig",
     "GalaxyStampProductionPreparation",
+    "STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE",
     "build_galaxy_independent_production_spec",
+    "delivery_execution_mode_from_manifest",
     "prepare_galaxy_independent_production",
     "run_galaxy_independent_target",
 ]

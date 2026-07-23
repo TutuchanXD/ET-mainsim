@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 from et_mainsim.galaxy_stamp_production import (
+    DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE,
     DEFAULT_CADENCE_SECONDS,
     DEFAULT_DURATION_DAYS,
     DEFAULT_GALAXY_PRODUCTION_SOURCE_IDS,
@@ -15,6 +16,7 @@ from et_mainsim.galaxy_stamp_production import (
     DEFAULT_RAW_EXPOSURE_SECONDS,
     DEFAULT_STAMP_SHAPE,
     GalaxyStampProductionConfig,
+    STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE,
     prepare_galaxy_independent_production,
     run_galaxy_independent_target,
 )
@@ -66,6 +68,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     prepare.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     prepare.add_argument("--run-seed", type=int, default=20260714)
+    prepare.add_argument(
+        "--delivery-execution-mode",
+        choices=(
+            DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE,
+            STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE,
+        ),
+        default=DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE,
+        help=(
+            "freeze direct shared writes or node-local staged publication; "
+            "the two modes are mutually exclusive for a formal run"
+        ),
+    )
 
     run = subparsers.add_parser(
         "run-target",
@@ -85,6 +99,13 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--focalplane-registry")
     run.add_argument("--device", choices=("cpu", "cuda"))
     run.add_argument("--batch-size", type=int, default=32)
+    run.add_argument(
+        "--output-root",
+        help=(
+            "optional case-root override for completed delivery bundles; use a "
+            "node-local scratch root only with the staged publisher"
+        ),
+    )
     return parser
 
 
@@ -110,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
                 stamp_shape=tuple(args.stamp_shape),
                 device=args.device,
                 run_seed=args.run_seed,
+                delivery_execution_mode=args.delivery_execution_mode,
             )
         )
         print(
@@ -134,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
         focalplane_registry=args.focalplane_registry,
         device=args.device,
         batch_size=args.batch_size,
+        output_root=args.output_root,
     )
     print(json.dumps(list(reports), ensure_ascii=False, sort_keys=True))
     return 0

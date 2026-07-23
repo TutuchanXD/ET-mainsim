@@ -369,6 +369,10 @@ def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch
     manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["schema_version"] == 2
+    assert (
+        manifest["delivery"]["execution_mode"]
+        == production.DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE
+    )
     assert manifest["delivery"]["time_plan_relative_path"] == "inputs/time_shards.json"
     assert manifest["targets"][0]["factor_snapshot_relative_path"] == (
         "inputs/galaxy_factor_snapshots/source_42.npz"
@@ -387,6 +391,70 @@ def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch
         relocated_manifest,
     )
     assert recovered_plan.accepted_raw_frame_count == 3
+
+
+def test_delivery_execution_mode_defaults_legacy_manifests_and_rejects_unknown() -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
+    assert (
+        production.delivery_execution_mode_from_manifest({"delivery": {}})
+        == production.DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE
+    )
+    assert (
+        production.delivery_execution_mode_from_manifest(
+            {
+                "delivery": {
+                    "execution_mode": (
+                        production.STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE
+                    )
+                }
+            }
+        )
+        == production.STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE
+    )
+    with pytest.raises(ValueError, match="delivery.execution_mode"):
+        production.delivery_execution_mode_from_manifest(
+            {"delivery": {"execution_mode": "mixed_writer_mode"}}
+        )
+
+
+def test_run_target_rejects_delivery_mode_output_root_mismatch_before_runtime_setup(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
+    def _manifest(mode: str) -> str:
+        path = tmp_path / f"{mode}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                    "schema_version": production.GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
+                    "delivery": {"execution_mode": mode},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    monkeypatch.setattr(
+        production,
+        "_runtime_paths",
+        lambda *_args, **_kwargs: pytest.fail("mode check must precede runtime setup"),
+    )
+
+    with pytest.raises(ValueError, match="direct_shared_filesystem.*output_root"):
+        production.run_galaxy_independent_target(
+            _manifest(production.DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE),
+            source_id=42,
+            output_root=tmp_path / "scratch" / "injected",
+        )
+    with pytest.raises(ValueError, match="staged_local_scratch_v1.*output_root"):
+        production.run_galaxy_independent_target(
+            _manifest(production.STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE),
+            source_id=42,
+        )
 
 
 def test_formal_galaxy_production_spec_freezes_delivery_and_sd20_policy() -> None:
@@ -487,6 +555,9 @@ def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
                     "focalplane_registry": str(tmp_path / "registry"),
                 },
                 "delivery": {
+                    "execution_mode": (
+                        production.DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE
+                    ),
                     "stamp_shape": [100, 300],
                     "time_plan_relative_path": "inputs/time_shards.json",
                     "time_plan_identity": production.file_identity(time_plan_path),
@@ -628,13 +699,24 @@ def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
         focalplane_registry=registry,
         device="cpu",
     )
+    staged_manifest_path = run_root / "production_manifest_staged.json"
+    staged_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    staged_payload["delivery"]["execution_mode"] = (
+        production.STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE
+    )
+    staged_manifest_path.write_text(
+        json.dumps(staged_payload),
+        encoding="utf-8",
+    )
+    scratch_case_root = tmp_path / "node-local-scratch" / "injected"
     production.run_galaxy_independent_target(
-        manifest_path,
+        staged_manifest_path,
         source_id=303,
         case="injected",
         data_root=data_root,
         focalplane_registry=registry,
         device="cpu",
+        output_root=scratch_case_root,
     )
 
     assert [request.manifest["case"] for request in requests] == [
@@ -756,3 +838,12 @@ def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
     ] == 202
     assert requests[3].manifest["physical_rng_pairing"][
         "canonical_context_scope"]["detector_id"] == "main_ld"
+    assert requests[3].output_root == scratch_case_root
+    assert requests[3].manifest["galaxy_production_manifest"] == str(
+        staged_manifest_path.resolve()
+    )
+    staged_identity = production.file_identity(staged_manifest_path)
+    assert requests[3].manifest["galaxy_production_manifest_identity"] == {
+        "sha256": staged_identity["sha256"],
+        "size_bytes": staged_identity["size_bytes"],
+    }
