@@ -415,6 +415,22 @@ def test_coverage_aware_analysis_rejects_a_coadded_reference_input(
         )
 
 
+def test_coverage_aware_analysis_request_requires_an_explicit_coverage_policy(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.coverage_aware_stamp_analysis import (
+        CoverageAwareAnalysisError,
+        CoverageAwareStampAnalysisRequest,
+    )
+
+    source_dir, output_dir = _write_reference_analysis_fixture(tmp_path)
+    with pytest.raises(CoverageAwareAnalysisError, match="must be explicit"):
+        CoverageAwareStampAnalysisRequest(
+            reference_analysis_dir=source_dir,
+            output_dir=output_dir,
+        )
+
+
 def test_coverage_aware_analysis_rejects_non_ten_second_reference_rows(
     tmp_path: Path,
 ) -> None:

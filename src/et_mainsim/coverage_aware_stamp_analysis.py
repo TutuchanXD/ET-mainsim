@@ -242,7 +242,7 @@ class CoverageAwareStampAnalysisRequest:
     reference_analysis_dir: Path | str
     output_dir: Path | str
     windows_minutes: tuple[int, ...] = (30, 90, 390)
-    minimum_coverage_fraction: float = 0.90
+    minimum_coverage_fraction: float | None = None
     minimum_accepted_bins: int = 10
     bin_origin_seconds: float = 0.0
 
@@ -250,6 +250,10 @@ class CoverageAwareStampAnalysisRequest:
         reference_dir = Path(self.reference_analysis_dir).expanduser().resolve()
         output_dir = Path(self.output_dir).expanduser().resolve()
         windows = _normalise_windows(self.windows_minutes)
+        if self.minimum_coverage_fraction is None:
+            raise CoverageAwareAnalysisError(
+                "minimum_coverage_fraction must be explicit for formal science analysis"
+            )
         coverage = _validate_fraction(self.minimum_coverage_fraction)
         minimum_bins = _validate_minimum_bins(self.minimum_accepted_bins)
         try:
