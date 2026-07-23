@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import errno
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -163,6 +164,48 @@ def test_write_science_task_list_rejects_an_output_symlink(
 
     assert output_path.is_symlink()
     assert not linked_target.exists()
+
+
+def test_science_task_list_public_api_is_exported() -> None:
+    import et_mainsim.science_stamp_production as production
+
+    assert {
+        "SCIENCE_STAMP_TASK_LIST_SCHEMA_ID",
+        "SCIENCE_STAMP_TASK_LIST_SCHEMA_VERSION",
+        "ScienceStampTaskListWriteResult",
+        "write_science_stamp_task_list",
+    } <= set(production.__all__)
+
+
+def test_write_science_task_list_does_not_hide_directory_fsync_io_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import et_mainsim.science_stamp_production as production
+
+    manifest_path = _write_minimal_task_manifest(tmp_path)
+    output_path = tmp_path / "tasks.json"
+    original_fsync = production.os.fsync
+    calls = 0
+
+    def fail_parent_fsync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError(errno.EIO, "synthetic directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(production.os, "fsync", fail_parent_fsync)
+
+    with pytest.raises(OSError, match="synthetic directory fsync failure"):
+        production.write_science_stamp_task_list(
+            manifest_path,
+            case="static",
+            tasks=((101, 0),),
+            output_path=output_path,
+        )
+
+    assert json.loads(output_path.read_text(encoding="utf-8"))["case"] == "static"
 
 
 def _curve(*, track: str = "varlc"):

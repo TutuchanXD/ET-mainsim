@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
+import errno
 import hashlib
 import json
 import math
@@ -74,6 +75,14 @@ REFERENCE_PSF_ID = 6
 REFERENCE_PSF_NODE_ANGLE_DEG = 12.0
 REFERENCE_DETECTOR_ROWS = 9_120
 REFERENCE_DETECTOR_COLS = 8_900
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
+    {
+        errno.EINVAL,
+        errno.ENOSYS,
+        errno.ENOTSUP,
+        errno.EOPNOTSUPP,
+    }
+)
 
 ScienceProductionTrack = Literal["aster", "varlc", "wdlc"]
 ScienceProductionCase = Literal["static", "injected"]
@@ -293,10 +302,11 @@ def _atomic_json_no_overwrite(path: Path, payload: Mapping[str, Any]) -> bytes:
                 os.fsync(parent_descriptor)
             finally:
                 os.close(parent_descriptor)
-        except OSError:
+        except OSError as error:
             # The bytes are already durable and visible; some network file
             # systems do not support directory fsync.
-            pass
+            if error.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+                raise
     finally:
         temporary.unlink(missing_ok=True)
     return encoded
@@ -1097,9 +1107,13 @@ __all__ = [
     "SCIENCE_PRODUCTION_TRACKS",
     "SCIENCE_STAMP_PRODUCTION_SCHEMA_ID",
     "SCIENCE_STAMP_PRODUCTION_SCHEMA_VERSION",
+    "SCIENCE_STAMP_TASK_LIST_SCHEMA_ID",
+    "SCIENCE_STAMP_TASK_LIST_SCHEMA_VERSION",
     "ScienceStampProductionConfig",
     "ScienceStampProductionPreparation",
+    "ScienceStampTaskListWriteResult",
     "build_science_independent_production_spec",
     "prepare_science_independent_production",
     "run_science_independent_target",
+    "write_science_stamp_task_list",
 ]
