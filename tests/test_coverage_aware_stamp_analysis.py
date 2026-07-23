@@ -115,11 +115,72 @@ def test_coverage_aware_cdpp_requires_contiguous_physical_cadence() -> None:
         )
 
 
-def _write_reference_analysis_fixture(tmp_path: Path) -> tuple[Path, Path]:
-    """Write a raw-10-s strict-reference output with 90% clean 30-min bins."""
+def _write_reference_analysis_fixture(
+    tmp_path: Path,
+    *,
+    minimum_coverage_fraction: float = 0.90,
+    minimum_accepted_bins: int = 2,
+) -> tuple[Path, Path, Path, Path]:
+    """Write a policy-bound raw strict reference with 90% clean 30-min bins."""
 
-    source_dir = tmp_path / "strict_reference"
-    source_dir.mkdir()
+    from et_mainsim.galaxy_stamp_production import (
+        GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+        GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
+    )
+    from et_mainsim.raw_coverage_policy import (
+        FrozenRawCoveragePolicyRequest,
+        write_frozen_raw_coverage_policy_v1,
+    )
+    from et_mainsim.stamp_inputs import file_identity
+
+    run_root = tmp_path / "formal_reference_run"
+    source_dir = run_root / "analysis" / "source_42" / "injected" / "raw_10s_strict"
+    source_dir.mkdir(parents=True)
+    production_manifest_path = run_root / "production_manifest.json"
+    production_manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_id": GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
+                "run_id": "fixture",
+                "observation_product": "final_dn",
+                "background_realization_delivered": False,
+                "delivery": {"raw_exposure_seconds": 10.0},
+                "targets": [
+                    {"source_id_int64": source_id}
+                    for source_id in (42, *range(100, 109))
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    policy_path = run_root / "analysis" / "raw_10s_coverage_v2_policy.json"
+    write_frozen_raw_coverage_policy_v1(
+        FrozenRawCoveragePolicyRequest(
+            production_manifest_path=production_manifest_path,
+            output_path=policy_path,
+            minimum_coverage_fraction=minimum_coverage_fraction,
+            minimum_accepted_bins=minimum_accepted_bins,
+        )
+    )
+    qc_path = run_root / "quality_control" / "injected_campaign_delivery_qc.json"
+    qc_path.parent.mkdir(parents=True)
+    qc_path.write_text(
+        json.dumps(
+            {
+                "schema_id": "et_mainsim.galaxy_campaign_delivery_qc.v1",
+                "schema_version": 1,
+                "ready": True,
+                "run_id": "fixture",
+                "case": "injected",
+                "manifest_identity": file_identity(production_manifest_path),
+                "coverage": {"target_count": 10},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     lightcurve_path = source_dir / "reference_lightcurve.csv"
     payload = _two_thirty_minute_cadences(
         invalid_per_bin=18,
@@ -166,6 +227,9 @@ def _write_reference_analysis_fixture(tmp_path: Path) -> tuple[Path, Path]:
                 "schema_version": 1,
                 "complete": True,
                 "run_id": "fixture",
+                "production_manifest_path": str(production_manifest_path),
+                "production_manifest_relative_to_run_root": "production_manifest.json",
+                "production_manifest_identity": file_identity(production_manifest_path),
                 "source_id": "42",
                 "source_id_int64": 42,
                 "case": "injected",
@@ -186,7 +250,12 @@ def _write_reference_analysis_fixture(tmp_path: Path) -> tuple[Path, Path]:
         + "\n",
         encoding="utf-8",
     )
-    return source_dir, tmp_path / "coverage_aware"
+    return (
+        source_dir,
+        run_root / "analysis" / "source_42" / "injected" / "raw_10s_coverage_v2",
+        policy_path,
+        qc_path,
+    )
 
 
 def _write_formal_raw_galaxy_fixture(tmp_path: Path) -> Path:
@@ -260,13 +329,20 @@ def _write_formal_raw_galaxy_fixture(tmp_path: Path) -> Path:
                 },
                 "targets": [
                     {
-                        "source_id": str(source_id),
-                        "source_id_int64": source_id,
-                        "factor_snapshot": snapshot_identity,
-                        "factor_snapshot_relative_path": (
-                            f"inputs/galaxy_factor_snapshots/source_{source_id}.npz"
+                        "source_id": str(target_id),
+                        "source_id_int64": target_id,
+                        **(
+                            {
+                                "factor_snapshot": snapshot_identity,
+                                "factor_snapshot_relative_path": (
+                                    f"inputs/galaxy_factor_snapshots/source_{source_id}.npz"
+                                ),
+                            }
+                            if target_id == source_id
+                            else {}
                         ),
                     }
+                    for target_id in (source_id, *range(100, 109))
                 ],
             },
             indent=2,
@@ -353,14 +429,15 @@ def test_coverage_aware_analysis_publishes_an_atomic_receipt(tmp_path) -> None:
         run_coverage_aware_stamp_analysis_v1,
     )
 
-    source_dir, output_dir = _write_reference_analysis_fixture(tmp_path)
+    source_dir, output_dir, policy_path, qc_path = _write_reference_analysis_fixture(
+        tmp_path
+    )
     result = run_coverage_aware_stamp_analysis_v1(
         CoverageAwareStampAnalysisRequest(
             reference_analysis_dir=source_dir,
             output_dir=output_dir,
-            windows_minutes=(30,),
-            minimum_coverage_fraction=0.90,
-            minimum_accepted_bins=2,
+            coverage_policy_path=policy_path,
+            campaign_qc_path=qc_path,
         )
     )
 
@@ -372,6 +449,10 @@ def test_coverage_aware_analysis_publishes_an_atomic_receipt(tmp_path) -> None:
     assert manifest["input_reference_analysis"]["source_id_int64"] == 42
     assert manifest["coverage_policy"]["minimum_coverage_fraction"] == pytest.approx(
         0.90
+    )
+    assert manifest["coverage_policy"]["windows_minutes"] == [30, 90, 390]
+    assert manifest["frozen_coverage_policy"]["path_relative_to_run_root"] == (
+        "analysis/raw_10s_coverage_v2_policy.json"
     )
     assert manifest["metrics"]["30"]["accepted_bin_count"] == 2
     assert manifest["analysis_implementation"]["module"] == (
@@ -391,14 +472,16 @@ def test_coverage_aware_analysis_serializes_unavailable_cdpp_as_json_null(
         run_coverage_aware_stamp_analysis_v1,
     )
 
-    source_dir, output_dir = _write_reference_analysis_fixture(tmp_path)
+    source_dir, output_dir, policy_path, qc_path = _write_reference_analysis_fixture(
+        tmp_path,
+        minimum_accepted_bins=3,
+    )
     result = run_coverage_aware_stamp_analysis_v1(
         CoverageAwareStampAnalysisRequest(
             reference_analysis_dir=source_dir,
             output_dir=output_dir,
-            windows_minutes=(30,),
-            minimum_coverage_fraction=0.90,
-            minimum_accepted_bins=3,
+            coverage_policy_path=policy_path,
+            campaign_qc_path=qc_path,
         )
     )
 
@@ -407,6 +490,34 @@ def test_coverage_aware_analysis_serializes_unavailable_cdpp_as_json_null(
     metrics = json.loads(manifest_text)["metrics"]["30"]
     assert metrics["observed_cdpp_ppm"] is None
     assert metrics["residual_cdpp_ppm"] is None
+
+
+def test_coverage_aware_analysis_requires_a_ready_campaign_qc_gate(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.coverage_aware_stamp_analysis import (
+        CoverageAwareAnalysisError,
+        CoverageAwareStampAnalysisRequest,
+        run_coverage_aware_stamp_analysis_v1,
+    )
+
+    source_dir, output_dir, policy_path, qc_path = _write_reference_analysis_fixture(
+        tmp_path
+    )
+    qc = json.loads(qc_path.read_text(encoding="utf-8"))
+    qc["ready"] = False
+    qc_path.write_text(json.dumps(qc) + "\n", encoding="utf-8")
+
+    with pytest.raises(CoverageAwareAnalysisError, match="not ready"):
+        run_coverage_aware_stamp_analysis_v1(
+            CoverageAwareStampAnalysisRequest(
+                reference_analysis_dir=source_dir,
+                output_dir=output_dir,
+                coverage_policy_path=policy_path,
+                campaign_qc_path=qc_path,
+            )
+        )
+    assert not output_dir.exists()
 
 
 def test_coverage_aware_analysis_rejects_a_coadded_reference_input(
@@ -418,7 +529,9 @@ def test_coverage_aware_analysis_rejects_a_coadded_reference_input(
         run_coverage_aware_stamp_analysis_v1,
     )
 
-    source_dir, output_dir = _write_reference_analysis_fixture(tmp_path)
+    source_dir, output_dir, policy_path, qc_path = _write_reference_analysis_fixture(
+        tmp_path
+    )
     manifest_path = source_dir / "analysis_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["delivery"].update(
@@ -434,9 +547,8 @@ def test_coverage_aware_analysis_rejects_a_coadded_reference_input(
             CoverageAwareStampAnalysisRequest(
                 reference_analysis_dir=source_dir,
                 output_dir=output_dir,
-                windows_minutes=(30,),
-                minimum_coverage_fraction=0.90,
-                minimum_accepted_bins=2,
+                coverage_policy_path=policy_path,
+                campaign_qc_path=qc_path,
             )
         )
 
@@ -445,12 +557,13 @@ def test_coverage_aware_analysis_request_requires_an_explicit_coverage_policy(
     tmp_path: Path,
 ) -> None:
     from et_mainsim.coverage_aware_stamp_analysis import (
-        CoverageAwareAnalysisError,
         CoverageAwareStampAnalysisRequest,
     )
 
-    source_dir, output_dir = _write_reference_analysis_fixture(tmp_path)
-    with pytest.raises(CoverageAwareAnalysisError, match="must be explicit"):
+    source_dir, output_dir, _policy_path, _qc_path = _write_reference_analysis_fixture(
+        tmp_path
+    )
+    with pytest.raises(TypeError, match="coverage_policy_path"):
         CoverageAwareStampAnalysisRequest(
             reference_analysis_dir=source_dir,
             output_dir=output_dir,
@@ -466,7 +579,9 @@ def test_coverage_aware_analysis_rejects_non_ten_second_reference_rows(
         run_coverage_aware_stamp_analysis_v1,
     )
 
-    source_dir, output_dir = _write_reference_analysis_fixture(tmp_path)
+    source_dir, output_dir, policy_path, qc_path = _write_reference_analysis_fixture(
+        tmp_path
+    )
     lightcurve_path = source_dir / "reference_lightcurve.csv"
     with lightcurve_path.open(encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
@@ -486,9 +601,8 @@ def test_coverage_aware_analysis_rejects_non_ten_second_reference_rows(
             CoverageAwareStampAnalysisRequest(
                 reference_analysis_dir=source_dir,
                 output_dir=output_dir,
-                windows_minutes=(30,),
-                minimum_coverage_fraction=0.90,
-                minimum_accepted_bins=2,
+                coverage_policy_path=policy_path,
+                campaign_qc_path=qc_path,
             )
         )
 
@@ -500,13 +614,17 @@ def test_raw_coverage_analysis_uses_only_clean_raw_frames_from_formal_delivery(
         CoverageAwareStampAnalysisRequest,
         run_coverage_aware_stamp_analysis_v1,
     )
+    from et_mainsim.raw_coverage_policy import (
+        FrozenRawCoveragePolicyRequest,
+        write_frozen_raw_coverage_policy_v1,
+    )
     from et_mainsim.standard_stamp_analysis import (
         StandardStampAnalysisRequest,
         run_standard_stamp_analysis_v1,
     )
 
     manifest_path = _write_formal_raw_galaxy_fixture(tmp_path)
-    strict_dir = tmp_path / "raw_10s_strict"
+    strict_dir = manifest_path.parent / "analysis" / "source_42" / "injected" / "raw_10s_strict"
     standard = run_standard_stamp_analysis_v1(
         StandardStampAnalysisRequest(
             production_manifest_path=manifest_path,
@@ -519,19 +637,46 @@ def test_raw_coverage_analysis_uses_only_clean_raw_frames_from_formal_delivery(
     )
     assert standard.valid_cadence_count == 324
 
-    output_dir = tmp_path / "raw_10s_coverage_v2"
-    coverage = run_coverage_aware_stamp_analysis_v1(
-        CoverageAwareStampAnalysisRequest(
-            reference_analysis_dir=strict_dir,
-            output_dir=output_dir,
-            windows_minutes=(30,),
+    policy_path = manifest_path.parent / "analysis" / "raw_10s_coverage_v2_policy.json"
+    write_frozen_raw_coverage_policy_v1(
+        FrozenRawCoveragePolicyRequest(
+            production_manifest_path=manifest_path,
+            output_path=policy_path,
             minimum_coverage_fraction=0.90,
             minimum_accepted_bins=2,
         )
     )
+    qc_path = manifest_path.parent / "quality_control" / "injected_campaign_delivery_qc.json"
+    qc_path.parent.mkdir(parents=True)
+    from et_mainsim.stamp_inputs import file_identity
+
+    qc_path.write_text(
+        json.dumps(
+            {
+                "schema_id": "et_mainsim.galaxy_campaign_delivery_qc.v1",
+                "schema_version": 1,
+                "ready": True,
+                "run_id": "raw-coverage-fixture",
+                "case": "injected",
+                "manifest_identity": file_identity(manifest_path),
+                "coverage": {"target_count": 10},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_dir = manifest_path.parent / "analysis" / "source_42" / "injected" / "raw_10s_coverage_v2"
+    coverage = run_coverage_aware_stamp_analysis_v1(
+        CoverageAwareStampAnalysisRequest(
+            reference_analysis_dir=strict_dir,
+            output_dir=output_dir,
+            coverage_policy_path=policy_path,
+            campaign_qc_path=qc_path,
+        )
+    )
 
     manifest = json.loads(coverage.analysis_manifest_path.read_text(encoding="utf-8"))
-    assert manifest["schema_id"] == "et_mainsim.raw_coverage_aware_stamp_analysis.v2"
+    assert manifest["schema_id"] == "et_mainsim.raw_coverage_aware_stamp_analysis.v3"
     assert manifest["input_raw_delivery"] == {
         "product_filename": "raw.h5",
         "cadence_seconds": 10.0,
@@ -555,7 +700,9 @@ def test_coverage_aware_analysis_cli_requires_an_explicit_coverage_policy(
 ) -> None:
     from et_mainsim.coverage_aware_stamp_analysis import main
 
-    source_dir, output_dir = _write_reference_analysis_fixture(tmp_path)
+    source_dir, output_dir, policy_path, qc_path = _write_reference_analysis_fixture(
+        tmp_path
+    )
     assert (
         main(
             (
@@ -563,12 +710,10 @@ def test_coverage_aware_analysis_cli_requires_an_explicit_coverage_policy(
                 str(source_dir),
                 "--output-dir",
                 str(output_dir),
-                "--windows-minutes",
-                "30",
-                "--minimum-coverage-fraction",
-                "0.90",
-                "--minimum-accepted-bins",
-                "2",
+                "--coverage-policy",
+                str(policy_path),
+                "--campaign-qc",
+                str(qc_path),
             )
         )
         == 0
@@ -577,6 +722,7 @@ def test_coverage_aware_analysis_cli_requires_an_explicit_coverage_policy(
     assert completion["source_id_int64"] == 42
     assert completion["case"] == "injected"
     assert completion["minimum_coverage_fraction"] == pytest.approx(0.90)
+    assert completion["windows_minutes"] == [30, 90, 390]
     assert completion["analysis_manifest_path"].endswith(
         "coverage_aware_analysis_manifest.json"
     )

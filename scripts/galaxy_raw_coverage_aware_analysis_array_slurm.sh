@@ -3,9 +3,9 @@
 # raw strict reference arrays have succeeded.  This reducer never reads or
 # rewrites final_dn: it consumes the immutable raw_10s_strict analysis output.
 #
-# The science policy is intentionally required rather than silently defaulted:
-#   ET_STAMP_MINIMUM_COVERAGE_FRACTION=0.95 \
-#   ET_STAMP_MINIMUM_ACCEPTED_BINS=10 \
+# The science policy is one immutable JSON file rather than a collection of
+# potentially drifting environment variables:
+#   ET_STAMP_COVERAGE_POLICY_JSON=<RUN_ROOT>/analysis/raw_10s_coverage_v2_policy.json \
 #   sbatch --dependency=afterok:<raw-strict-array-job-id> \
 #     scripts/galaxy_raw_coverage_aware_analysis_array_slurm.sh
 
@@ -22,14 +22,16 @@ set -euo pipefail
 
 : "${ET_STAMP_MANIFEST:?Set ET_STAMP_MANIFEST to production_manifest.json}"
 : "${ET_STAMP_CODE_ROOT:?Set ET_STAMP_CODE_ROOT to the deployed ET-mainsim checkout}"
-: "${ET_STAMP_MINIMUM_COVERAGE_FRACTION:?Set ET_STAMP_MINIMUM_COVERAGE_FRACTION to the frozen science threshold}"
-: "${ET_STAMP_MINIMUM_ACCEPTED_BINS:?Set ET_STAMP_MINIMUM_ACCEPTED_BINS to the frozen minimum accepted-bin count}"
+: "${ET_STAMP_COVERAGE_POLICY_JSON:?Set ET_STAMP_COVERAGE_POLICY_JSON to the immutable frozen policy JSON}"
 
-ET_STAMP_BIN_ORIGIN_SECONDS="${ET_STAMP_BIN_ORIGIN_SECONDS:-0}"
 ARRAY_INDEX="${SLURM_ARRAY_TASK_ID:?This launcher must be submitted as an array job}"
 
 if [[ ! -f "${ET_STAMP_MANIFEST}" ]]; then
   echo "ET_STAMP_MANIFEST is not a regular file: ${ET_STAMP_MANIFEST}" >&2
+  exit 2
+fi
+if [[ ! -f "${ET_STAMP_COVERAGE_POLICY_JSON}" ]]; then
+  echo "ET_STAMP_COVERAGE_POLICY_JSON is not a regular file: ${ET_STAMP_COVERAGE_POLICY_JSON}" >&2
   exit 2
 fi
 
@@ -100,15 +102,13 @@ echo "job_id=${SLURM_JOB_ID:-unknown} host=$(hostname)"
 echo "array_index=${ARRAY_INDEX} source_id=${SOURCE_ID} target_count=${TARGET_COUNT} case=injected raw_cadence_seconds=10"
 echo "manifest=${ET_STAMP_MANIFEST}"
 echo "campaign_qc=${ET_STAMP_CAMPAIGN_QC_JSON}"
+echo "coverage_policy=${ET_STAMP_COVERAGE_POLICY_JSON}"
 echo "reference_analysis_dir=${REFERENCE_ANALYSIS_DIR}"
 echo "output_dir=${OUTPUT_DIR}"
-echo "minimum_coverage_fraction=${ET_STAMP_MINIMUM_COVERAGE_FRACTION} minimum_accepted_bins=${ET_STAMP_MINIMUM_ACCEPTED_BINS}"
 date
 
 exec python -m et_mainsim.coverage_aware_stamp_analysis \
   --reference-analysis-dir "${REFERENCE_ANALYSIS_DIR}" \
   --output-dir "${OUTPUT_DIR}" \
-  --windows-minutes 30 90 390 \
-  --minimum-coverage-fraction "${ET_STAMP_MINIMUM_COVERAGE_FRACTION}" \
-  --minimum-accepted-bins "${ET_STAMP_MINIMUM_ACCEPTED_BINS}" \
-  --bin-origin-seconds "${ET_STAMP_BIN_ORIGIN_SECONDS}"
+  --campaign-qc "${ET_STAMP_CAMPAIGN_QC_JSON}" \
+  --coverage-policy "${ET_STAMP_COVERAGE_POLICY_JSON}"

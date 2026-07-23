@@ -29,13 +29,19 @@ from typing import Any
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from .raw_coverage_policy import (
+    FrozenRawCoveragePolicy,
+    FrozenRawCoveragePolicyError,
+    load_frozen_raw_coverage_policy_v1,
+    validate_frozen_raw_coverage_policy_for_run_v1,
+)
 from .stamp_inputs import file_identity
 
 
 COVERAGE_AWARE_STAMP_ANALYSIS_SCHEMA_ID = (
-    "et_mainsim.raw_coverage_aware_stamp_analysis.v2"
+    "et_mainsim.raw_coverage_aware_stamp_analysis.v3"
 )
-COVERAGE_AWARE_STAMP_ANALYSIS_SCHEMA_VERSION = 2
+COVERAGE_AWARE_STAMP_ANALYSIS_SCHEMA_VERSION = 3
 
 _TIME_TOLERANCE_SECONDS = 1e-8
 _RAW_CADENCE_SECONDS = 10.0
@@ -241,35 +247,18 @@ class CoverageAwareStampAnalysisRequest:
 
     reference_analysis_dir: Path | str
     output_dir: Path | str
-    windows_minutes: tuple[int, ...] = (30, 90, 390)
-    minimum_coverage_fraction: float | None = None
-    minimum_accepted_bins: int = 10
-    bin_origin_seconds: float = 0.0
+    coverage_policy_path: Path | str
+    campaign_qc_path: Path | str
 
     def __post_init__(self) -> None:
         reference_dir = Path(self.reference_analysis_dir).expanduser().resolve()
         output_dir = Path(self.output_dir).expanduser().resolve()
-        windows = _normalise_windows(self.windows_minutes)
-        if self.minimum_coverage_fraction is None:
-            raise CoverageAwareAnalysisError(
-                "minimum_coverage_fraction must be explicit for formal science analysis"
-            )
-        coverage = _validate_fraction(self.minimum_coverage_fraction)
-        minimum_bins = _validate_minimum_bins(self.minimum_accepted_bins)
-        try:
-            origin = float(self.bin_origin_seconds)
-        except (TypeError, ValueError, OverflowError) as error:
-            raise CoverageAwareAnalysisError(
-                "bin_origin_seconds must be finite"
-            ) from error
-        if not math.isfinite(origin):
-            raise CoverageAwareAnalysisError("bin_origin_seconds must be finite")
+        policy_path = Path(self.coverage_policy_path).expanduser().resolve()
+        campaign_qc_path = Path(self.campaign_qc_path).expanduser().resolve()
         object.__setattr__(self, "reference_analysis_dir", reference_dir)
         object.__setattr__(self, "output_dir", output_dir)
-        object.__setattr__(self, "windows_minutes", windows)
-        object.__setattr__(self, "minimum_coverage_fraction", coverage)
-        object.__setattr__(self, "minimum_accepted_bins", minimum_bins)
-        object.__setattr__(self, "bin_origin_seconds", origin)
+        object.__setattr__(self, "coverage_policy_path", policy_path)
+        object.__setattr__(self, "campaign_qc_path", campaign_qc_path)
 
 
 @dataclass(frozen=True)
@@ -300,11 +289,24 @@ class _ReferenceAnalysisInput:
     analysis_manifest_path: Path
     analysis_manifest: Mapping[str, Any]
     lightcurve_path: Path
+    run_root: Path
+    run_id: str
+    production_manifest_path: Path
+    production_manifest_relative_to_run_root: str
+    production_manifest_identity: Mapping[str, Any]
     source_id: int
     case: str
     cadence_seconds: float
     raw_exposure_seconds: float
     curve: CoverageAwareLightCurve
+
+
+@dataclass(frozen=True)
+class _ResolvedCoveragePolicy:
+    policy: FrozenRawCoveragePolicy
+    policy_relative_to_run_root: str
+    campaign_qc_relative_to_run_root: str
+    campaign_qc_identity: Mapping[str, Any]
 
 
 def _normalise_windows(windows_minutes: Iterable[int]) -> tuple[int, ...]:
@@ -561,6 +563,58 @@ def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
     return payload
 
 
+def _content_identity(value: Mapping[str, Any], *, label: str) -> dict[str, Any]:
+    """Return a mount-independent content receipt from ``file_identity`` data."""
+
+    sha256 = value.get("sha256")
+    size_bytes = value.get("size_bytes")
+    if not isinstance(sha256, str) or len(sha256) != 64:
+        raise CoverageAwareAnalysisError(f"{label}.sha256 must be a SHA-256 hex string")
+    try:
+        int(sha256, 16)
+    except ValueError as error:
+        raise CoverageAwareAnalysisError(
+            f"{label}.sha256 must be a SHA-256 hex string"
+        ) from error
+    if isinstance(size_bytes, bool):
+        raise CoverageAwareAnalysisError(f"{label}.size_bytes must be a positive integer")
+    try:
+        parsed_size = int(size_bytes)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise CoverageAwareAnalysisError(
+            f"{label}.size_bytes must be a positive integer"
+        ) from error
+    if parsed_size <= 0 or parsed_size != size_bytes:
+        raise CoverageAwareAnalysisError(f"{label}.size_bytes must be a positive integer")
+    return {"sha256": sha256, "size_bytes": parsed_size}
+
+
+def _same_content_identity(actual: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    return (
+        actual.get("sha256") == expected.get("sha256")
+        and actual.get("size_bytes") == expected.get("size_bytes")
+    )
+
+
+def _resolve_run_relative_path(
+    run_root: Path,
+    path: Path,
+    *,
+    label: str,
+    regular_file: bool = False,
+) -> str:
+    if path.is_symlink():
+        raise CoverageAwareAnalysisError(f"{label} must not be a symlink")
+    if regular_file and not path.is_file():
+        raise CoverageAwareAnalysisError(f"{label} must be a regular file")
+    try:
+        return path.resolve().relative_to(run_root.resolve()).as_posix()
+    except ValueError as error:
+        raise CoverageAwareAnalysisError(
+            f"{label} must be located within the formal run root"
+        ) from error
+
+
 def _resolve_child(root: Path, relative: object, *, label: str) -> Path:
     if not isinstance(relative, str) or not relative.strip():
         raise CoverageAwareAnalysisError(f"{label} must be a non-empty relative path")
@@ -749,6 +803,56 @@ def _discover_reference_analysis(
         raise CoverageAwareAnalysisError(
             "reference analysis must not use a background realization"
         )
+    run_id = manifest.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise CoverageAwareAnalysisError("reference analysis run_id must be non-empty")
+    production_manifest_text = manifest.get("production_manifest_path")
+    if not isinstance(production_manifest_text, str) or not production_manifest_text:
+        raise CoverageAwareAnalysisError(
+            "reference analysis lacks production_manifest_path"
+        )
+    production_manifest_path = Path(production_manifest_text).expanduser().resolve()
+    if not production_manifest_path.is_file() or production_manifest_path.is_symlink():
+        raise CoverageAwareAnalysisError(
+            "reference analysis production_manifest_path must be a real regular file"
+        )
+    run_root = production_manifest_path.parent.resolve()
+    recorded_manifest_relative = manifest.get("production_manifest_relative_to_run_root")
+    actual_manifest_relative = _resolve_run_relative_path(
+        run_root,
+        production_manifest_path,
+        label="reference analysis production manifest",
+        regular_file=True,
+    )
+    if recorded_manifest_relative != actual_manifest_relative:
+        raise CoverageAwareAnalysisError(
+            "reference analysis production_manifest_relative_to_run_root conflicts "
+            "with production_manifest_path"
+        )
+    expected_manifest_identity = manifest.get("production_manifest_identity")
+    if not isinstance(expected_manifest_identity, Mapping):
+        raise CoverageAwareAnalysisError(
+            "reference analysis lacks production_manifest_identity"
+        )
+    expected_manifest_content = _content_identity(
+        expected_manifest_identity,
+        label="reference analysis production_manifest_identity",
+    )
+    if not _same_content_identity(
+        _content_identity(
+            file_identity(production_manifest_path),
+            label="production manifest identity",
+        ),
+        expected_manifest_content,
+    ):
+        raise CoverageAwareAnalysisError(
+            "reference analysis production manifest identity changed"
+        )
+    _resolve_run_relative_path(
+        run_root,
+        reference_dir,
+        label="reference_analysis_dir",
+    )
     delivery = manifest.get("delivery")
     if not isinstance(delivery, Mapping):
         raise CoverageAwareAnalysisError("reference analysis lacks delivery metadata")
@@ -816,11 +920,104 @@ def _discover_reference_analysis(
         analysis_manifest_path=manifest_path,
         analysis_manifest=manifest,
         lightcurve_path=lightcurve_path,
+        run_root=run_root,
+        run_id=run_id,
+        production_manifest_path=production_manifest_path,
+        production_manifest_relative_to_run_root=actual_manifest_relative,
+        production_manifest_identity=expected_manifest_content,
         source_id=source_id,
         case=str(case),
         cadence_seconds=cadence_seconds,
         raw_exposure_seconds=raw_exposure_seconds,
         curve=curve,
+    )
+
+
+def _resolve_coverage_policy(
+    request: CoverageAwareStampAnalysisRequest,
+    resolved: _ReferenceAnalysisInput,
+) -> _ResolvedCoveragePolicy:
+    """Load one policy and bind it to the strict analysis' frozen run."""
+
+    qc_relative, qc_identity = _resolve_campaign_qc(request, resolved)
+    try:
+        policy = load_frozen_raw_coverage_policy_v1(request.coverage_policy_path)
+        policy_relative, production_relative = (
+            validate_frozen_raw_coverage_policy_for_run_v1(
+                policy,
+                production_manifest_path=resolved.production_manifest_path,
+                case=resolved.case,
+            )
+        )
+    except FrozenRawCoveragePolicyError as error:
+        raise CoverageAwareAnalysisError(f"invalid frozen coverage policy: {error}") from error
+    if production_relative != resolved.production_manifest_relative_to_run_root:
+        raise CoverageAwareAnalysisError(
+            "frozen coverage policy resolves a different production-manifest path"
+        )
+    if not _same_content_identity(
+        policy.production_manifest_identity,
+        resolved.production_manifest_identity,
+    ):
+        raise CoverageAwareAnalysisError(
+            "frozen coverage policy conflicts with strict analysis production identity"
+        )
+    _resolve_run_relative_path(
+        resolved.run_root,
+        Path(request.output_dir),
+        label="coverage-aware output_dir",
+    )
+    return _ResolvedCoveragePolicy(
+        policy=policy,
+        policy_relative_to_run_root=policy_relative,
+        campaign_qc_relative_to_run_root=qc_relative,
+        campaign_qc_identity=qc_identity,
+    )
+
+
+def _resolve_campaign_qc(
+    request: CoverageAwareStampAnalysisRequest,
+    resolved: _ReferenceAnalysisInput,
+) -> tuple[str, Mapping[str, Any]]:
+    """Require the immutable full-campaign QC gate before source analysis."""
+
+    qc_path = Path(request.campaign_qc_path)
+    qc_relative = _resolve_run_relative_path(
+        resolved.run_root,
+        qc_path,
+        label="campaign QC receipt",
+        regular_file=True,
+    )
+    receipt = _read_json_object(qc_path, label="campaign QC receipt")
+    if receipt.get("schema_id") != "et_mainsim.galaxy_campaign_delivery_qc.v1":
+        raise CoverageAwareAnalysisError("campaign QC receipt has an unsupported schema")
+    if int(receipt.get("schema_version", -1)) != 1:
+        raise CoverageAwareAnalysisError("campaign QC receipt has an unsupported version")
+    if receipt.get("ready") is not True:
+        raise CoverageAwareAnalysisError("campaign QC receipt is not ready")
+    if receipt.get("case") != "injected":
+        raise CoverageAwareAnalysisError("campaign QC receipt is not for injected delivery")
+    if receipt.get("run_id") != resolved.run_id:
+        raise CoverageAwareAnalysisError("campaign QC receipt run_id conflicts with strict analysis")
+    manifest_identity = receipt.get("manifest_identity")
+    if not isinstance(manifest_identity, Mapping) or not _same_content_identity(
+        _content_identity(
+            manifest_identity,
+            label="campaign QC manifest identity",
+        ),
+        resolved.production_manifest_identity,
+    ):
+        raise CoverageAwareAnalysisError(
+            "campaign QC receipt binds a different production manifest"
+        )
+    coverage = receipt.get("coverage")
+    if not isinstance(coverage, Mapping) or coverage.get("target_count") != 10:
+        raise CoverageAwareAnalysisError(
+            "campaign QC receipt must prove exactly 10 formal targets"
+        )
+    return (
+        qc_relative,
+        _content_identity(file_identity(qc_path), label="campaign QC receipt identity"),
     )
 
 
@@ -913,27 +1110,64 @@ def _fsync_directory(path: Path) -> None:
 def _output_manifest(
     *,
     resolved: _ReferenceAnalysisInput,
-    request: CoverageAwareStampAnalysisRequest,
+    policy_binding: _ResolvedCoveragePolicy,
     result: CoverageAwareCDPPResult,
     binned_lightcurve_path: Path,
 ) -> dict[str, Any]:
+    policy = policy_binding.policy
+    reference_relative = _resolve_run_relative_path(
+        resolved.run_root,
+        resolved.reference_dir,
+        label="reference analysis directory",
+    )
+    lightcurve_relative = _resolve_run_relative_path(
+        resolved.run_root,
+        resolved.lightcurve_path,
+        label="reference light curve",
+        regular_file=True,
+    )
     return {
         "schema_id": COVERAGE_AWARE_STAMP_ANALYSIS_SCHEMA_ID,
         "schema_version": COVERAGE_AWARE_STAMP_ANALYSIS_SCHEMA_VERSION,
         "complete": True,
+        "run_id": resolved.run_id,
         "source_id": str(resolved.source_id),
         "source_id_int64": resolved.source_id,
         "case": resolved.case,
         "observation_product": "final_dn",
         "background_realization_used": False,
+        "production_manifest": {
+            "path_relative_to_run_root": (
+                resolved.production_manifest_relative_to_run_root
+            ),
+            "identity": dict(resolved.production_manifest_identity),
+        },
+        "campaign_qc": {
+            "path_relative_to_run_root": (
+                policy_binding.campaign_qc_relative_to_run_root
+            ),
+            "identity": dict(policy_binding.campaign_qc_identity),
+        },
         "analysis_implementation": {
             "module": "et_mainsim.coverage_aware_stamp_analysis",
-            "module_identity": file_identity(Path(__file__)),
+            "module_identity": _content_identity(
+                file_identity(Path(__file__)),
+                label="coverage analysis module identity",
+            ),
         },
         "input_reference_analysis": {
-            "path": str(resolved.reference_dir),
-            "analysis_manifest": file_identity(resolved.analysis_manifest_path),
-            "reference_lightcurve": file_identity(resolved.lightcurve_path),
+            "path_relative_to_run_root": reference_relative,
+            "analysis_manifest": _content_identity(
+                file_identity(resolved.analysis_manifest_path),
+                label="strict analysis manifest identity",
+            ),
+            "reference_lightcurve": {
+                "path_relative_to_run_root": lightcurve_relative,
+                "identity": _content_identity(
+                    file_identity(resolved.lightcurve_path),
+                    label="strict reference light-curve identity",
+                ),
+            },
             "source_id_int64": resolved.source_id,
             "case": resolved.case,
             "strict_quality_policy": "invalidate_whole_fixed_aperture_cadence",
@@ -944,13 +1178,13 @@ def _output_manifest(
             "raw_exposure_seconds": resolved.raw_exposure_seconds,
             "raw_frame_policy": "one_contiguous_raw_frame_per_reference_cadence",
         },
-        "coverage_policy": {
-            "minimum_coverage_fraction": request.minimum_coverage_fraction,
-            "minimum_accepted_bins": request.minimum_accepted_bins,
-            "bin_origin_seconds": request.bin_origin_seconds,
-            "invalid_cadence_handling": "omit_whole_invalid_cadences_without_pixel_or_flux_imputation",
-            "accepted_bin_normalization": "actual_effective_exposure_only",
+        "frozen_coverage_policy": {
+            "schema_id": policy.schema_id,
+            "schema_version": policy.schema_version,
+            "path_relative_to_run_root": policy_binding.policy_relative_to_run_root,
+            "identity": policy.content_identity,
         },
+        "coverage_policy": policy.coverage_policy_record(),
         "legacy_compatibility": {
             "pca_used": False,
             "savgol_detrending_used": False,
@@ -964,7 +1198,10 @@ def _output_manifest(
         "binned_lightcurve": {
             "path": binned_lightcurve_path.name,
             "format": "csv",
-            "identity": file_identity(binned_lightcurve_path),
+            "identity": _content_identity(
+                file_identity(binned_lightcurve_path),
+                label="binned light-curve identity",
+            ),
         },
         "metrics": {
             str(window): metric.to_dict()
@@ -981,6 +1218,8 @@ def run_coverage_aware_stamp_analysis_v1(
     if not isinstance(request, CoverageAwareStampAnalysisRequest):
         raise TypeError("request must be a CoverageAwareStampAnalysisRequest")
     resolved = _discover_reference_analysis(request)
+    policy_binding = _resolve_coverage_policy(request, resolved)
+    policy = policy_binding.policy
     output_dir = Path(request.output_dir)
     if output_dir.exists() or output_dir.is_symlink():
         raise FileExistsError(
@@ -1008,10 +1247,10 @@ def run_coverage_aware_stamp_analysis_v1(
         )
         result = compute_coverage_aware_cdpp_v1(
             resolved.curve,
-            windows_minutes=request.windows_minutes,
-            minimum_coverage_fraction=request.minimum_coverage_fraction,
-            minimum_accepted_bins=request.minimum_accepted_bins,
-            bin_origin_seconds=request.bin_origin_seconds,
+            windows_minutes=policy.windows_minutes,
+            minimum_coverage_fraction=policy.minimum_coverage_fraction,
+            minimum_accepted_bins=policy.minimum_accepted_bins,
+            bin_origin_seconds=policy.bin_origin_seconds,
         )
         binned_path = _write_binned_lightcurve(
             staging_dir / "coverage_aware_binned_lightcurve.csv",
@@ -1021,11 +1260,31 @@ def run_coverage_aware_stamp_analysis_v1(
             staging_dir / "coverage_aware_analysis_manifest.json",
             _output_manifest(
                 resolved=resolved,
-                request=request,
+                policy_binding=policy_binding,
                 result=result,
                 binned_lightcurve_path=binned_path,
             ),
         )
+        if not _same_content_identity(
+            _content_identity(
+                file_identity(request.campaign_qc_path),
+                label="campaign QC receipt identity after reduction",
+            ),
+            policy_binding.campaign_qc_identity,
+        ):
+            raise CoverageAwareAnalysisError(
+                "campaign QC receipt changed during coverage reduction"
+            )
+        if not _same_content_identity(
+            _content_identity(
+                file_identity(policy.path),
+                label="frozen coverage policy identity after reduction",
+            ),
+            policy.content_identity,
+        ):
+            raise CoverageAwareAnalysisError(
+                "frozen coverage policy changed during coverage reduction"
+            )
         _fsync_directory(staging_dir)
         os.replace(staging_dir, output_dir)
         _fsync_directory(output_dir.parent)
@@ -1048,22 +1307,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-analysis-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
-        "--windows-minutes",
-        nargs="+",
-        type=int,
-        default=(30, 90, 390),
+        "--campaign-qc",
+        required=True,
+        help="Ready full-campaign injected delivery QC receipt bound to this run.",
     )
     parser.add_argument(
-        "--minimum-coverage-fraction",
+        "--coverage-policy",
         required=True,
-        type=float,
         help=(
-            "Required scientific policy: accept a physical bin only when its "
-            "usable exposure fraction reaches this value."
+            "Immutable owner-approved raw-coverage policy JSON.  It binds "
+            "windows, coverage threshold, sample count, origin, and no-imputation "
+            "semantics to one formal production manifest."
         ),
     )
-    parser.add_argument("--minimum-accepted-bins", type=int, default=10)
-    parser.add_argument("--bin-origin-seconds", type=float, default=0.0)
     return parser
 
 
@@ -1074,19 +1330,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     request = CoverageAwareStampAnalysisRequest(
         reference_analysis_dir=args.reference_analysis_dir,
         output_dir=args.output_dir,
-        windows_minutes=tuple(args.windows_minutes),
-        minimum_coverage_fraction=args.minimum_coverage_fraction,
-        minimum_accepted_bins=args.minimum_accepted_bins,
-        bin_origin_seconds=args.bin_origin_seconds,
+        coverage_policy_path=args.coverage_policy,
+        campaign_qc_path=args.campaign_qc,
     )
     result = run_coverage_aware_stamp_analysis_v1(request)
+    policy = load_frozen_raw_coverage_policy_v1(request.coverage_policy_path)
     completion = result.to_dict()
     completion.update(
         {
-            "windows_minutes": list(request.windows_minutes),
-            "minimum_coverage_fraction": request.minimum_coverage_fraction,
-            "minimum_accepted_bins": request.minimum_accepted_bins,
-            "bin_origin_seconds": request.bin_origin_seconds,
+            "windows_minutes": list(policy.windows_minutes),
+            "minimum_coverage_fraction": policy.minimum_coverage_fraction,
+            "minimum_accepted_bins": policy.minimum_accepted_bins,
+            "bin_origin_seconds": policy.bin_origin_seconds,
+            "coverage_policy_identity": policy.content_identity,
         }
     )
     print(json.dumps(completion, ensure_ascii=False, sort_keys=True))

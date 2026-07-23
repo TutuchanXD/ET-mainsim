@@ -125,13 +125,12 @@ def test_galaxy_raw_coverage_analysis_launchers_are_qc_gated_and_immutable() -> 
     )
 
     assert (
-        ': "${ET_STAMP_MINIMUM_COVERAGE_FRACTION:?Set ET_STAMP_MINIMUM_COVERAGE_FRACTION'
+        ': "${ET_STAMP_COVERAGE_POLICY_JSON:?Set ET_STAMP_COVERAGE_POLICY_JSON'
         in coverage
     )
-    assert (
-        ': "${ET_STAMP_MINIMUM_ACCEPTED_BINS:?Set ET_STAMP_MINIMUM_ACCEPTED_BINS'
-        in coverage
-    )
+    assert "ET_STAMP_MINIMUM_COVERAGE_FRACTION" not in coverage
+    assert "ET_STAMP_MINIMUM_ACCEPTED_BINS" not in coverage
+    assert "ET_STAMP_BIN_ORIGIN_SECONDS" not in coverage
     assert "python -m et_mainsim.coverage_aware_stamp_analysis" in coverage
     assert (
         'REFERENCE_ANALYSIS_DIR="${RUN_ROOT}/analysis/source_${SOURCE_ID}/injected/raw_10s_strict"'
@@ -141,11 +140,8 @@ def test_galaxy_raw_coverage_analysis_launchers_are_qc_gated_and_immutable() -> 
         'OUTPUT_DIR="${RUN_ROOT}/analysis/source_${SOURCE_ID}/injected/raw_10s_coverage_v2"'
         in coverage
     )
-    assert (
-        '--minimum-coverage-fraction "${ET_STAMP_MINIMUM_COVERAGE_FRACTION}"'
-        in coverage
-    )
-    assert '--minimum-accepted-bins "${ET_STAMP_MINIMUM_ACCEPTED_BINS}"' in coverage
+    assert '--campaign-qc "${ET_STAMP_CAMPAIGN_QC_JSON}"' in coverage
+    assert '--coverage-policy "${ET_STAMP_COVERAGE_POLICY_JSON}"' in coverage
 
 
 def test_galaxy_campaign_qc_slurm_launcher_is_a_fail_closed_analysis_gate() -> None:

@@ -23,6 +23,11 @@ def test_galaxy_delivery_notebook_is_a_read_only_raw_coverage_v2_consumer() -> N
     assert "raw_10s_coverage_v2" in source
     assert "coverage_aware_analysis_manifest.json" in source
     assert "injected_campaign_delivery_qc.json" in source
+    assert "et_mainsim.raw_coverage_aware_stamp_analysis.v3" in source
+    assert "content_identity(" in source
+    assert "qc['manifest_identity'] == file_identity(manifest_path)" not in source
+    assert "input_reference['analysis_manifest'] == file_identity(" not in source
+    assert "ET_STAMP_MINIMUM_COVERAGE_FRACTION" not in source
     assert "run_standard_stamp_analysis_v1" not in source
     assert "StandardStampAnalysisRequest" not in source
     assert "discover_standard_stamp_analysis_input" not in source
