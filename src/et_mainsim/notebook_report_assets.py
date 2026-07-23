@@ -442,6 +442,31 @@ def _finite(value: Any, *, label: str) -> float:
     return result
 
 
+def _psf_id(value: Any, *, label: str) -> str | int:
+    """Validate the scalar ID shape emitted by the formal PSF audit.
+
+    The delivery audit reads ``chosen_psf_id`` from the focal-plane registry
+    and serializes the registry's integer IDs unchanged.  A future registry
+    may instead use a non-empty string key, but booleans, floats, and negative
+    IDs are not meaningful PSF selections.
+    """
+
+    if isinstance(value, bool):
+        raise NotebookReportAssetError(f"{label} must be a non-boolean PSF ID")
+    if isinstance(value, (int, np.integer)):
+        result = int(value)
+        if result < 0 or result > 2**63 - 1:
+            raise NotebookReportAssetError(
+                f"{label} must be a non-negative signed PSF ID"
+            )
+        return result
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise NotebookReportAssetError(
+        f"{label} must be a non-empty string or non-negative integer PSF ID"
+    )
+
+
 def _validate_campaign_qc(
     qc: Mapping[str, Any],
     *,
@@ -556,7 +581,10 @@ def _validate_provenance_audit(
                 raise NotebookReportAssetError(
                     f"provenance audit source {source_id} {name} must be zero"
                 )
-        _text(summary.get("chosen_psf_id"), label=f"provenance audit source {source_id} PSF")
+        _psf_id(
+            summary.get("chosen_psf_id"),
+            label=f"provenance audit source {source_id} PSF",
+        )
         _finite(
             summary.get("node_angle_deg"),
             label=f"provenance audit source {source_id} node angle",

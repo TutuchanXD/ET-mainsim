@@ -32,6 +32,7 @@ def _formal_receipts(
     tmp_path: Path,
     *,
     provenance_ready: bool = True,
+    chosen_psf_id: object = "psf-12deg",
 ) -> dict[str, Path]:
     run_root = tmp_path / "galaxy_independent_90d_v3"
     quality_control = run_root / "quality_control"
@@ -88,7 +89,7 @@ def _formal_receipts(
                     "valid_bundle_count": 5 if provenance_ready else 4,
                     "missing_bundle_count": 0 if provenance_ready else 1,
                     "invalid_bundle_count": 0,
-                    "chosen_psf_id": "psf-12deg",
+                    "chosen_psf_id": chosen_psf_id,
                     "node_angle_deg": 12.0,
                     "runtime_registry_attestation_verified": provenance_ready,
                     "runtime_registry_semantic_content_sha256": "a" * 64,
@@ -174,6 +175,36 @@ def test_nullable_cdpp_values_convert_blanks_and_masks_to_nan() -> None:
     np.testing.assert_allclose(result[[0, 3]], [12.5, 7.0])
     assert np.isnan(result[1])
     assert np.isnan(result[2])
+
+
+def test_readiness_accepts_integer_psf_ids_from_the_provenance_audit(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.notebook_report_assets import (
+        validate_galaxy_notebook_readiness_v1,
+    )
+
+    paths = _formal_receipts(tmp_path, chosen_psf_id=1)
+
+    readiness = validate_galaxy_notebook_readiness_v1(_readiness_request(paths))
+
+    assert readiness.run_id == "galaxy_independent_90d_v3"
+
+
+@pytest.mark.parametrize("chosen_psf_id", [True, -1, 1.5, "   "])
+def test_readiness_refuses_nonphysical_psf_ids(
+    tmp_path: Path,
+    chosen_psf_id: object,
+) -> None:
+    from et_mainsim.notebook_report_assets import (
+        NotebookReportAssetError,
+        validate_galaxy_notebook_readiness_v1,
+    )
+
+    paths = _formal_receipts(tmp_path, chosen_psf_id=chosen_psf_id)
+
+    with pytest.raises(NotebookReportAssetError, match="PSF ID"):
+        validate_galaxy_notebook_readiness_v1(_readiness_request(paths))
 
 
 def test_pr_asset_export_is_an_explicit_opt_in_outside_the_run_root(
