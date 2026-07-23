@@ -23,7 +23,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from .galaxy_stamp_production import build_galaxy_independent_production_spec
+from .science_stamp_production import build_science_independent_production_spec
 from .independent_stamp_production import (
     IndependentStampShardRequest,
     raw_stamp_delivery_frame_from_photsim7,
@@ -416,7 +416,7 @@ def prepare_aster_g6_saturation_validation(
     )
     if len(time_plan.shards) != 1:
         raise RuntimeError("Aster saturation validation must have one time shard")
-    base_spec = build_galaxy_independent_production_spec(
+    base_spec = build_science_independent_production_spec(
         n_raw_frames=config.n_raw_frames,
         raw_exposure_seconds=config.raw_exposure_seconds,
         device=config.device,

@@ -1278,10 +1278,8 @@ def run_galaxy_independent_target(
                 "case": case,
                 "rng_trace_scope": dict(rng_trace_scope),
                 "physical_rng_pairing": dict(physical_rng_pairing),
-                "galaxy_production_manifest": str(resolved_manifest_path),
-                "galaxy_production_manifest_identity": dict(
-                    production_manifest_identity
-                ),
+                "production_manifest": str(resolved_manifest_path),
+                "production_manifest_identity": dict(production_manifest_identity),
                 "target_input_truth": source_truth,
                 "simulation_spec_sha256": target_spec_sha256,
                 "renderer_options": renderer_options,

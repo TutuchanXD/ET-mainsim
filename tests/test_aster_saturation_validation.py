@@ -64,6 +64,9 @@ def test_prepare_aster_g6_freezes_explicit_psf_inputs_and_time_plan(tmp_path) ->
     assert manifest["target"]["psf_id"] == 6
     assert manifest["target"]["psf_node_angle_deg"] == 12.0
     assert manifest["target"]["coordinate_mode"] == "explicit_psf_no_sky_coordinate"
+    assert manifest["simulation_spec_base"]["dynamic_effects"]["dva"][
+        "enabled"
+    ] is False
     assert manifest["delivery"]["coadd_sizes"] == [3, 6, 12, 30]
     assert manifest["delivery"]["time_plan_relative_path"] == "inputs/time_shards.json"
     assert prepared.time_plan.accepted_raw_frame_count == 60

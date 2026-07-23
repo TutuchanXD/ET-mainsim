@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+import ctypes
 from dataclasses import dataclass
 import errno
 import hashlib
@@ -27,16 +28,26 @@ from uuid import uuid4
 
 import numpy as np
 
-from .galaxy_stamp_production import (
-    STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE,
-    delivery_execution_mode_from_manifest,
-)
 from .independent_stamp_production import _read_staged_bundle_coverage
 from .time_shards import ContinuousTimeShard, ContinuousTimeShardPlan
 
 
 class StagedStampShardPublishError(RuntimeError):
     """A scratch shard cannot safely become a formal delivery shard."""
+
+
+_STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE = "staged_local_scratch_v1"
+_LEGACY_GALAXY_PRODUCTION_SCHEMA_ID = "et_mainsim.galaxy_stamp_production.v1"
+_LEGACY_GALAXY_PRODUCTION_SCHEMA_VERSION = 2
+_GENERIC_MANIFEST_PATH_KEY = "production_manifest"
+_GENERIC_MANIFEST_IDENTITY_KEY = "production_manifest_identity"
+_LEGACY_GALAXY_MANIFEST_PATH_KEY = "galaxy_production_manifest"
+_LEGACY_GALAXY_MANIFEST_IDENTITY_KEY = "galaxy_production_manifest_identity"
+STAMP_SHARD_PUBLICATION_RECEIPT_FILENAME = "publication_receipt.json"
+STAMP_SHARD_PUBLICATION_RECEIPT_SCHEMA_ID = (
+    "et_mainsim.stamp_shard_publication_receipt.v1"
+)
+STAMP_SHARD_PUBLICATION_RECEIPT_SCHEMA_VERSION = 1
 
 
 _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
@@ -103,6 +114,78 @@ def _fsync_directory(path: Path) -> bool:
     finally:
         os.close(descriptor)
     return True
+
+
+def _atomic_publish_directory_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish a directory while refusing every existing target."""
+
+    renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if renameat2 is None:
+        raise StagedStampShardPublishError(
+            "atomic no-replace directory publication is unavailable"
+        )
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    at_fdcwd = -100
+    rename_noreplace = 1
+    status = renameat2(
+        at_fdcwd,
+        os.fsencode(source),
+        at_fdcwd,
+        os.fsencode(destination),
+        rename_noreplace,
+    )
+    if status == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            f"formal shard delivery already exists: {destination}",
+            str(destination),
+        )
+    if error_number in {
+        errno.EINVAL,
+        errno.ENOSYS,
+        errno.ENOTSUP,
+        errno.EOPNOTSUPP,
+    }:
+        raise StagedStampShardPublishError(
+            "filesystem does not support atomic no-replace directory publication"
+        )
+    raise OSError(
+        error_number,
+        os.strerror(error_number),
+        str(destination),
+    )
+
+
+def _require_no_symlink_directory_components(path: Path, *, run_root: Path) -> None:
+    """Reject an existing non-directory or symlink in a formal parent path."""
+
+    try:
+        relative = path.relative_to(run_root)
+    except ValueError as error:
+        raise StagedStampShardPublishError(
+            "formal shard parent escapes the production run root"
+        ) from error
+    current = run_root
+    for component in relative.parts:
+        current = current / component
+        if current.is_symlink():
+            raise StagedStampShardPublishError(
+                f"formal shard parent contains a symbolic link: {current}"
+            )
+        if current.exists() and not current.is_dir():
+            raise StagedStampShardPublishError(
+                f"formal shard parent component is not a directory: {current}"
+            )
 
 
 @dataclass(frozen=True)
@@ -254,6 +337,108 @@ def _same_file_content_identity(
     )
 
 
+def _delivery_execution_mode_from_manifest(payload: Mapping[str, Any]) -> str:
+    """Read the generic frozen delivery mode without importing a campaign."""
+
+    delivery = payload.get("delivery")
+    if not isinstance(delivery, Mapping):
+        raise ValueError("production manifest delivery must be an object")
+    execution_mode = delivery.get("execution_mode", "direct_shared_filesystem")
+    if not isinstance(execution_mode, str) or execution_mode not in {
+        "direct_shared_filesystem",
+        _STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE,
+    }:
+        raise ValueError("production manifest delivery.execution_mode is invalid")
+    return execution_mode
+
+
+def _is_legacy_galaxy_production_manifest(payload: Mapping[str, Any]) -> bool:
+    """Return whether the manifest may use the retired Galaxy-only keys."""
+
+    return (
+        payload.get("schema_id") == _LEGACY_GALAXY_PRODUCTION_SCHEMA_ID
+        and payload.get("schema_version")
+        == _LEGACY_GALAXY_PRODUCTION_SCHEMA_VERSION
+    )
+
+
+def _caller_production_manifest_reference(
+    caller: Mapping[str, Any],
+    *,
+    production_manifest_payload: Mapping[str, Any],
+    member_name: str,
+) -> tuple[Any, Any]:
+    """Select generic provenance or the exact historical Galaxy fallback.
+
+    A partially populated generic reference is never allowed to fall back.  It
+    would otherwise let an HDF5 member silently change provenance dialect when
+    one key is missing.  Likewise, Galaxy-named fields cannot authenticate a
+    generic campaign.
+    """
+
+    generic_path_present = _GENERIC_MANIFEST_PATH_KEY in caller
+    generic_identity_present = _GENERIC_MANIFEST_IDENTITY_KEY in caller
+    legacy_path_present = _LEGACY_GALAXY_MANIFEST_PATH_KEY in caller
+    legacy_identity_present = _LEGACY_GALAXY_MANIFEST_IDENTITY_KEY in caller
+    generic_present = generic_path_present or generic_identity_present
+    legacy_present = legacy_path_present or legacy_identity_present
+    legacy_galaxy_manifest = _is_legacy_galaxy_production_manifest(
+        production_manifest_payload
+    )
+
+    if generic_present:
+        if not generic_path_present or not generic_identity_present:
+            raise StagedStampShardPublishError(
+                f"staged delivery member {member_name} has an incomplete generic "
+                "production manifest reference"
+            )
+        if legacy_present:
+            if not legacy_galaxy_manifest:
+                raise StagedStampShardPublishError(
+                    f"staged delivery member {member_name} uses Galaxy provenance "
+                    "on a generic production manifest"
+                )
+            if not legacy_path_present or not legacy_identity_present:
+                raise StagedStampShardPublishError(
+                    f"staged delivery member {member_name} has an incomplete legacy "
+                    "Galaxy production manifest reference"
+                )
+            if (
+                caller[_GENERIC_MANIFEST_PATH_KEY]
+                != caller[_LEGACY_GALAXY_MANIFEST_PATH_KEY]
+                or caller[_GENERIC_MANIFEST_IDENTITY_KEY]
+                != caller[_LEGACY_GALAXY_MANIFEST_IDENTITY_KEY]
+            ):
+                raise StagedStampShardPublishError(
+                    f"staged delivery member {member_name} has conflicting generic "
+                    "and legacy Galaxy production manifest references"
+                )
+        return (
+            caller[_GENERIC_MANIFEST_PATH_KEY],
+            caller[_GENERIC_MANIFEST_IDENTITY_KEY],
+        )
+
+    if legacy_present:
+        if not legacy_galaxy_manifest:
+            raise StagedStampShardPublishError(
+                f"staged delivery member {member_name} generic production requires "
+                "caller_manifest.production_manifest"
+            )
+        if not legacy_path_present or not legacy_identity_present:
+            raise StagedStampShardPublishError(
+                f"staged delivery member {member_name} has an incomplete legacy "
+                "Galaxy production manifest reference"
+            )
+        return (
+            caller[_LEGACY_GALAXY_MANIFEST_PATH_KEY],
+            caller[_LEGACY_GALAXY_MANIFEST_IDENTITY_KEY],
+        )
+
+    raise StagedStampShardPublishError(
+        f"staged delivery member {member_name} has no production manifest reference"
+    )
+
+
 def _require_staged_manifest_and_canonical_formal_root(
     request: StagedStampShardPublishRequest,
     payload: Mapping[str, Any],
@@ -261,12 +446,12 @@ def _require_staged_manifest_and_canonical_formal_root(
     """Reject mixed writer modes and cross-run publication before I/O begins."""
 
     try:
-        execution_mode = delivery_execution_mode_from_manifest(payload)
+        execution_mode = _delivery_execution_mode_from_manifest(payload)
     except (TypeError, ValueError) as error:
         raise StagedStampShardPublishError(
             "production manifest delivery.execution_mode is invalid"
         ) from error
-    if execution_mode != STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE:
+    if execution_mode != _STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE:
         raise StagedStampShardPublishError(
             "staged publisher requires "
             "delivery.execution_mode='staged_local_scratch_v1'"
@@ -464,6 +649,7 @@ def _validate_shard_contract(
     *,
     request: StagedStampShardPublishRequest,
     run_id: str,
+    production_manifest_payload: Mapping[str, Any],
     production_manifest_identity: Mapping[str, Any],
 ) -> None:
     _require_exact_members(root, shard=request.shard)
@@ -492,12 +678,21 @@ def _validate_shard_contract(
             raise StagedStampShardPublishError(
                 f"staged delivery member {name} case does not match publication request"
             )
-        caller_manifest = caller.get("galaxy_production_manifest")
-        if not isinstance(caller_manifest, str) or Path(caller_manifest).expanduser().resolve() != request.production_manifest_path:
+        caller_manifest, caller_manifest_identity = (
+            _caller_production_manifest_reference(
+                caller,
+                production_manifest_payload=production_manifest_payload,
+                member_name=name,
+            )
+        )
+        if (
+            not isinstance(caller_manifest, str)
+            or Path(caller_manifest).expanduser().resolve()
+            != request.production_manifest_path
+        ):
             raise StagedStampShardPublishError(
                 f"staged delivery member {name} does not cite the canonical production manifest"
             )
-        caller_manifest_identity = caller.get("galaxy_production_manifest_identity")
         if (
             not isinstance(caller_manifest_identity, Mapping)
             or dict(caller_manifest_identity) != dict(production_manifest_identity)
@@ -533,8 +728,167 @@ def _copy_members_and_verify(
             raise StagedStampShardPublishError(
                 f"byte identity mismatch after copying {name} to formal storage"
             )
-        identities[name] = source_hash
+        # The formal receipt records the destination digest.  Equality above
+        # separately proves that it is byte-identical to the scratch source.
+        identities[name] = destination_hash
     return identities
+
+
+def _full_shard_identity(shard: ContinuousTimeShard) -> dict[str, Any]:
+    """Serialize every field that determines one independent time shard."""
+
+    return {
+        "shard_id": int(shard.shard_id),
+        "raw_start_index": int(shard.raw_start_index),
+        "raw_stop_index": int(shard.raw_stop_index),
+        "coadd_sizes": [int(value) for value in shard.coadd_sizes],
+        "raw_exposure_seconds": float(shard.raw_exposure_seconds),
+    }
+
+
+def _sha256_hex(value: str, *, label: str) -> str:
+    prefix = "sha256:"
+    if not isinstance(value, str) or not value.startswith(prefix):
+        raise StagedStampShardPublishError(f"{label} has no SHA-256 identity")
+    digest = value[len(prefix) :]
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise StagedStampShardPublishError(f"{label} has an invalid SHA-256 identity")
+    return digest
+
+
+def _publication_receipt_payload(
+    *,
+    request: StagedStampShardPublishRequest,
+    staging_root: Path,
+    run_id: str,
+    production_manifest_identity: Mapping[str, Any],
+    member_sha256: Mapping[str, str],
+) -> dict[str, Any]:
+    """Build one relocation-safe receipt for the future final shard paths."""
+
+    run_root = Path(request.production_manifest_path).parent.resolve()
+    expected_names = tuple(name for name, _, _ in _expected_members(request.shard))
+    if set(member_sha256) != set(expected_names):
+        raise StagedStampShardPublishError(
+            "copied member identities differ from the exact raw/coadd delivery set"
+        )
+    manifest_sha256 = production_manifest_identity.get("sha256")
+    manifest_size = production_manifest_identity.get("size_bytes")
+    if (
+        not isinstance(manifest_sha256, str)
+        or len(manifest_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in manifest_sha256)
+        or isinstance(manifest_size, bool)
+        or not isinstance(manifest_size, int)
+        or manifest_size < 0
+    ):
+        raise StagedStampShardPublishError(
+            "production manifest has an invalid frozen content identity"
+        )
+
+    members: dict[str, dict[str, Any]] = {}
+    for name in expected_names:
+        staged_member = staging_root / name
+        if not staged_member.is_file() or staged_member.is_symlink():
+            raise StagedStampShardPublishError(
+                f"copied shard member is not a regular file: {staged_member}"
+            )
+        final_member = request.final_shard_root / name
+        try:
+            relative_path = final_member.relative_to(run_root).as_posix()
+        except ValueError as error:
+            raise StagedStampShardPublishError(
+                "formal shard member path escapes the production run root"
+            ) from error
+        members[name] = {
+            "path_relative_to_run_root": relative_path,
+            "size_bytes": int(staged_member.stat().st_size),
+            "sha256": _sha256_hex(
+                member_sha256[name],
+                label=f"copied shard member {name}",
+            ),
+        }
+
+    manifest_relative_path = Path(request.production_manifest_path).relative_to(
+        run_root
+    ).as_posix()
+    return {
+        "schema_id": STAMP_SHARD_PUBLICATION_RECEIPT_SCHEMA_ID,
+        "schema_version": STAMP_SHARD_PUBLICATION_RECEIPT_SCHEMA_VERSION,
+        "complete": True,
+        "run_id": run_id,
+        "case": request.case,
+        "target_source_id_int64": request.target_source_id,
+        "shard": _full_shard_identity(request.shard),
+        "production_manifest": {
+            "path_relative_to_run_root": manifest_relative_path,
+            "size_bytes": manifest_size,
+            "sha256": manifest_sha256,
+        },
+        "members": members,
+    }
+
+
+def _canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            dict(payload),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _validate_publication_receipt_readback(
+    path: Path,
+    *,
+    expected_payload: Mapping[str, Any],
+) -> None:
+    """Require the durable receipt bytes to equal the canonical intended bytes."""
+
+    if not path.is_file() or path.is_symlink():
+        raise StagedStampShardPublishError(
+            "publication receipt is not a regular non-symlink file"
+        )
+    actual_bytes = _read_frozen_file_bytes(path, label="publication receipt")
+    expected_bytes = _canonical_json_bytes(expected_payload)
+    if actual_bytes != expected_bytes:
+        raise StagedStampShardPublishError(
+            "publication receipt readback differs from the intended receipt"
+        )
+    parsed = _json_object_from_bytes(actual_bytes, label="publication receipt")
+    if dict(parsed) != dict(expected_payload):
+        raise StagedStampShardPublishError(
+            "publication receipt readback has the wrong payload"
+        )
+
+
+def _write_and_validate_publication_receipt(
+    staging_root: Path,
+    *,
+    payload: Mapping[str, Any],
+) -> Path:
+    """Durably write and strictly read back a receipt inside hidden staging."""
+
+    path = staging_root / STAMP_SHARD_PUBLICATION_RECEIPT_FILENAME
+    raw_bytes = _canonical_json_bytes(payload)
+    try:
+        with path.open("xb") as stream:
+            stream.write(raw_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError as error:
+        raise StagedStampShardPublishError(
+            "publication receipt unexpectedly already exists in staging"
+        ) from error
+    _validate_publication_receipt_readback(
+        path,
+        expected_payload=payload,
+    )
+    return path
 
 
 def publish_staged_independent_stamp_shard(
@@ -566,12 +920,16 @@ def publish_staged_independent_stamp_shard(
         source_root,
         request=request,
         run_id=run_id,
+        production_manifest_payload=frozen_manifest.payload,
         production_manifest_identity=production_manifest_identity,
     )
 
     final_root = request.final_shard_root
     parent = final_root.parent
+    run_root = production_manifest_path.parent.resolve()
+    _require_no_symlink_directory_components(parent, run_root=run_root)
     parent.mkdir(parents=True, exist_ok=True)
+    _require_no_symlink_directory_components(parent, run_root=run_root)
     if final_root.exists() or final_root.is_symlink():
         raise FileExistsError(f"formal shard delivery already exists: {final_root}")
     lock = parent / f".{final_root.name}.staged-publish.lock"
@@ -597,14 +955,27 @@ def publish_staged_independent_stamp_shard(
             staging_root,
             request=request,
             run_id=run_id,
+            production_manifest_payload=frozen_manifest.payload,
             production_manifest_identity=production_manifest_identity,
+        )
+        receipt_payload = _publication_receipt_payload(
+            request=request,
+            staging_root=staging_root,
+            run_id=run_id,
+            production_manifest_identity=production_manifest_identity,
+            member_sha256=identities,
+        )
+        _write_and_validate_publication_receipt(
+            staging_root,
+            payload=receipt_payload,
         )
         _fsync_directory(staging_root)
         _require_frozen_inputs_unchanged(
             frozen_manifest=frozen_manifest,
             frozen_time_shard=frozen_time_shard,
         )
-        os.replace(staging_root, final_root)
+        _require_no_symlink_directory_components(parent, run_root=run_root)
+        _atomic_publish_directory_noreplace(staging_root, final_root)
         published = True
         parent_directory_fsync = (
             "completed" if _fsync_directory(parent) else "unsupported"

@@ -839,11 +839,13 @@ def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
     assert requests[3].manifest["physical_rng_pairing"][
         "canonical_context_scope"]["detector_id"] == "main_ld"
     assert requests[3].output_root == scratch_case_root
-    assert requests[3].manifest["galaxy_production_manifest"] == str(
+    assert requests[3].manifest["production_manifest"] == str(
         staged_manifest_path.resolve()
     )
     staged_identity = production.file_identity(staged_manifest_path)
-    assert requests[3].manifest["galaxy_production_manifest_identity"] == {
+    assert requests[3].manifest["production_manifest_identity"] == {
         "sha256": staged_identity["sha256"],
         "size_bytes": staged_identity["size_bytes"],
     }
+    assert "galaxy_production_manifest" not in requests[3].manifest
+    assert "galaxy_production_manifest_identity" not in requests[3].manifest
