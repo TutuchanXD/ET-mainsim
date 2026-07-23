@@ -867,9 +867,30 @@ def _write_binned_lightcurve(
     return path
 
 
+def _json_safe(value: Any) -> Any:
+    """Convert NumPy/non-finite diagnostics to portable strict JSON values."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
+
+
 def _write_json(path: Path, payload: Mapping[str, Any]) -> Path:
     with path.open("w", encoding="utf-8") as stream:
-        json.dump(payload, stream, ensure_ascii=False, sort_keys=True, indent=2)
+        json.dump(
+            _json_safe(payload),
+            stream,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        )
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())

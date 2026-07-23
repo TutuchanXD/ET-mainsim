@@ -383,6 +383,32 @@ def test_coverage_aware_analysis_publishes_an_atomic_receipt(tmp_path) -> None:
     assert all(row["accepted"] == "1" for row in rows)
 
 
+def test_coverage_aware_analysis_serializes_unavailable_cdpp_as_json_null(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.coverage_aware_stamp_analysis import (
+        CoverageAwareStampAnalysisRequest,
+        run_coverage_aware_stamp_analysis_v1,
+    )
+
+    source_dir, output_dir = _write_reference_analysis_fixture(tmp_path)
+    result = run_coverage_aware_stamp_analysis_v1(
+        CoverageAwareStampAnalysisRequest(
+            reference_analysis_dir=source_dir,
+            output_dir=output_dir,
+            windows_minutes=(30,),
+            minimum_coverage_fraction=0.90,
+            minimum_accepted_bins=3,
+        )
+    )
+
+    manifest_text = result.analysis_manifest_path.read_text(encoding="utf-8")
+    assert "NaN" not in manifest_text
+    metrics = json.loads(manifest_text)["metrics"]["30"]
+    assert metrics["observed_cdpp_ppm"] is None
+    assert metrics["residual_cdpp_ppm"] is None
+
+
 def test_coverage_aware_analysis_rejects_a_coadded_reference_input(
     tmp_path: Path,
 ) -> None:
