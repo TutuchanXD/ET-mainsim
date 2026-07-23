@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
@@ -37,6 +38,16 @@ from .time_shards import ContinuousTimeShard, ContinuousTimeShardPlan
 
 class StagedStampShardPublishError(RuntimeError):
     """A scratch shard cannot safely become a formal delivery shard."""
+
+
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
+    {
+        errno.EINVAL,
+        errno.ENOSYS,
+        errno.ENOTSUP,
+        errno.EOPNOTSUPP,
+    }
+)
 
 
 def _strict_source_id(value: Any) -> int:
@@ -79,9 +90,21 @@ def _fsync_file(path: Path) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+    """Persist a rename, tolerating only filesystems without directory fsync."""
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     try:
-        os.fsync(descriptor)
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if error.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+                raise
     finally:
         os.close(descriptor)
 
@@ -189,6 +212,18 @@ def _production_manifest_content_identity(path: Path) -> dict[str, Any]:
     }
 
 
+def _same_file_content_identity(
+    actual: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> bool:
+    """Compare the portable content fields of two file-identity receipts."""
+
+    return (
+        actual.get("sha256") == expected.get("sha256")
+        and actual.get("size_bytes") == expected.get("size_bytes")
+    )
+
+
 def _require_staged_manifest_and_canonical_formal_root(
     request: StagedStampShardPublishRequest,
 ) -> Mapping[str, Any]:
@@ -241,6 +276,19 @@ def _load_frozen_time_shard(
         raise StagedStampShardPublishError(
             "production time-shard plan must stay below the production manifest root"
         ) from error
+    expected_identity = delivery.get("time_plan_identity")
+    try:
+        actual_identity = file_identity(time_plan_path)
+    except OSError as error:
+        raise StagedStampShardPublishError(
+            "cannot read the frozen production time-shard plan"
+        ) from error
+    if not isinstance(expected_identity, Mapping) or not _same_file_content_identity(
+        actual_identity, expected_identity
+    ):
+        raise StagedStampShardPublishError(
+            "time shard plan identity changed after production preparation"
+        )
     try:
         with time_plan_path.open(encoding="utf-8") as stream:
             time_plan_payload = json.load(stream)
@@ -418,6 +466,14 @@ def publish_staged_independent_stamp_shard(
     if not isinstance(request, StagedStampShardPublishRequest):
         raise TypeError("request must be a StagedStampShardPublishRequest")
     _require_staged_manifest_and_canonical_formal_root(request)
+    frozen_shard = _load_frozen_time_shard(
+        Path(request.production_manifest_path),
+        shard_id=request.shard.shard_id,
+    )
+    if request.shard != frozen_shard:
+        raise StagedStampShardPublishError(
+            "request shard does not match the frozen production time-shard plan"
+        )
     run_id = _load_run_id(Path(request.production_manifest_path))
     production_manifest_identity = _production_manifest_content_identity(
         Path(request.production_manifest_path)

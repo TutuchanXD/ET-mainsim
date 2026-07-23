@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -53,7 +56,9 @@ def _make_staged_shard(tmp_path):
         max_raw_frames_per_shard=6,
         shards=(shard,),
     )
-    time_plan.write_manifest(inputs_root / "time_shards.json")
+    time_plan_path = time_plan.write_manifest(inputs_root / "time_shards.json")
+    from et_mainsim.stamp_inputs import file_identity
+
     production_manifest = tmp_path / "production_manifest.json"
     production_manifest.write_text(
         json.dumps(
@@ -62,12 +67,12 @@ def _make_staged_shard(tmp_path):
                 "delivery": {
                     "execution_mode": "staged_local_scratch_v1",
                     "time_plan_relative_path": "inputs/time_shards.json",
+                    "time_plan_identity": file_identity(time_plan_path),
                 },
             }
         ),
         encoding="utf-8",
     )
-    from et_mainsim.stamp_inputs import file_identity
 
     production_manifest_identity = file_identity(production_manifest)
     request = IndependentStampShardRequest(
@@ -165,14 +170,13 @@ def test_publish_staged_shard_rejects_a_different_production_manifest(tmp_path) 
     )
 
     production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
+    original_payload = json.loads(production_manifest.read_text(encoding="utf-8"))
     different_manifest = tmp_path / "different_manifest.json"
     different_manifest.write_text(
         json.dumps(
             {
                 "run_id": "different",
-                "delivery": {
-                    "execution_mode": "staged_local_scratch_v1",
-                },
+                "delivery": original_payload["delivery"],
             }
         ),
         encoding="utf-8",
@@ -294,6 +298,110 @@ def test_publish_staged_shard_rejects_changed_production_manifest_identity(
     ).exists()
 
 
+def test_publish_api_rejects_a_shard_that_differs_from_the_frozen_plan(
+    tmp_path,
+) -> None:
+    from et_mainsim.staged_stamp_delivery import (
+        StagedStampShardPublishError,
+        StagedStampShardPublishRequest,
+        publish_staged_independent_stamp_shard,
+    )
+    from et_mainsim.time_shards import ContinuousTimeShard
+
+    production_manifest, staged_case_root, _ = _make_staged_shard(tmp_path)
+    formal_case_root = production_manifest.parent / "cases" / "injected"
+    wrong_shard = ContinuousTimeShard(
+        shard_id=0,
+        raw_start_index=18,
+        raw_stop_index=24,
+        coadd_sizes=(3, 6),
+        raw_exposure_seconds=10.0,
+    )
+
+    with pytest.raises(
+        StagedStampShardPublishError,
+        match="does not match the frozen production time-shard plan",
+    ):
+        publish_staged_independent_stamp_shard(
+            StagedStampShardPublishRequest(
+                staged_case_root=staged_case_root,
+                formal_case_root=formal_case_root,
+                production_manifest_path=production_manifest,
+                target_source_id=42,
+                shard=wrong_shard,
+                case="injected",
+            )
+        )
+
+    assert not (
+        formal_case_root / "stamps" / "target_42" / "delivery" / "shard_00000"
+    ).exists()
+
+
+def test_publish_api_rejects_changed_frozen_time_plan_identity(tmp_path) -> None:
+    from et_mainsim.staged_stamp_delivery import (
+        StagedStampShardPublishError,
+        StagedStampShardPublishRequest,
+        publish_staged_independent_stamp_shard,
+    )
+
+    production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
+    formal_case_root = production_manifest.parent / "cases" / "injected"
+    time_plan_path = production_manifest.parent / "inputs" / "time_shards.json"
+    time_plan_path.write_bytes(time_plan_path.read_bytes() + b"\n")
+
+    with pytest.raises(
+        StagedStampShardPublishError,
+        match="time shard plan identity changed after production preparation",
+    ):
+        publish_staged_independent_stamp_shard(
+            StagedStampShardPublishRequest(
+                staged_case_root=staged_case_root,
+                formal_case_root=formal_case_root,
+                production_manifest_path=production_manifest,
+                target_source_id=42,
+                shard=shard,
+                case="injected",
+            )
+        )
+
+    assert not (
+        formal_case_root / "stamps" / "target_42" / "delivery" / "shard_00000"
+    ).exists()
+
+
+def test_publish_api_checks_time_plan_identity_before_parsing_it(tmp_path) -> None:
+    from et_mainsim.staged_stamp_delivery import (
+        StagedStampShardPublishError,
+        StagedStampShardPublishRequest,
+        publish_staged_independent_stamp_shard,
+    )
+
+    production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
+    formal_case_root = production_manifest.parent / "cases" / "injected"
+    time_plan_path = production_manifest.parent / "inputs" / "time_shards.json"
+    time_plan_path.write_text("not a JSON time plan", encoding="utf-8")
+
+    with pytest.raises(
+        StagedStampShardPublishError,
+        match="time shard plan identity changed after production preparation",
+    ):
+        publish_staged_independent_stamp_shard(
+            StagedStampShardPublishRequest(
+                staged_case_root=staged_case_root,
+                formal_case_root=formal_case_root,
+                production_manifest_path=production_manifest,
+                target_source_id=42,
+                shard=shard,
+                case="injected",
+            )
+        )
+
+    assert not (
+        formal_case_root / "stamps" / "target_42" / "delivery" / "shard_00000"
+    ).exists()
+
+
 def test_publish_staged_shard_removes_incoming_directory_when_copy_fails(
     tmp_path,
     monkeypatch,
@@ -365,6 +473,39 @@ def test_publish_staged_shard_keeps_a_qc_visible_lock_if_postrename_fsync_fails(
 
     assert (final_parent / "shard_00000").is_dir()
     assert (final_parent / ".shard_00000.staged-publish.lock").is_dir()
+
+
+def test_publish_staged_shard_tolerates_unsupported_parent_directory_fsync(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.staged_stamp_delivery as staged_delivery
+
+    production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
+    formal_case_root = production_manifest.parent / "cases" / "injected"
+    request = staged_delivery.StagedStampShardPublishRequest(
+        staged_case_root=staged_case_root,
+        formal_case_root=formal_case_root,
+        production_manifest_path=production_manifest,
+        target_source_id=42,
+        shard=shard,
+        case="injected",
+    )
+    final_parent = formal_case_root / "stamps" / "target_42" / "delivery"
+    original_fsync = staged_delivery.os.fsync
+
+    def _reject_parent_directory_fsync(descriptor):
+        descriptor_target = Path(os.readlink(f"/proc/self/fd/{descriptor}")).resolve()
+        if descriptor_target == final_parent:
+            raise OSError(errno.EINVAL, "directory fsync is unsupported")
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(staged_delivery.os, "fsync", _reject_parent_directory_fsync)
+
+    result = staged_delivery.publish_staged_independent_stamp_shard(request)
+
+    assert result.final_shard_root.is_dir()
+    assert not (final_parent / ".shard_00000.staged-publish.lock").exists()
 
 
 def test_publish_cli_resolves_the_frozen_time_shard_from_production_manifest(
