@@ -194,6 +194,35 @@ time-plan、factor snapshot、SHA-256 和 schema。它不会读取 partial/stagi
 也不会替换已完成的 analysis 目录。`%1` 是有意的：全文件 validation/hash 会访问
 共享存储，串行执行避免在渲染结束后制造不受控的 I/O 峰值。
 
+在提交标准测光前，还必须对**全量** formal delivery 运行一次 metadata-level
+completion gate：
+
+```bash
+python scripts/audit_galaxy_campaign_delivery.py \
+  --production-manifest /cluster/home/cxgao/sshfs-share/ET_stamp_science/<run>/production_manifest.json \
+  --case injected \
+  --output-json /cluster/home/cxgao/sshfs-share/ET_stamp_science/<run>/quality_control/injected_campaign_delivery_qc.json \
+  --require-complete
+```
+
+它从冻结 manifest 推导完整的 `target × shard × {raw,30,60,120,300 s}` 矩阵，并逐一
+检查 final HDF5 的 schema、`complete=true`、`final_dn` 语义、产品/coadd identity、
+stamp shape、caller 的 run/case/target provenance，以及每一个 raw-frame 半开区间、时间
+起点和曝光长度是否与冻结 time plan 精确一致。任何缺失、错误成员、未知 final HDF5
+或残留 `.partial` 都会使 `--require-complete` 返回非零，不能继续声明完整交付。
+
+该 gate **不**重复读取约 9 TB 的 image payload：每个 HDF5 在原子发布前已经执行了
+分块的全 payload 合同验证；随后的 60 s 标准分析还会再次完整验证并 SHA-256 绑定它所
+实际使用的 90 个输入。三者分别覆盖单文件 payload、全 campaign 时间/产品覆盖和测光
+输入身份，不能相互替代。省略 `--require-complete` 时命令可安全用于运行中的进度收据，
+但 `ready=false` 的收据绝不是科学交付。
+
+在 H100 上应通过
+`scripts/galaxy_campaign_delivery_qc_slurm.sh` 以 render array 的 `afterok` 依赖提交该
+gate；随后标准分析 array 必须依赖 QC job 的 `afterok`，而不是直接依赖 render array。
+这样 render 的 Slurm 成功、所有 final 成员完整且时间/身份正确，是标准光变与 CDPP 开始
+前不可跳过的两个独立条件。
+
 ## 7. 其他科学团队输入的当前状态
 
 ### SN 团队

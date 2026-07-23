@@ -91,3 +91,34 @@ def test_galaxy_standard_analysis_array_launcher_is_serial_and_manifest_driven()
     assert "--cadence-seconds 60" in script
     assert "--output-dir \"${OUTPUT_DIR}\"" in script
     assert "--overwrite" not in script
+
+
+def test_galaxy_campaign_qc_slurm_launcher_is_a_fail_closed_analysis_gate() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "galaxy_campaign_delivery_qc_slurm.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "#SBATCH --partition=cpu" in script
+    assert "#SBATCH --cpus-per-task=4" in script
+    assert "#SBATCH --mem=16G" in script
+    assert "#SBATCH --time=02:00:00" in script
+    assert "#SBATCH --gres=" not in script
+    assert (
+        ': "${ET_STAMP_MANIFEST:?Set ET_STAMP_MANIFEST to production_manifest.json}"'
+        in script
+    )
+    assert (
+        ': "${ET_STAMP_CODE_ROOT:?Set ET_STAMP_CODE_ROOT to the deployed ET-mainsim checkout}"'
+        in script
+    )
+    assert script.index("conda activate etbase-clu") < script.index(
+        "scripts/audit_galaxy_campaign_delivery.py"
+    )
+    assert "--case injected" in script
+    assert "--require-complete" in script
+    assert (
+        'OUTPUT_JSON="${RUN_ROOT}/quality_control/injected_campaign_delivery_qc.json"'
+        in script
+    )
