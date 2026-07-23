@@ -11,6 +11,8 @@ import pytest
 
 
 _PNG_BYTES = b"\x89PNG\r\n\x1a\nminimal-test-png"
+_SINGLE_SOURCE_MARKER = "ET_STAMP_REPORT_GATE=galaxy_single_source_raw_coverage_v2_ready"
+_CAMPAIGN_SUMMARY_MARKER = "ET_STAMP_REPORT_GATE=galaxy_campaign_raw_coverage_v2_ready"
 
 
 def _write_json(path: Path, value: object) -> Path:
@@ -68,6 +70,8 @@ def _formal_receipts(
             "case": "injected",
             "manifest_identity": manifest_identity,
             "time_plan_identity": _content_identity(time_plan_path),
+            "expected_bundle_count": 50,
+            "valid_bundle_count": 50,
         },
     )
     audit_path = _write_json(
@@ -119,7 +123,85 @@ def _readiness_request(paths: dict[str, Path]):
     )
 
 
-def _executed_notebook_path(path: Path) -> Path:
+def _campaign_summary_receipts(paths: dict[str, Path]) -> dict[str, Path]:
+    run_root = paths["run_root"]
+    policy_path = run_root / "analysis" / "raw_10s_coverage_v2_policy.json"
+    policy_path.parent.mkdir(parents=True)
+    policy = {
+        "schema_id": "et_mainsim.raw_coverage_aware_policy.v1",
+        "schema_version": 1,
+        "complete": True,
+        "run_id": run_root.name,
+        "case": "injected",
+        "observation_product": "final_dn",
+        "background_realization_used": False,
+        "production_manifest_identity": _content_identity(paths["manifest"]),
+        "coverage": {
+            "windows_minutes": [30, 90, 390],
+            "minimum_coverage_fraction": 0.9,
+            "minimum_accepted_bins": 2,
+            "bin_origin_seconds": 0.0,
+            "invalid_cadence_handling": (
+                "omit_whole_invalid_cadences_without_pixel_or_flux_imputation"
+            ),
+            "accepted_bin_normalization": "actual_effective_exposure_only",
+        },
+    }
+    _write_json(policy_path, policy)
+    summary_dir = (
+        run_root / "analysis" / "campaign" / "injected" / "raw_10s_coverage_v2_summary"
+    )
+    summary_dir.mkdir(parents=True)
+    source_summary_path = summary_dir / "source_summary.csv"
+    source_metrics_path = summary_dir / "source_window_metrics.csv"
+    source_summary_path.write_text("source_id\n100\n", encoding="utf-8")
+    source_metrics_path.write_text("source_id,observed_cdpp_ppm\n100,12.5\n", encoding="utf-8")
+    manifest = {
+        "schema_id": "et_mainsim.galaxy_raw_coverage_v2_campaign_summary.v1",
+        "schema_version": 1,
+        "complete": True,
+        "ready": True,
+        "run_id": run_root.name,
+        "case": "injected",
+        "observation_product": "final_dn",
+        "background_realization_used": False,
+        "source_count": 10,
+        "production_manifest": {"identity": _content_identity(paths["manifest"])},
+        "campaign_qc": {"identity": _content_identity(paths["qc"])},
+        "frozen_coverage_policy": {
+            "identity": _content_identity(policy_path),
+            "record": policy["coverage"],
+        },
+        "source_artifacts": [
+            {"source_id": str(value)} for value in range(100, 110)
+        ],
+        "tables": {
+            "source_summary": {
+                "path": source_summary_path.name,
+                "format": "csv",
+                "identity": _content_identity(source_summary_path),
+            },
+            "source_window_metrics": {
+                "path": source_metrics_path.name,
+                "format": "csv",
+                "identity": _content_identity(source_metrics_path),
+            },
+        },
+    }
+    summary_path = _write_json(summary_dir / "campaign_summary_manifest.json", manifest)
+    return {
+        "summary": summary_path,
+        "policy": policy_path,
+        "source_summary": source_summary_path,
+        "source_metrics": source_metrics_path,
+    }
+
+
+def _executed_notebook_path(
+    path: Path,
+    *,
+    marker: str = _SINGLE_SOURCE_MARKER,
+) -> Path:
     encoded = base64.b64encode(_PNG_BYTES).decode("ascii")
     return _write_json(
         path,
@@ -134,7 +216,7 @@ def _executed_notebook_path(path: Path) -> Path:
                         {
                             "output_type": "stream",
                             "name": "stdout",
-                            "text": "ET_STAMP_REPORT_GATE=ready",
+                            "text": marker,
                         },
                         {
                             "output_type": "display_data",
@@ -191,6 +273,84 @@ def test_readiness_accepts_integer_psf_ids_from_the_provenance_audit(
     readiness = validate_galaxy_notebook_readiness_v1(_readiness_request(paths))
 
     assert readiness.run_id == "galaxy_independent_90d_v3"
+
+
+def test_readiness_binds_provenance_bundle_counts_to_campaign_qc(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.notebook_report_assets import (
+        NotebookReportAssetError,
+        validate_galaxy_notebook_readiness_v1,
+    )
+
+    paths = _formal_receipts(tmp_path)
+    audit = json.loads(paths["audit"].read_text(encoding="utf-8"))
+    audit["expected_bundle_count"] = 40
+    audit["valid_bundle_count"] = 40
+    for source in audit["source_summaries"].values():
+        source["expected_bundle_count"] = 4
+        source["valid_bundle_count"] = 4
+    _write_json(paths["audit"], audit)
+
+    with pytest.raises(
+        NotebookReportAssetError,
+        match="provenance audit bundle counts conflict with campaign QC",
+    ):
+        validate_galaxy_notebook_readiness_v1(_readiness_request(paths))
+
+
+def test_readiness_refuses_a_changed_campaign_summary_metrics_table(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.notebook_report_assets import (
+        GalaxyNotebookReadinessRequest,
+        NotebookReportAssetError,
+        validate_galaxy_notebook_readiness_v1,
+    )
+
+    paths = _formal_receipts(tmp_path)
+    summary = _campaign_summary_receipts(paths)
+    summary["source_metrics"].write_text(
+        "source_id,observed_cdpp_ppm\n100,999.0\n", encoding="utf-8"
+    )
+
+    with pytest.raises(NotebookReportAssetError, match="source window metrics table identity"):
+        validate_galaxy_notebook_readiness_v1(
+            GalaxyNotebookReadinessRequest(
+                production_manifest_path=paths["manifest"],
+                campaign_qc_path=paths["qc"],
+                provenance_audit_path=paths["audit"],
+                campaign_summary_manifest_path=summary["summary"],
+                coverage_policy_path=summary["policy"],
+            )
+        )
+
+
+def test_readiness_refuses_an_unexpected_campaign_summary_table_path(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.notebook_report_assets import (
+        GalaxyNotebookReadinessRequest,
+        NotebookReportAssetError,
+        validate_galaxy_notebook_readiness_v1,
+    )
+
+    paths = _formal_receipts(tmp_path)
+    summary = _campaign_summary_receipts(paths)
+    payload = json.loads(summary["summary"].read_text(encoding="utf-8"))
+    payload["tables"]["source_summary"]["path"] = "other.csv"
+    _write_json(summary["summary"], payload)
+
+    with pytest.raises(NotebookReportAssetError, match="source summary table path"):
+        validate_galaxy_notebook_readiness_v1(
+            GalaxyNotebookReadinessRequest(
+                production_manifest_path=paths["manifest"],
+                campaign_qc_path=paths["qc"],
+                provenance_audit_path=paths["audit"],
+                campaign_summary_manifest_path=summary["summary"],
+                coverage_policy_path=summary["policy"],
+            )
+        )
 
 
 def test_readiness_refuses_a_campaign_qc_copy_outside_the_formal_run_root(
@@ -372,7 +532,8 @@ def test_pr_asset_wrapper_refuses_an_incomplete_audit_before_writing(
         readiness=_readiness_request(paths),
         executed_notebook_path=_executed_notebook_path(tmp_path / "executed.ipynb"),
         asset_specs=(NotebookPngAssetSpec("quality-figure", "quality.png"),),
-        required_markers=("ET_STAMP_REPORT_GATE=ready",),
+        required_markers=(_SINGLE_SOURCE_MARKER,),
+        asset_scope="single_source",
         environment={
             "ET_STAMP_WRITE_PR_ASSETS": "1",
             "ET_STAMP_PRESENTATION_DIR": str(report_root),
@@ -399,7 +560,8 @@ def test_pr_asset_wrapper_records_the_final_dn_readiness_chain(tmp_path: Path) -
             readiness=_readiness_request(paths),
             executed_notebook_path=_executed_notebook_path(tmp_path / "executed.ipynb"),
             asset_specs=(NotebookPngAssetSpec("quality-figure", "quality.png"),),
-            required_markers=("ET_STAMP_REPORT_GATE=ready",),
+            required_markers=(_SINGLE_SOURCE_MARKER,),
+            asset_scope="single_source",
             environment={
                 "ET_STAMP_WRITE_PR_ASSETS": "1",
                 "ET_STAMP_PRESENTATION_DIR": str(report_root),
@@ -437,6 +599,99 @@ def test_generic_export_refuses_a_formal_galaxy_manifest_without_readiness(
                 required_markers=("ET_STAMP_REPORT_GATE=ready",),
             )
         )
+
+
+def test_single_source_scope_refuses_the_campaign_summary_marker(tmp_path: Path) -> None:
+    from et_mainsim.notebook_report_assets import (
+        GalaxyPrAssetExportRequest,
+        NotebookPngAssetSpec,
+        NotebookReportAssetError,
+        export_galaxy_pr_assets_v1,
+    )
+
+    paths = _formal_receipts(tmp_path)
+    with pytest.raises(NotebookReportAssetError, match="single_source.*marker"):
+        export_galaxy_pr_assets_v1(
+            GalaxyPrAssetExportRequest(
+                readiness=_readiness_request(paths),
+                executed_notebook_path=_executed_notebook_path(
+                    tmp_path / "executed.ipynb", marker=_CAMPAIGN_SUMMARY_MARKER
+                ),
+                asset_specs=(NotebookPngAssetSpec("quality-figure", "quality.png"),),
+                required_markers=(_CAMPAIGN_SUMMARY_MARKER,),
+                asset_scope="single_source",
+                environment={
+                    "ET_STAMP_WRITE_PR_ASSETS": "1",
+                    "ET_STAMP_PRESENTATION_DIR": str(tmp_path / "pr-assets"),
+                },
+            )
+        )
+
+
+def test_campaign_summary_scope_requires_summary_and_policy(tmp_path: Path) -> None:
+    from et_mainsim.notebook_report_assets import (
+        GalaxyPrAssetExportRequest,
+        NotebookPngAssetSpec,
+        NotebookReportAssetError,
+        export_galaxy_pr_assets_v1,
+    )
+
+    paths = _formal_receipts(tmp_path)
+    with pytest.raises(NotebookReportAssetError, match="campaign_summary.*summary.*policy"):
+        export_galaxy_pr_assets_v1(
+            GalaxyPrAssetExportRequest(
+                readiness=_readiness_request(paths),
+                executed_notebook_path=_executed_notebook_path(
+                    tmp_path / "executed.ipynb", marker=_CAMPAIGN_SUMMARY_MARKER
+                ),
+                asset_specs=(NotebookPngAssetSpec("quality-figure", "quality.png"),),
+                required_markers=(_CAMPAIGN_SUMMARY_MARKER,),
+                asset_scope="campaign_summary",
+                environment={
+                    "ET_STAMP_WRITE_PR_ASSETS": "1",
+                    "ET_STAMP_PRESENTATION_DIR": str(tmp_path / "pr-assets"),
+                },
+            )
+        )
+
+
+def test_campaign_summary_scope_exports_only_with_summary_receipts(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.notebook_report_assets import (
+        GalaxyNotebookReadinessRequest,
+        GalaxyPrAssetExportRequest,
+        NotebookPngAssetSpec,
+        export_galaxy_pr_assets_v1,
+    )
+
+    paths = _formal_receipts(tmp_path)
+    summary = _campaign_summary_receipts(paths)
+    result = export_galaxy_pr_assets_v1(
+        GalaxyPrAssetExportRequest(
+            readiness=GalaxyNotebookReadinessRequest(
+                production_manifest_path=paths["manifest"],
+                campaign_qc_path=paths["qc"],
+                provenance_audit_path=paths["audit"],
+                campaign_summary_manifest_path=summary["summary"],
+                coverage_policy_path=summary["policy"],
+            ),
+            executed_notebook_path=_executed_notebook_path(
+                tmp_path / "executed.ipynb", marker=_CAMPAIGN_SUMMARY_MARKER
+            ),
+            asset_specs=(NotebookPngAssetSpec("quality-figure", "quality.png"),),
+            required_markers=(_CAMPAIGN_SUMMARY_MARKER,),
+            asset_scope="campaign_summary",
+            environment={
+                "ET_STAMP_WRITE_PR_ASSETS": "1",
+                "ET_STAMP_PRESENTATION_DIR": str(tmp_path / "pr-assets"),
+            },
+        )
+    )
+
+    assert result is not None
+    context = json.loads(result.receipt_path.read_text(encoding="utf-8"))["publication_context"]
+    assert context["galaxy_readiness"]["asset_scope"] == "campaign_summary"
 
 
 def test_generic_cli_refuses_a_formal_galaxy_manifest_without_readiness(
@@ -487,10 +742,12 @@ def test_galaxy_safe_cli_exports_only_after_formal_readiness(
             str(paths["qc"]),
             "--galaxy-provenance-audit",
             str(paths["audit"]),
+            "--galaxy-asset-scope",
+            "single_source",
             "--asset",
             "quality-figure=quality.png",
             "--required-marker",
-            "ET_STAMP_REPORT_GATE=ready",
+            _SINGLE_SOURCE_MARKER,
         )
     )
 
@@ -519,14 +776,48 @@ def test_galaxy_safe_cli_requires_summary_and_policy_together(
             str(paths["qc"]),
             "--galaxy-provenance-audit",
             str(paths["audit"]),
+            "--galaxy-asset-scope",
+            "campaign_summary",
             "--galaxy-campaign-summary",
             str(tmp_path / "campaign_summary_manifest.json"),
             "--asset",
             "quality-figure=quality.png",
             "--required-marker",
-            "ET_STAMP_REPORT_GATE=ready",
+            _CAMPAIGN_SUMMARY_MARKER,
         )
     )
 
     assert result == 2
     assert "campaign summary and frozen coverage policy" in capsys.readouterr().err
+
+
+def test_galaxy_safe_cli_requires_an_explicit_asset_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from et_mainsim.notebook_report_assets import main
+
+    paths = _formal_receipts(tmp_path)
+    monkeypatch.setenv("ET_STAMP_WRITE_PR_ASSETS", "1")
+    monkeypatch.setenv("ET_STAMP_PRESENTATION_DIR", str(tmp_path / "pr-assets"))
+
+    result = main(
+        (
+            "--executed-notebook",
+            str(_executed_notebook_path(tmp_path / "executed.ipynb")),
+            "--production-manifest",
+            str(paths["manifest"]),
+            "--galaxy-campaign-qc",
+            str(paths["qc"]),
+            "--galaxy-provenance-audit",
+            str(paths["audit"]),
+            "--asset",
+            "quality-figure=quality.png",
+            "--required-marker",
+            _SINGLE_SOURCE_MARKER,
+        )
+    )
+
+    assert result == 2
+    assert "--galaxy-asset-scope" in capsys.readouterr().err

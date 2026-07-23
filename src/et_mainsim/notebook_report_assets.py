@@ -21,7 +21,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -52,6 +52,20 @@ _GALAXY_CAMPAIGN_QC_RELATIVE_PATH = Path(
 _GALAXY_PROVENANCE_AUDIT_RELATIVE_PATH = Path(
     "quality_control/injected_campaign_provenance_psf_audit.json"
 )
+_GALAXY_SINGLE_SOURCE_ASSET_SCOPE = "single_source"
+_GALAXY_CAMPAIGN_SUMMARY_ASSET_SCOPE = "campaign_summary"
+_GALAXY_ASSET_SCOPE_MARKERS = {
+    _GALAXY_SINGLE_SOURCE_ASSET_SCOPE: (
+        "ET_STAMP_REPORT_GATE=galaxy_single_source_raw_coverage_v2_ready",
+    ),
+    _GALAXY_CAMPAIGN_SUMMARY_ASSET_SCOPE: (
+        "ET_STAMP_REPORT_GATE=galaxy_campaign_raw_coverage_v2_ready",
+    ),
+}
+_GALAXY_CAMPAIGN_SUMMARY_TABLE_FILENAMES = {
+    "source_summary": "source_summary.csv",
+    "source_window_metrics": "source_window_metrics.csv",
+}
 
 
 class NotebookReportAssetError(ValueError):
@@ -134,6 +148,7 @@ class GalaxyPrAssetExportRequest:
     """
 
     readiness: GalaxyNotebookReadinessRequest
+    asset_scope: Literal["single_source", "campaign_summary"]
     executed_notebook_path: Path | str
     asset_specs: Sequence[NotebookPngAssetSpec]
     required_markers: Sequence[str]
@@ -524,7 +539,7 @@ def _validate_campaign_qc(
     manifest_identity: Mapping[str, Any],
     time_plan_identity: Mapping[str, Any],
     case: str,
-) -> None:
+) -> tuple[int, int]:
     if qc.get("schema_id") != _GALAXY_CAMPAIGN_QC_SCHEMA_ID:
         raise NotebookReportAssetError("campaign QC has an unsupported schema")
     if _integer(qc.get("schema_version"), label="campaign QC schema_version", minimum=1) != (
@@ -548,6 +563,21 @@ def _validate_campaign_qc(
         expected=time_plan_identity,
         label="campaign QC time-plan identity",
     )
+    expected_bundle_count = _integer(
+        qc.get("expected_bundle_count"),
+        label="campaign QC expected_bundle_count",
+        minimum=1,
+    )
+    valid_bundle_count = _integer(
+        qc.get("valid_bundle_count"),
+        label="campaign QC valid_bundle_count",
+        minimum=0,
+    )
+    if valid_bundle_count != expected_bundle_count:
+        raise NotebookReportAssetError(
+            "campaign QC valid bundle count does not meet the expected count"
+        )
+    return expected_bundle_count, valid_bundle_count
 
 
 def _validate_provenance_audit(
@@ -558,7 +588,7 @@ def _validate_provenance_audit(
     source_ids: tuple[str, ...],
     manifest_identity: Mapping[str, Any],
     case: str,
-) -> None:
+) -> tuple[int, int]:
     if audit.get("schema_id") != _GALAXY_PROVENANCE_AUDIT_SCHEMA_ID:
         raise NotebookReportAssetError("provenance audit has an unsupported schema")
     if _integer(
@@ -665,6 +695,46 @@ def _validate_provenance_audit(
         raise NotebookReportAssetError(
             "provenance audit source bundle counts conflict with campaign totals"
         )
+    return expected_bundle_count, valid_bundle_count
+
+
+def _validate_campaign_summary_tables(
+    summary: Mapping[str, Any],
+    *,
+    summary_path: Path,
+) -> None:
+    """Bind both published campaign CSVs to the immutable summary manifest."""
+
+    tables = _mapping(summary.get("tables"), label="campaign summary tables")
+    for table_key, filename in _GALAXY_CAMPAIGN_SUMMARY_TABLE_FILENAMES.items():
+        label = table_key.replace("_", " ")
+        table = _mapping(
+            tables.get(table_key), label=f"campaign summary {label} table"
+        )
+        path_text = _text(
+            table.get("path"), label=f"campaign summary {label} table path"
+        )
+        if path_text != filename:
+            raise NotebookReportAssetError(
+                f"campaign summary {label} table path must be {filename}"
+            )
+        if table.get("format") != "csv":
+            raise NotebookReportAssetError(
+                f"campaign summary {label} table format must be csv"
+            )
+        table_path = _relative_file_within(
+            summary_path.parent,
+            path_text,
+            label=f"campaign summary {label} table path",
+        )
+        _require_content_identity(
+            table.get("identity"),
+            expected=_content_identity(
+                file_identity(table_path),
+                label=f"campaign summary {label} table file",
+            ),
+            label=f"campaign summary {label} table identity",
+        )
 
 
 def _validate_campaign_summary(
@@ -758,6 +828,7 @@ def _validate_campaign_summary(
     ):
         if not _same_or_child(path.resolve(), root.resolve()):
             raise NotebookReportAssetError(f"{label} must remain within the formal run root")
+    _validate_campaign_summary_tables(summary, summary_path=summary_path)
 
 
 def validate_galaxy_notebook_readiness_v1(
@@ -830,7 +901,7 @@ def validate_galaxy_notebook_readiness_v1(
         file_identity(time_plan_path), label="production time-plan file"
     )
     campaign_qc = _read_json(campaign_qc_path, label="campaign QC")
-    _validate_campaign_qc(
+    campaign_qc_bundle_counts = _validate_campaign_qc(
         campaign_qc,
         run_root=run_root,
         run_id=run_id,
@@ -839,7 +910,7 @@ def validate_galaxy_notebook_readiness_v1(
         case=request.case,
     )
     provenance_audit = _read_json(provenance_audit_path, label="provenance audit")
-    _validate_provenance_audit(
+    provenance_audit_bundle_counts = _validate_provenance_audit(
         provenance_audit,
         run_root=run_root,
         run_id=run_id,
@@ -847,6 +918,10 @@ def validate_galaxy_notebook_readiness_v1(
         manifest_identity=manifest_identity,
         case=request.case,
     )
+    if provenance_audit_bundle_counts != campaign_qc_bundle_counts:
+        raise NotebookReportAssetError(
+            "provenance audit bundle counts conflict with campaign QC"
+        )
     campaign_summary_path: Path | None = None
     campaign_summary_identity: Mapping[str, Any] | None = None
     coverage_policy_path: Path | None = None
@@ -1003,6 +1078,41 @@ def resolve_galaxy_pr_asset_export_root_v1(
     return destination
 
 
+def _validated_galaxy_asset_scope(
+    request: GalaxyPrAssetExportRequest,
+) -> Literal["single_source", "campaign_summary"]:
+    """Require the figure type, its readiness inputs, and marker to agree."""
+
+    scope = request.asset_scope
+    if scope not in _GALAXY_ASSET_SCOPE_MARKERS:
+        raise NotebookReportAssetError(
+            "Galaxy asset scope must be single_source or campaign_summary"
+        )
+    has_campaign_summary = request.readiness.campaign_summary_manifest_path is not None
+    has_coverage_policy = request.readiness.coverage_policy_path is not None
+    if scope == _GALAXY_SINGLE_SOURCE_ASSET_SCOPE:
+        if has_campaign_summary or has_coverage_policy:
+            raise NotebookReportAssetError(
+                "single_source asset scope does not accept campaign summary receipts"
+            )
+    elif not (has_campaign_summary and has_coverage_policy):
+        raise NotebookReportAssetError(
+            "campaign_summary asset scope requires both campaign summary and "
+            "frozen coverage policy"
+        )
+    markers = tuple(
+        _text(marker, label="required readiness marker")
+        for marker in request.required_markers
+    )
+    expected_markers = _GALAXY_ASSET_SCOPE_MARKERS[scope]
+    if markers != expected_markers:
+        raise NotebookReportAssetError(
+            f"{scope} asset scope requires exactly its readiness marker: "
+            f"{expected_markers[0]}"
+        )
+    return scope
+
+
 def export_galaxy_pr_assets_v1(
     request: GalaxyPrAssetExportRequest,
 ) -> ExecutedNotebookReportAssetResult | None:
@@ -1015,6 +1125,7 @@ def export_galaxy_pr_assets_v1(
 
     if not isinstance(request, GalaxyPrAssetExportRequest):
         raise NotebookReportAssetError("request must be GalaxyPrAssetExportRequest")
+    asset_scope = _validated_galaxy_asset_scope(request)
     environment = os.environ if request.environment is None else request.environment
     if not isinstance(environment, Mapping):
         raise NotebookReportAssetError("asset-export environment must be a mapping")
@@ -1031,6 +1142,7 @@ def export_galaxy_pr_assets_v1(
         "schema_id": "et_mainsim.galaxy_pr_asset_readiness.v1",
         "run_id": readiness.run_id,
         "case": "injected",
+        "asset_scope": asset_scope,
         "observation_product": "final_dn",
         "production_manifest": dict(readiness.production_manifest_identity),
         "campaign_qc": {
@@ -1266,6 +1378,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="frozen coverage policy paired with --galaxy-campaign-summary",
     )
+    parser.add_argument(
+        "--galaxy-asset-scope",
+        choices=(
+            _GALAXY_SINGLE_SOURCE_ASSET_SCOPE,
+            _GALAXY_CAMPAIGN_SUMMARY_ASSET_SCOPE,
+        ),
+        help=(
+            "formal Galaxy figure type: single_source requires only source receipts; "
+            "campaign_summary also requires the summary and frozen policy"
+        ),
+    )
     return parser
 
 
@@ -1277,6 +1400,7 @@ def _galaxy_cli_export_requested(args: argparse.Namespace) -> bool:
             "galaxy_provenance_audit",
             "galaxy_campaign_summary",
             "galaxy_coverage_policy",
+            "galaxy_asset_scope",
         )
     )
 
@@ -1294,6 +1418,10 @@ def _galaxy_pr_asset_export_request_from_args(
             "formal Galaxy export requires both --galaxy-campaign-qc and "
             "--galaxy-provenance-audit"
         )
+    if args.galaxy_asset_scope is None:
+        raise NotebookReportAssetError(
+            "formal Galaxy export requires --galaxy-asset-scope"
+        )
     return GalaxyPrAssetExportRequest(
         readiness=GalaxyNotebookReadinessRequest(
             production_manifest_path=args.production_manifest,
@@ -1302,6 +1430,7 @@ def _galaxy_pr_asset_export_request_from_args(
             campaign_summary_manifest_path=args.galaxy_campaign_summary,
             coverage_policy_path=args.galaxy_coverage_policy,
         ),
+        asset_scope=args.galaxy_asset_scope,
         executed_notebook_path=args.executed_notebook,
         asset_specs=tuple(args.asset),
         required_markers=tuple(args.required_marker),
