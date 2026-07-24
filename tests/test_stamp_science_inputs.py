@@ -384,6 +384,8 @@ def test_wdlc_adapter_reconstructs_modes_gates_out_and_integrates_exposures(
     assert gate["passed"] is True
     assert gate["max_abs"] <= 1.0e-12
     assert gate["rms"] <= 1.0e-12
+    assert gate["max_abs_tolerance"] == pytest.approx(15.0e-6)
+    assert gate["rms_tolerance"] == pytest.approx(2.0e-6)
     assert curves[0].metadata["electron_rate_role"] == (
         "consistency_only_not_ET_absolute_flux"
     )
@@ -422,6 +424,16 @@ def test_wdlc_180d_mode_rounding_budget_keeps_max_and_rms_gates_independent() ->
     assert inputs._wdlc_mode_gate_metrics(
         broad_mismatch,
         np.zeros_like(broad_mismatch),
+    )["passed"] is False
+
+    # The measured 270-day WD envelope must remain outside this emergency
+    # 180-day budget; approval of the shorter campaign is not an implicit
+    # long-baseline tolerance expansion.
+    long_baseline = np.full(100, 2.49324e-6, dtype=np.float64)
+    long_baseline[0] = 19.1715e-6
+    assert inputs._wdlc_mode_gate_metrics(
+        long_baseline,
+        np.zeros_like(long_baseline),
     )["passed"] is False
 
 
