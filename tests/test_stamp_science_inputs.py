@@ -394,6 +394,37 @@ def test_wdlc_adapter_reconstructs_modes_gates_out_and_integrates_exposures(
     assert curves[0].metadata["exposure_sampling"] == "analytic_sinc_interval_mean"
 
 
+def test_wdlc_180d_mode_rounding_budget_keeps_max_and_rms_gates_independent() -> None:
+    import et_mainsim.stamp_science_inputs as inputs
+
+    # The approved 180-day WD audit has an 11.7717-ppm maximum but only a
+    # 1.689-ppm RMS.  Keep that finite-precision envelope distinct from the
+    # tighter RMS guard so a broad mismatch still fails closed.
+    approved = np.full(100, 1.2e-6, dtype=np.float64)
+    approved[0] = 11.7717e-6
+    accepted = inputs._wdlc_mode_gate_metrics(
+        approved,
+        np.zeros_like(approved),
+    )
+
+    assert accepted["passed"] is True
+    assert accepted["max_abs_tolerance"] == pytest.approx(15.0e-6)
+    assert accepted["rms_tolerance"] == pytest.approx(2.0e-6)
+
+    max_outlier = np.zeros(100, dtype=np.float64)
+    max_outlier[0] = 15.0001e-6
+    assert inputs._wdlc_mode_gate_metrics(
+        max_outlier,
+        np.zeros_like(max_outlier),
+    )["passed"] is False
+
+    broad_mismatch = np.full(100, 2.0001e-6, dtype=np.float64)
+    assert inputs._wdlc_mode_gate_metrics(
+        broad_mismatch,
+        np.zeros_like(broad_mismatch),
+    )["passed"] is False
+
+
 def test_wdlc_adapter_fails_closed_when_fractional_out_breaks_mode_gate(
     tmp_path,
     monkeypatch,
