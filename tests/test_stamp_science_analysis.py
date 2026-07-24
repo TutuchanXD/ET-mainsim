@@ -431,6 +431,34 @@ def test_static_analysis_requires_unity_q_and_a_reused_injected_aperture(
         )
 
 
+def test_frozen_aperture_background_mask_requirement_follows_strategy() -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    local = replace(
+        _frozen_fixture_aperture(),
+        background_mask=None,
+        metadata={
+            "background_strategy": (
+                "delivered_expectation_plus_local_diagnostic"
+            )
+        },
+    )
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="complete mask/template contract",
+    ):
+        backend._validate_frozen_aperture_definition(local)
+
+    expectation_only = replace(
+        local,
+        metadata={"background_strategy": "delivered_expectation_only"},
+    )
+    assert (
+        backend._validate_frozen_aperture_definition(expectation_only)
+        is expectation_only
+    )
+
+
 def test_static_analysis_reuses_the_frozen_injected_aperture_without_training(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1012,6 +1040,165 @@ def test_27_by_27_expectation_only_analysis_publishes_optimal_aperture_and_captu
         np.testing.assert_array_equal(raw["captured_flux_qa_pass"], True)
         assert np.all(np.isnan(raw["flux_local_bgsub_e"]))
         assert np.all(np.isfinite(raw["flux_expectation_bgsub_e"]))
+
+
+def test_expectation_only_injected_aperture_round_trips_into_static_product_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The formal static path must preserve the injected no-local-BG contract."""
+
+    import photsim7.aperture as legacy_aperture
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    import et_mainsim.stamp_science_analysis as backend
+
+    run_root = tmp_path / "run"
+    production_manifest = run_root / "production_manifest.json"
+    production_manifest.parent.mkdir(parents=True)
+    production_manifest.write_text(
+        json.dumps(
+            {
+                "schema_id": "et_mainsim.galaxy_stamp_production.v1",
+                "schema_version": 3,
+                "run_id": "fixture-run",
+            }
+        ),
+        encoding="utf-8",
+    )
+    production_binding = backend._cli_file_binding(production_manifest)
+    source_identity = {
+        "production_track": "galaxy",
+        "namespace": "gaia_dr3",
+        "external_source_id": "42",
+        "source_id": "42",
+    }
+    production = SimpleNamespace(
+        manifest_path=production_manifest.resolve(),
+        manifest_binding=production_binding,
+        manifest={},
+        run_id="fixture-run",
+        source_identity=source_identity,
+        target={},
+        factor_snapshot_path=run_root / "inputs" / "unused-factor.npz",
+        factor_snapshot_binding={},
+        read_noise_e_per_raw_pixel=1.0,
+        quantization_noise_e_per_raw_pixel=0.0,
+    )
+    production_identity = production_binding["identity"]
+    injected_raw, injected_coadd, injected_q = _series_fixture(
+        tmp_path / "injected-input",
+        second_start=120,
+        stamp_shape=(21, 23),
+        target_yx=(10, 11),
+        target_source_id="42",
+        run_id="fixture-run",
+        production_manifest_identity=production_identity,
+        frames_per_shard=120,
+        coadd_factors=(3, 6, 12, 30),
+    )
+    static_raw, static_coadd, _ = _series_fixture(
+        tmp_path / "static-input",
+        second_start=120,
+        science_case="static",
+        stamp_shape=(21, 23),
+        target_yx=(10, 11),
+        target_source_id="42",
+        run_id="fixture-run",
+        production_manifest_identity=production_identity,
+        frames_per_shard=120,
+        coadd_factors=(3, 6, 12, 30),
+    )
+    formal_policy = backend.StampScienceAnalysisPolicy()
+    code_identity = {
+        "schema_id": "et_mainsim.formal_analysis_code_identity.v1",
+        "schema_version": 1,
+        "provenance": {
+            "et_mainsim": {
+                "commit": "a" * 40,
+                "dirty": False,
+                "version": "1",
+            },
+            "photsim7": {
+                "commit": "b" * 40,
+                "dirty": False,
+                "version": "1",
+            },
+            "runtime": {"python": "3.13.0"},
+        },
+        "analysis_dependencies": {},
+    }
+    injected_request = backend.StampScienceAnalysisRequest(
+        raw_bundle_paths=injected_raw,
+        direct_coadd_bundle_paths=injected_coadd,
+        output_dir=tmp_path / "paired-injected-product-set",
+        raw_relative_flux=injected_q,
+        raw_relative_flux_identity={"source": "unit-test-q"},
+        read_noise_e_per_pixel=1.0,
+        quantization_noise_e_per_pixel=0.0,
+        policy=formal_policy,
+        code_identity=code_identity,
+        analysis_context={
+            "production_manifest": production_binding,
+            "production_track": "galaxy",
+            "source_identity": source_identity,
+            "source_id": "42",
+            "case": "injected",
+        },
+    )
+    monkeypatch.setattr(
+        backend,
+        "collect_formal_analysis_code_identity_v1",
+        lambda: code_identity,
+    )
+    injected = backend.analyze_stamp_science_product_set_v1(injected_request)
+
+    discovery = backend.StampScienceAnalysisBundleDiscovery(
+        raw_bundle_paths=static_raw,
+        direct_coadd_bundle_paths=static_coadd,
+        shard_ids=(0, 1),
+        time_plan_identity={"size_bytes": 1, "sha256": "a" * 64},
+        static_task_list_binding={
+            "path": str(run_root / "inputs" / "static_representative.json"),
+            "identity": {"size_bytes": 1, "sha256": "b" * 64},
+        },
+    )
+    monkeypatch.setattr(
+        backend,
+        "_resolve_production_source_v1",
+        lambda *_args, **_kwargs: production,
+    )
+    monkeypatch.setattr(
+        backend,
+        "discover_stamp_science_analysis_bundles_v1",
+        lambda *_args, **_kwargs: discovery,
+    )
+    request_path = tmp_path / "static-request.json"
+    backend.write_stamp_science_analysis_request_v1(
+        request_path,
+        production_manifest=production_manifest,
+        source_id="42",
+        case="static",
+        output_dir=tmp_path / "paired-static-product-set",
+        aperture_analysis_manifest=(
+            injected.science_optimal_aperture.manifest_path
+        ),
+    )
+
+    static_request = backend.load_stamp_science_analysis_request_v1(request_path)
+    assert static_request.frozen_aperture is not None
+    assert static_request.frozen_aperture.background_mask is None
+    static = backend.analyze_stamp_science_product_set_v1(static_request)
+    validation = backend.validate_stamp_science_analysis_product_set_v1(
+        static.output_dir
+    )
+    assert validation.complete is True
+    with h5py.File(static.science_optimal_aperture.hdf5_path, "r") as handle:
+        assert not np.any(handle["aperture/background_mask"])
 
 
 def test_input_hdf_byte_identity_prefers_a_complete_staged_receipt(
@@ -1960,8 +2147,10 @@ def test_canonical_bundle_discovery_supports_static_subset_and_rejects_injected_
             source_id="42",
             case="static",
         )
-    static_task_list = run_root / "inputs" / "static_representative_day0.json"
-    static_task_list.parent.mkdir(exist_ok=True)
+    static_task_list = (
+        run_root / "inputs" / "task_lists" / "static_representative.json"
+    )
+    static_task_list.parent.mkdir(parents=True)
     static_task_list.write_text(
         json.dumps(
             {
@@ -1985,6 +2174,19 @@ def test_canonical_bundle_discovery_supports_static_subset_and_rejects_injected_
     assert static.shard_ids == (0,)
     assert len(static.raw_bundle_paths) == 1
     assert set(static.direct_coadd_bundle_paths) == {3, 6, 12, 30}
+
+    old_task_list = run_root / "inputs" / "static_representative_day0.json"
+    old_task_list.write_bytes(static_task_list.read_bytes())
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="inputs/task_lists/static_representative.json",
+    ):
+        backend.discover_stamp_science_analysis_bundles_v1(
+            production_manifest,
+            source_id="42",
+            case="static",
+            static_task_list=old_task_list,
+        )
 
     production.source_identity = {"production_track": "varlc"}
     production.manifest = {
@@ -2022,6 +2224,380 @@ def test_canonical_bundle_discovery_supports_static_subset_and_rejects_injected_
             source_id="42",
             case="injected",
         )
+
+
+def test_analysis_cli_help_names_the_authoritative_static_task_list(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    with pytest.raises(SystemExit) as exit_info:
+        backend.main(["write-request", "--help"])
+    assert exit_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "inputs/task_lists/static_representative.json" in help_text
+    assert "static_representative_day0.json" not in help_text
+    assert "--gate-task-list" in help_text
+
+
+def test_injected_gate_discovery_only_admits_bound_contiguous_shards_zero_to_five(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+    from et_mainsim.time_shards import plan_continuous_time_shards
+
+    run_root = tmp_path / "run"
+    production_manifest = run_root / "production_manifest.json"
+    production_manifest.parent.mkdir(parents=True)
+    production_manifest.write_text("{}\n", encoding="utf-8")
+    production = SimpleNamespace(
+        manifest_path=production_manifest.resolve(),
+        run_id="fixture-run",
+        source_identity={"production_track": "galaxy"},
+        manifest={"delivery": {}},
+        manifest_binding={
+            "path": str(production_manifest.resolve()),
+            "identity": backend._file_identity(production_manifest),
+        },
+    )
+    plan = plan_continuous_time_shards(
+        raw_start_index=0,
+        raw_stop_index=10_800,
+        coadd_sizes=(3, 6, 12, 30),
+        raw_exposure_seconds=10.0,
+        max_raw_frames_per_shard=60,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_resolve_production_source_v1",
+        lambda *_args, **_kwargs: production,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_load_bound_time_plan_v1",
+        lambda _production: (plan, {"size_bytes": 1, "sha256": "a" * 64}),
+    )
+    delivery_root = (
+        run_root
+        / "cases"
+        / "injected"
+        / "stamps"
+        / "target_42"
+        / "delivery"
+    )
+    for shard_id in range(6):
+        start = shard_id * 60
+        planes = _raw_planes(start=start, n_frames=60)
+        planes.pop("q")
+        shard_root = delivery_root / f"shard_{shard_id:05d}"
+        shard_root.mkdir(parents=True)
+        _write_bundle(
+            shard_root / "raw.h5",
+            planes=planes,
+            product_kind="raw",
+            factor=1,
+            shard_id=shard_id,
+            science_case="injected",
+            target_source_id="42",
+        )
+        for factor in (3, 6, 12, 30):
+            _write_bundle(
+                shard_root / f"coadd_{factor * 10}s.h5",
+                planes=_coadd_planes(planes, factor=factor),
+                product_kind="coadd",
+                factor=factor,
+                shard_id=shard_id,
+                science_case="injected",
+                target_source_id="42",
+            )
+    gate_task_list = run_root / "inputs" / "task_lists" / "injected_gate.json"
+    gate_task_list.parent.mkdir(parents=True)
+
+    def write_gate(shards: list[int]) -> None:
+        gate_task_list.write_text(
+            json.dumps(
+                {
+                    "schema_id": "et_mainsim.science_stamp_task_list.v1",
+                    "schema_version": 1,
+                    "case": "injected",
+                    "production_manifest_identity": production.manifest_binding[
+                        "identity"
+                    ],
+                    "tasks": [
+                        {"source_id": 42, "shard_id": shard_id}
+                        for shard_id in shards
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_gate([*range(6), 179])
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="explicit shards 0..5",
+    ):
+        backend.discover_stamp_science_analysis_bundles_v1(
+            production_manifest,
+            source_id="42",
+            case="injected",
+            gate_task_list=gate_task_list,
+        )
+    discovery = backend.discover_stamp_science_analysis_bundles_v1(
+        production_manifest,
+        source_id="42",
+        case="injected",
+        shard_ids=tuple(range(6)),
+        gate_task_list=gate_task_list,
+    )
+    assert discovery.shard_ids == tuple(range(6))
+    assert all("shard_00179" not in str(path) for path in discovery.raw_bundle_paths)
+    assert discovery.gate_task_list_binding == backend._cli_file_binding(
+        gate_task_list
+    )
+    production.read_noise_e_per_raw_pixel = 6.0
+    production.quantization_noise_e_per_raw_pixel = 0.0
+    production.factor_snapshot_binding = {
+        "path": str(run_root / "inputs" / "unused-factor.npz"),
+        "identity": {"size_bytes": 1, "sha256": "c" * 64},
+    }
+    monkeypatch.setattr(
+        backend,
+        "_validate_production_binding_for_headers",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        backend,
+        "collect_formal_analysis_code_identity_v1",
+        lambda: {"git_commit": "unit-test"},
+    )
+    request_path = tmp_path / "injected-gate-request.json"
+    backend.write_stamp_science_analysis_request_v1(
+        request_path,
+        production_manifest=production_manifest,
+        source_id="42",
+        case="injected",
+        shard_ids=tuple(range(6)),
+        gate_task_list=gate_task_list,
+        output_dir=tmp_path / "gate-analysis",
+    )
+    request_payload = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request_payload["input_discovery"]["gate_task_list"] == (
+        backend._cli_file_binding(gate_task_list)
+    )
+
+    for invalid in ([*range(6)], [*range(6), 178]):
+        write_gate(invalid)
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="0..5 and 179",
+        ):
+            backend.discover_stamp_science_analysis_bundles_v1(
+                production_manifest,
+                source_id="42",
+                case="injected",
+                shard_ids=tuple(range(6)),
+                gate_task_list=gate_task_list,
+            )
+
+
+def test_formal_injected_gate_request_writes_loads_runs_and_validates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import photsim7.aperture as legacy_aperture
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    import et_mainsim.stamp_science_analysis as backend
+    from et_mainsim.galaxy_lightcurves import (
+        GalaxyLightCurve,
+        write_galaxy_factor_snapshot,
+    )
+    from et_mainsim.time_shards import plan_continuous_time_shards
+
+    run_root = tmp_path / "run"
+    snapshot = run_root / "inputs" / "factor.npz"
+    factor_count = 21_600
+    factors = 1.0 + 0.1 * (np.arange(factor_count) % 4)
+    snapshot_identity = write_galaxy_factor_snapshot(
+        snapshot,
+        curve=GalaxyLightCurve(
+            source_id=42,
+            gaia_g_mag=11.0,
+            ra_deg=10.0,
+            dec_deg=20.0,
+            source_class="fixture",
+            native_time_seconds=np.asarray([0.0, 10.0]),
+            clean_flux_factor=np.asarray([1.0, 1.1]),
+            input_identity={"sha256": "0" * 64, "size_bytes": 1, "path": "x"},
+        ),
+        factors=factors,
+        raw_exposure_seconds=10.0,
+    )
+    time_plan = plan_continuous_time_shards(
+        raw_start_index=0,
+        raw_stop_index=factor_count,
+        coadd_sizes=(3, 6, 12, 30),
+        raw_exposure_seconds=10.0,
+        max_raw_frames_per_shard=120,
+    )
+    time_plan_path = time_plan.write_manifest(
+        run_root / "inputs" / "time_shards.json"
+    )
+    production_manifest = run_root / "production_manifest.json"
+    production_manifest.write_text(
+        json.dumps(
+            {
+                "schema_id": "et_mainsim.galaxy_stamp_production.v1",
+                "schema_version": 3,
+                "run_id": "galaxy-gate-fixture",
+                "delivery": {
+                    "raw_exposure_seconds": 10.0,
+                    "cadence_seconds": [30.0, 60.0, 120.0, 300.0],
+                    "coadd_sizes": [3, 6, 12, 30],
+                    "time_plan_relative_path": "inputs/time_shards.json",
+                    "time_plan_identity": backend._file_identity(time_plan_path),
+                },
+                "simulation_spec_base": {
+                    "readout": {
+                        "readout_noise": {
+                            "unit": "electron / pix",
+                            "value": 6.0,
+                        },
+                        "gain_electrons_per_adu": {
+                            "unit": "electron / adu",
+                            "value": 1.4,
+                        },
+                        "enable_adc_digitization": True,
+                        "adc_round_values": True,
+                    },
+                    "observation": {
+                        "exposure_duration": {"unit": "s", "value": 10.0}
+                    },
+                },
+                "targets": [
+                    {
+                        "source_id": "42",
+                        "source_id_int64": 42,
+                        "factor_snapshot_relative_path": "inputs/factor.npz",
+                        "factor_snapshot": snapshot_identity,
+                    }
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    production_identity = backend._file_identity(production_manifest)
+    delivery_root = (
+        run_root
+        / "cases"
+        / "injected"
+        / "stamps"
+        / "target_42"
+        / "delivery"
+    )
+    for shard in time_plan.shards[:6]:
+        planes = _raw_planes(
+            start=shard.raw_start_index,
+            n_frames=shard.raw_frame_count,
+            stamp_shape=(21, 23),
+            target_yx=(10, 11),
+        )
+        planes.pop("q")
+        shard_root = delivery_root / f"shard_{shard.shard_id:05d}"
+        shard_root.mkdir(parents=True)
+        _write_bundle(
+            shard_root / "raw.h5",
+            planes=planes,
+            product_kind="raw",
+            factor=1,
+            shard_id=shard.shard_id,
+            science_case="injected",
+            target_source_id="42",
+            run_id="galaxy-gate-fixture",
+            production_manifest_identity=production_identity,
+        )
+        for factor in (3, 6, 12, 30):
+            _write_bundle(
+                shard_root / f"coadd_{factor * 10}s.h5",
+                planes=_coadd_planes(planes, factor=factor),
+                product_kind="coadd",
+                factor=factor,
+                shard_id=shard.shard_id,
+                science_case="injected",
+                target_source_id="42",
+                run_id="galaxy-gate-fixture",
+                production_manifest_identity=production_identity,
+            )
+    gate_task_list = run_root / "inputs" / "task_lists" / "injected_gate.json"
+    gate_task_list.parent.mkdir(parents=True)
+    gate_task_list.write_text(
+        json.dumps(
+            {
+                "schema_id": "et_mainsim.science_stamp_task_list.v1",
+                "schema_version": 1,
+                "case": "injected",
+                "production_manifest_identity": production_identity,
+                "tasks": [
+                    {"source_id": 42, "shard_id": shard_id}
+                    for shard_id in (*range(6), 179)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    code_identity = {
+        "schema_id": "et_mainsim.formal_analysis_code_identity.v1",
+        "schema_version": 1,
+        "provenance": {
+            "et_mainsim": {
+                "commit": "a" * 40,
+                "dirty": False,
+                "version": "1",
+            },
+            "photsim7": {
+                "commit": "b" * 40,
+                "dirty": False,
+                "version": "1",
+            },
+            "runtime": {"python": "3.13.0"},
+        },
+        "analysis_dependencies": {},
+    }
+    monkeypatch.setattr(
+        backend,
+        "collect_formal_analysis_code_identity_v1",
+        lambda: code_identity,
+    )
+    request_path = tmp_path / "gate-request.json"
+    backend.write_stamp_science_analysis_request_v1(
+        request_path,
+        production_manifest=production_manifest,
+        source_id="42",
+        case="injected",
+        shard_ids=tuple(range(6)),
+        gate_task_list=gate_task_list,
+        output_dir=tmp_path / "gate-analysis",
+    )
+    request = backend.load_stamp_science_analysis_request_v1(request_path)
+    assert request.analysis_context["input_discovery"]["shard_ids"] == list(
+        range(6)
+    )
+    assert len(request.raw_bundle_paths) == 6
+    assert request.raw_relative_flux.shape == (720,)
+    assert backend.validate_stamp_science_analysis_request_ready_v1(request) is request
+
+    publication = backend.analyze_stamp_science_product_set_v1(request)
+    validation = backend.validate_stamp_science_analysis_product_set_v1(
+        publication.output_dir
+    )
+    assert validation.complete is True
 
 
 def test_formal_code_identity_is_automatic_and_rejects_dirty_or_unknown_repositories(

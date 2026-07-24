@@ -102,6 +102,10 @@ _REPRESENTATIVE_FRAMES_SCHEMA_ID = (
     "et_mainsim.representative_calibrated_stamp_frames.v2"
 )
 _REPRESENTATIVE_FRAMES_SCHEMA_VERSION = 2
+_EXPECTATION_ONLY_BACKGROUND_STRATEGY = "delivered_expectation_only"
+_LOCAL_DIAGNOSTIC_BACKGROUND_STRATEGY = (
+    "delivered_expectation_plus_local_diagnostic"
+)
 _REFERENCE_LIGHTCURVE_REQUIRED_COLUMNS = tuple(
     sorted(
         (
@@ -325,17 +329,28 @@ def _validate_frozen_aperture_definition(
         if value.training_raw_frame_indices is None
         else np.asarray(value.training_raw_frame_indices)
     )
+    metadata = value.metadata if isinstance(value.metadata, Mapping) else {}
+    background_strategy = metadata.get("background_strategy")
+    if background_strategy == _EXPECTATION_ONLY_BACKGROUND_STRATEGY:
+        background_invalid = background is not None
+    else:
+        background_invalid = bool(
+            background is None
+            or background.shape != aperture.shape
+            or background.dtype.kind not in {"b", "i", "u"}
+            or not np.all((background == 0) | (background == 1))
+            or not np.any(background)
+            or np.any(
+                np.asarray(aperture, dtype=bool)
+                & np.asarray(background, dtype=bool)
+            )
+        )
     if (
         aperture.ndim != 2
         or aperture.dtype.kind not in {"b", "i", "u"}
         or not np.all((aperture == 0) | (aperture == 1))
         or not np.any(aperture)
-        or background is None
-        or background.shape != aperture.shape
-        or background.dtype.kind not in {"b", "i", "u"}
-        or not np.all((background == 0) | (background == 1))
-        or not np.any(background)
-        or np.any(np.asarray(aperture, dtype=bool) & np.asarray(background, dtype=bool))
+        or background_invalid
         or signal is None
         or noise is None
         or signal.shape != aperture.shape
@@ -4766,6 +4781,7 @@ class StampScienceAnalysisBundleDiscovery:
     shard_ids: tuple[int, ...]
     time_plan_identity: Mapping[str, Any]
     static_task_list_binding: Mapping[str, Any] | None = None
+    gate_task_list_binding: Mapping[str, Any] | None = None
 
 
 def _same_content_identity(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
@@ -5031,6 +5047,72 @@ def _load_bound_time_plan_v1(
     return plan, actual_identity
 
 
+def _load_bound_analysis_task_list_v1(
+    path: Path,
+    *,
+    expected_path: Path,
+    expected_case: str,
+    production: _ResolvedProductionSource,
+    label: str,
+) -> tuple[dict[str, Any], tuple[tuple[str, int], ...]]:
+    resolved = path.expanduser().resolve()
+    if resolved != expected_path.resolve():
+        expected_relative = expected_path.resolve().relative_to(
+            production.manifest_path.parent.resolve()
+        )
+        raise StampScienceAnalysisContractError(
+            f"formal {label} task list must be {expected_relative.as_posix()}"
+        )
+    if not resolved.is_file() or resolved.is_symlink():
+        raise StampScienceAnalysisContractError(
+            f"formal {label} task list is missing or unsafe"
+        )
+    binding = _cli_file_binding(resolved)
+    task_stat = _FileStat.from_path(resolved)
+    try:
+        task_bytes = resolved.read_bytes()
+        payload = json.loads(task_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StampScienceAnalysisContractError(
+            f"formal {label} task list is not valid UTF-8 JSON"
+        ) from error
+    if (
+        not isinstance(payload, Mapping)
+        or _FileStat.from_path(resolved) != task_stat
+        or len(task_bytes) != binding["identity"]["size_bytes"]
+        or hashlib.sha256(task_bytes).hexdigest()
+        != binding["identity"]["sha256"]
+        or payload.get("schema_id")
+        != "et_mainsim.science_stamp_task_list.v1"
+        or payload.get("schema_version") != 1
+        or payload.get("case") != expected_case
+        or not isinstance(payload.get("production_manifest_identity"), Mapping)
+        or not _same_content_identity(
+            payload["production_manifest_identity"],
+            production.manifest_binding["identity"],
+        )
+        or not isinstance(payload.get("tasks"), list)
+    ):
+        raise StampScienceAnalysisContractError(
+            f"formal {label} task list schema/production identity is invalid"
+        )
+    tasks: list[tuple[str, int]] = []
+    for task in payload["tasks"]:
+        if (
+            not isinstance(task, Mapping)
+            or set(task) != {"source_id", "shard_id"}
+            or isinstance(task.get("source_id"), bool)
+            or isinstance(task.get("shard_id"), bool)
+            or not isinstance(task.get("source_id"), int)
+            or not isinstance(task.get("shard_id"), int)
+        ):
+            raise StampScienceAnalysisContractError(
+                f"formal {label} task list contains an invalid task"
+            )
+        tasks.append((str(task["source_id"]), int(task["shard_id"])))
+    return binding, tuple(tasks)
+
+
 def discover_stamp_science_analysis_bundles_v1(
     production_manifest: Path | str,
     *,
@@ -5038,6 +5120,7 @@ def discover_stamp_science_analysis_bundles_v1(
     case: Literal["static", "injected"] | str,
     shard_ids: Sequence[int] | None = None,
     static_task_list: Path | str | None = None,
+    gate_task_list: Path | str | None = None,
 ) -> StampScienceAnalysisBundleDiscovery:
     """Discover the exact formal raw/coadd matrix from the frozen run layout."""
 
@@ -5069,79 +5152,84 @@ def discover_stamp_science_analysis_bundles_v1(
             "formal target delivery directory is missing or unsafe"
         )
     if case_text == "injected":
-        if shard_ids is not None or static_task_list is not None:
+        if static_task_list is not None:
             raise StampScienceAnalysisContractError(
-                "formal injected discovery requires the complete time-shard plan"
+                "formal injected discovery forbids a static task list"
             )
-        selected_ids = tuple(sorted(by_id))
         task_list_binding = None
+        if gate_task_list is None:
+            if shard_ids is not None:
+                raise StampScienceAnalysisContractError(
+                    "formal full injected discovery requires the complete "
+                    "time-shard plan"
+                )
+            selected_ids = tuple(sorted(by_id))
+            gate_task_list_binding = None
+        else:
+            if (
+                shard_ids is None
+                or any(isinstance(value, (bool, np.bool_)) for value in shard_ids)
+                or tuple(int(value) for value in shard_ids) != tuple(range(6))
+            ):
+                raise StampScienceAnalysisContractError(
+                    "formal injected gate analysis requires explicit shards 0..5"
+                )
+            expected_gate_path = (
+                production.manifest_path.parent
+                / "inputs"
+                / "task_lists"
+                / "injected_gate.json"
+            )
+            gate_task_list_binding, tasks = _load_bound_analysis_task_list_v1(
+                Path(gate_task_list),
+                expected_path=expected_gate_path,
+                expected_case="injected",
+                production=production,
+                label="injected gate",
+            )
+            expected_tasks = {
+                (source_text, shard_id) for shard_id in (*range(6), 179)
+            }
+            if (
+                len(tasks) != len(expected_tasks)
+                or set(tasks) != expected_tasks
+                or any(value not in by_id for value in (*range(6), 179))
+            ):
+                raise StampScienceAnalysisContractError(
+                    "formal injected gate task list must declare exactly "
+                    "shards 0..5 and 179 for only the requested representative source"
+                )
+            selected_ids = tuple(range(6))
     else:
+        if gate_task_list is not None:
+            raise StampScienceAnalysisContractError(
+                "formal static discovery forbids an injected gate task list"
+            )
         task_list_path = (
             production.manifest_path.parent
             / "inputs"
-            / "static_representative_day0.json"
+            / "task_lists"
+            / "static_representative.json"
             if static_task_list is None
             else Path(static_task_list).expanduser().resolve()
         )
         expected_task_list_path = (
             production.manifest_path.parent
             / "inputs"
-            / "static_representative_day0.json"
+            / "task_lists"
+            / "static_representative.json"
         ).resolve()
-        if task_list_path.resolve() != expected_task_list_path:
-            raise StampScienceAnalysisContractError(
-                "formal static task list must be inputs/static_representative_day0.json"
-            )
-        if not task_list_path.is_file() or task_list_path.is_symlink():
-            raise StampScienceAnalysisContractError(
-                "formal static task list is missing or unsafe"
-            )
-        task_list_binding = _cli_file_binding(task_list_path)
-        task_stat = _FileStat.from_path(task_list_path)
-        try:
-            task_bytes = task_list_path.read_bytes()
-            task_payload = json.loads(task_bytes.decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise StampScienceAnalysisContractError(
-                "formal static task list is not valid UTF-8 JSON"
-            ) from error
-        if (
-            not isinstance(task_payload, Mapping)
-            or _FileStat.from_path(task_list_path) != task_stat
-            or len(task_bytes) != task_list_binding["identity"]["size_bytes"]
-            or hashlib.sha256(task_bytes).hexdigest()
-            != task_list_binding["identity"]["sha256"]
-            or task_payload.get("schema_id")
-            != "et_mainsim.science_stamp_task_list.v1"
-            or task_payload.get("schema_version") != 1
-            or task_payload.get("case") != "static"
-            or not isinstance(
-                task_payload.get("production_manifest_identity"), Mapping
-            )
-            or not _same_content_identity(
-                task_payload["production_manifest_identity"],
-                production.manifest_binding["identity"],
-            )
-            or not isinstance(task_payload.get("tasks"), list)
-        ):
-            raise StampScienceAnalysisContractError(
-                "formal static task list schema/production identity is invalid"
-            )
-        selected_values: list[int] = []
-        for task in task_payload["tasks"]:
-            if (
-                not isinstance(task, Mapping)
-                or set(task) != {"source_id", "shard_id"}
-                or isinstance(task.get("source_id"), bool)
-                or isinstance(task.get("shard_id"), bool)
-                or not isinstance(task.get("source_id"), int)
-                or not isinstance(task.get("shard_id"), int)
-            ):
-                raise StampScienceAnalysisContractError(
-                    "formal static task list contains an invalid task"
-                )
-            if str(task["source_id"]) == source_text:
-                selected_values.append(int(task["shard_id"]))
+        task_list_binding, tasks = _load_bound_analysis_task_list_v1(
+            task_list_path,
+            expected_path=expected_task_list_path,
+            expected_case="static",
+            production=production,
+            label="static",
+        )
+        gate_task_list_binding = None
+        selected_values = [
+            shard_id for task_source, shard_id in tasks if task_source == source_text
+        ]
         selected_ids = tuple(sorted(selected_values))
         if (
             not selected_ids
@@ -5264,6 +5352,7 @@ def discover_stamp_science_analysis_bundles_v1(
         shard_ids=selected_ids,
         time_plan_identity=time_plan_identity,
         static_task_list_binding=task_list_binding,
+        gate_task_list_binding=gate_task_list_binding,
     )
 
 
@@ -5431,31 +5520,49 @@ def validate_stamp_science_analysis_request_ready_v1(
                 "formal canonical discovery lacks shard_ids"
             )
         recorded_task_list = discovery_context.get("static_task_list")
+        recorded_gate_task_list = discovery_context.get("gate_task_list")
         if context.get("case") == "static":
             if (
                 not isinstance(recorded_task_list, Mapping)
                 or not isinstance(recorded_task_list.get("path"), str)
+                or recorded_gate_task_list is not None
             ):
                 raise StampScienceAnalysisContractError(
                     "formal static discovery lacks its bound task list"
                 )
             task_list_path: Path | None = Path(recorded_task_list["path"])
+            gate_task_list_path: Path | None = None
         else:
             if recorded_task_list is not None:
                 raise StampScienceAnalysisContractError(
                     "formal injected discovery must not bind a static task list"
                 )
             task_list_path = None
+            if recorded_gate_task_list is None:
+                gate_task_list_path = None
+            elif (
+                isinstance(recorded_gate_task_list, Mapping)
+                and isinstance(recorded_gate_task_list.get("path"), str)
+            ):
+                gate_task_list_path = Path(recorded_gate_task_list["path"])
+            else:
+                raise StampScienceAnalysisContractError(
+                    "formal injected gate task-list binding is invalid"
+                )
         rediscovered = discover_stamp_science_analysis_bundles_v1(
             production.manifest_path,
             source_id=str(context["source_id"]),
             case=str(context.get("case")),
             shard_ids=(
                 None
-                if context.get("case") == "injected"
+                if (
+                    context.get("case") == "injected"
+                    and recorded_gate_task_list is None
+                )
                 else tuple(recorded_shards)
             ),
             static_task_list=task_list_path,
+            gate_task_list=gate_task_list_path,
         )
         if (
             list(rediscovered.shard_ids) != recorded_shards
@@ -5473,6 +5580,19 @@ def validate_stamp_science_analysis_request_ready_v1(
                 context.get("case") == "static"
                 and dict(rediscovered.static_task_list_binding or {})
                 != dict(recorded_task_list)
+            )
+            or (
+                context.get("case") == "injected"
+                and (
+                    None
+                    if rediscovered.gate_task_list_binding is None
+                    else dict(rediscovered.gate_task_list_binding)
+                )
+                != (
+                    None
+                    if recorded_gate_task_list is None
+                    else dict(recorded_gate_task_list)
+                )
             )
         ):
             raise StampScienceAnalysisContractError(
@@ -5551,6 +5671,7 @@ def write_stamp_science_analysis_request_v1(
     case: Literal["static", "injected"] | str,
     shard_ids: Sequence[int] | None = None,
     static_task_list: Path | str | None = None,
+    gate_task_list: Path | str | None = None,
     output_dir: Path | str,
     aperture_analysis_manifest: Path | str | None = None,
 ) -> Path:
@@ -5570,6 +5691,7 @@ def write_stamp_science_analysis_request_v1(
         case=case_text,
         shard_ids=shard_ids,
         static_task_list=static_task_list,
+        gate_task_list=gate_task_list,
     )
     raw_bundle_paths = discovery.raw_bundle_paths
     direct_coadd_bundle_paths = discovery.direct_coadd_bundle_paths
@@ -5581,6 +5703,11 @@ def write_stamp_science_analysis_request_v1(
             None
             if discovery.static_task_list_binding is None
             else dict(discovery.static_task_list_binding)
+        ),
+        "gate_task_list": (
+            None
+            if discovery.gate_task_list_binding is None
+            else dict(discovery.gate_task_list_binding)
         ),
     }
     raw_bindings = [_cli_bundle_binding(item) for item in raw_bundle_paths]
@@ -5839,11 +5966,55 @@ def _load_published_aperture_v1(
         analysis_dir / "aperture_definition.json",
         label="published aperture definition",
     )
+    metadata = definition_payload.get("metadata")
+    policy = contract.get("policy")
+    photometry_policy = (
+        policy.get("photometry") if isinstance(policy, Mapping) else None
+    )
+    contract_strategy = contract.get("background_strategy")
+    metadata_strategy = (
+        metadata.get("background_strategy") if isinstance(metadata, Mapping) else None
+    )
+    policy_strategy = (
+        photometry_policy.get("background_strategy")
+        if isinstance(photometry_policy, Mapping)
+        else None
+    )
+    if (
+        contract_strategy
+        not in {
+            _EXPECTATION_ONLY_BACKGROUND_STRATEGY,
+            _LOCAL_DIAGNOSTIC_BACKGROUND_STRATEGY,
+        }
+        or metadata_strategy != contract_strategy
+        or policy_strategy != contract_strategy
+    ):
+        raise StampScienceAnalysisContractError(
+            "published aperture background strategy metadata/contract differs"
+        )
     with h5py.File(analysis_dir / "photometry.h5", "r") as handle:
         group = handle["aperture"]
+        persisted_background = np.asarray(group["background_mask"], dtype=bool)
+        background_pixel_count = definition_payload.get("background_pixel_count")
+        if (
+            isinstance(background_pixel_count, bool)
+            or not isinstance(background_pixel_count, int)
+            or background_pixel_count != int(np.count_nonzero(persisted_background))
+        ):
+            raise StampScienceAnalysisContractError(
+                "published aperture background mask/count differs"
+            )
+        if contract_strategy == _EXPECTATION_ONLY_BACKGROUND_STRATEGY:
+            if np.any(persisted_background):
+                raise StampScienceAnalysisContractError(
+                    "expectation-only published aperture has local background pixels"
+                )
+            restored_background: NDArray[np.bool_] | None = None
+        else:
+            restored_background = persisted_background
         definition = ScienceApertureDefinition(
             aperture_mask=np.asarray(group["aperture_mask"], dtype=bool),
-            background_mask=np.asarray(group["background_mask"], dtype=bool),
+            background_mask=restored_background,
             signal_template_e=np.asarray(group["signal_template_e"], dtype=np.float64),
             noise_template_e=np.asarray(group["noise_template_e"], dtype=np.float64),
             training_raw_frame_indices=np.asarray(
@@ -5863,11 +6034,7 @@ def _load_published_aperture_v1(
                     int(item) for item in definition_payload["target_peak_yx"]
                 )
             ),
-            metadata=(
-                definition_payload.get("metadata")
-                if isinstance(definition_payload.get("metadata"), Mapping)
-                else {}
-            ),
+            metadata=(metadata if isinstance(metadata, Mapping) else {}),
         )
     source_identity = {
         "mode": "validated_published_injected_analysis_v1",
@@ -6264,7 +6431,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         help=(
             "identity-bound et_mainsim.science_stamp_task_list.v1; defaults to "
-            "inputs/static_representative_day0.json for static"
+            "inputs/task_lists/static_representative.json for static"
+        ),
+    )
+    write_parser.add_argument(
+        "--gate-task-list",
+        type=Path,
+        help=(
+            "injected-only admission gate bound to "
+            "inputs/task_lists/injected_gate.json; admits exactly shards 0..5"
         ),
     )
     write_parser.add_argument("--analysis-output", type=Path, required=True)
@@ -6278,6 +6453,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             case=arguments.case,
             shard_ids=arguments.shard_id,
             static_task_list=arguments.static_task_list,
+            gate_task_list=arguments.gate_task_list,
             output_dir=arguments.analysis_output,
             aperture_analysis_manifest=arguments.aperture_analysis_manifest,
         )

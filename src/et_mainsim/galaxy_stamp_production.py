@@ -74,6 +74,9 @@ FORMAL_PIXEL_PHASE_PROFILE_PATH = (
     "detector/pixel_response_profile_teff5500_feh-0.1_logg4.4_"
     "pfc_v240423.npy"
 )
+FORMAL_PIXEL_PHASE_PROFILE_SHA256 = (
+    "6d3339298b9876a1e8e1afd36f606dc4d31fd5eab5054710d4de81c6d3f271bd"
+)
 
 ProductionCase = Literal["static", "injected"]
 DeliveryExecutionMode = Literal[
@@ -1361,6 +1364,7 @@ __all__ = [
     "FORMAL_INTER_PRV_RMS_PERCENT",
     "FORMAL_INTRA_PRV_RMS_PERCENT",
     "FORMAL_PIXEL_PHASE_PROFILE_PATH",
+    "FORMAL_PIXEL_PHASE_PROFILE_SHA256",
     "FORMAL_READOUT_NOISE_E_PER_PIXEL",
     "FORMAL_STAMP_CENTERING_POLICY",
     "GALAXY_STAMP_PRODUCTION_SCHEMA_ID",

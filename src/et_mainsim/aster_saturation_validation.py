@@ -23,6 +23,12 @@ from typing import Any, Literal
 
 import numpy as np
 
+from .galaxy_stamp_production import (
+    DEFAULT_STAMP_SHAPE,
+    FORMAL_STAMP_CENTERING_POLICY,
+    FORMAL_PIXEL_PHASE_PROFILE_PATH,
+    FORMAL_PIXEL_PHASE_PROFILE_SHA256,
+)
 from .science_stamp_production import build_science_independent_production_spec
 from .independent_stamp_production import (
     IndependentStampShardRequest,
@@ -47,7 +53,7 @@ DEFAULT_ASTER_G6_PSF_NODE_ANGLE_DEG = 12.0
 DEFAULT_ASTER_G6_RAW_EXPOSURE_SECONDS = 10.0
 DEFAULT_ASTER_G6_N_RAW_FRAMES = 360
 DEFAULT_ASTER_G6_CADENCE_SECONDS = (30.0, 60.0, 120.0, 300.0)
-DEFAULT_ASTER_G6_STAMP_SHAPE = (100, 300)
+DEFAULT_ASTER_G6_STAMP_SHAPE = DEFAULT_STAMP_SHAPE
 
 AsterSaturationCase = Literal["static", "injected"]
 
@@ -144,6 +150,73 @@ def _same_file_content_identity(
         )
     except (KeyError, TypeError, ValueError):
         return False
+
+
+def _require_aster_g6_runtime_contract(
+    manifest: Mapping[str, Any],
+    *,
+    data_root: Path,
+) -> None:
+    """Reject a drifted compact-saturation manifest before rendering starts."""
+
+    delivery = manifest.get("delivery")
+    if (
+        not isinstance(delivery, Mapping)
+        or delivery.get("stamp_shape") != list(DEFAULT_ASTER_G6_STAMP_SHAPE)
+        or delivery.get("stamp_centering_policy")
+        != FORMAL_STAMP_CENTERING_POLICY
+    ):
+        raise ValueError("Aster saturation manifest has the wrong stamp centering contract")
+    spec = manifest.get("simulation_spec_base")
+    if (
+        not isinstance(spec, Mapping)
+        or manifest.get("simulation_spec_base_sha256")
+        != _canonical_json_sha256(spec)
+    ):
+        raise ValueError("Aster saturation simulation spec identity changed")
+    response = spec.get("detector_response")
+    expected_response = {
+        "enable_inter_pixel_response": True,
+        "inter_prv_rms": {"value": 1.0, "unit": "%"},
+        "inter_prv_nominal": {"value": 100.0, "unit": "%"},
+        "enable_intra_pixel_response": True,
+        "intra_prv_rms": {"value": 1.0, "unit": "%"},
+        "enable_pixel_phase_response": True,
+        "pixel_response_profile_mod": "flux conserved",
+        "pixel_phase_profile_path": FORMAL_PIXEL_PHASE_PROFILE_PATH,
+        "scripted_sensitivity_enabled": False,
+        "whole_pixel_gain_normal_enabled": False,
+        "whole_pixel_gain_sinusoidal_enabled": False,
+        "enable_flat_field_correction": False,
+    }
+    if not isinstance(response, Mapping) or any(
+        response.get(key) != value for key, value in expected_response.items()
+    ):
+        raise ValueError("Aster saturation detector response is not the frozen contract")
+    readout = spec.get("readout")
+    expected_readout = {
+        "readout_noise": {"value": 5.0, "unit": "electron / pix"},
+        "gain_electrons_per_adu": {"value": 1.4, "unit": "electron / adu"},
+        "bias_level_adu": {"value": 3500.0, "unit": "adu"},
+        "column_noise_sigma_adu": {"value": 0.0, "unit": "adu"},
+    }
+    if not isinstance(readout, Mapping) or any(
+        readout.get(key) != value for key, value in expected_readout.items()
+    ):
+        raise ValueError("Aster saturation readout is not the frozen contract")
+    artifacts = spec.get("artifacts")
+    if (
+        not isinstance(artifacts, Mapping)
+        or artifacts.get("background_output_policy") != "expectation"
+        or manifest.get("observation_product") != "final_dn"
+        or manifest.get("background_realization_delivered") is not False
+    ):
+        raise ValueError("Aster saturation observation/background contract differs")
+    profile_identity = file_identity(
+        data_root / FORMAL_PIXEL_PHASE_PROFILE_PATH
+    )
+    if profile_identity.get("sha256") != FORMAL_PIXEL_PHASE_PROFILE_SHA256:
+        raise ValueError("Aster saturation pixel-phase profile identity changed")
 
 
 def _resolve_manifest_resource(
@@ -262,7 +335,7 @@ class AsterG6SaturationValidationConfig:
         if len(stamp_shape) != 2 or any(value <= 0 for value in stamp_shape):
             raise ValueError("stamp_shape must contain two positive integers")
         if stamp_shape != DEFAULT_ASTER_G6_STAMP_SHAPE:
-            raise ValueError("Aster saturation validation requires a 100x300 stamp")
+            raise ValueError("Aster saturation validation requires a 27x27 stamp")
         max_raw_frames = _positive_int(
             self.max_raw_frames_per_shard, name="max_raw_frames_per_shard"
         )
@@ -495,6 +568,7 @@ def prepare_aster_g6_saturation_validation(
         },
         "delivery": {
             "stamp_shape": list(config.stamp_shape),
+            "stamp_centering_policy": FORMAL_STAMP_CENTERING_POLICY,
             "raw_exposure_seconds": config.raw_exposure_seconds,
             "cadence_seconds": list(config.cadence_seconds),
             "coadd_sizes": list(config.coadd_sizes),
@@ -595,6 +669,10 @@ def run_aster_g6_saturation_validation(
     spec_payload = manifest.get("simulation_spec_base")
     if not isinstance(spec_payload, Mapping):
         raise ValueError("Aster saturation manifest lacks simulation_spec_base")
+    _require_aster_g6_runtime_contract(
+        manifest,
+        data_root=resolved_data_root,
+    )
 
     from photsim7.data_registry import DataRegistry
     from photsim7.simulation_services import (
@@ -742,6 +820,7 @@ def run_aster_g6_saturation_validation(
         manifest={
             "run_id": str(manifest["run_id"]),
             "case": selected_case,
+            "stamp_centering_policy": FORMAL_STAMP_CENTERING_POLICY,
             "saturation_validation_manifest": str(resolved_manifest_path),
             "target_input_truth": source_truth,
             "simulation_spec_sha256": target_spec_sha256,
