@@ -1,7 +1,7 @@
 """Formal standard light-curve analysis for independent Galaxy stamp delivery.
 
 This module is deliberately a *post-processing* layer over
-``et_mainsim.stamp_delivery_bundle.v1``.  It never reads historical pickle
+``et_mainsim.stamp_delivery_bundle.v2``.  It never reads historical pickle
 products, calls legacy PCA/SG filtering, or manufactures a new observation:
 ``final_dn`` remains the only detector observation.  The derived light curve
 uses :mod:`et_mainsim.reference_photometry`, which streams the formal HDF5

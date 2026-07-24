@@ -18,6 +18,9 @@ def _render_raw(frame_index: int):
     return RawStampDeliveryFrame(
         final_dn=np.full(shape, value, dtype=np.uint16),
         background_expectation_e=np.full(shape, value * 0.5, dtype=np.float64),
+        captured_flux_fraction=1.0,
+        captured_flux_qa_pass=True,
+        captured_flux_weight_e=float(value * 10),
         bias_level_dn=float(value),
         column_noise_dn_by_x=np.full(shape[1], value * 0.25, dtype=np.float64),
         valid_mask=np.ones(shape, dtype=bool),

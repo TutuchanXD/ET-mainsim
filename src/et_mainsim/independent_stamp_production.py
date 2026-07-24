@@ -101,6 +101,9 @@ class RawStampDeliveryFrame:
 
     final_dn: NDArray[np.unsignedinteger]
     background_expectation_e: NDArray[np.float64]
+    captured_flux_fraction: float
+    captured_flux_qa_pass: bool
+    captured_flux_weight_e: float
     bias_level_dn: float
     column_noise_dn_by_x: NDArray[np.float64]
     valid_mask: NDArray[np.bool_]
@@ -121,6 +124,21 @@ class RawStampDeliveryFrame:
             raise ValueError("background_expectation_e must be finite and match final_dn")
         if np.any(background < 0.0):
             raise ValueError("background_expectation_e must be non-negative")
+        fraction = float(self.captured_flux_fraction)
+        if (
+            not math.isfinite(fraction)
+            or fraction < 0.0
+            or fraction > 1.0 + 1.0e-6
+        ):
+            raise ValueError(
+                "captured_flux_fraction must lie in [0, 1] within 1e-6 tolerance"
+            )
+        if not isinstance(self.captured_flux_qa_pass, (bool, np.bool_)):
+            raise ValueError("captured_flux_qa_pass must be boolean")
+        capture_weight = _positive_float(
+            self.captured_flux_weight_e,
+            name="captured_flux_weight_e",
+        )
         bias = float(self.bias_level_dn)
         if not math.isfinite(bias):
             raise ValueError("bias_level_dn must be finite")
@@ -134,6 +152,13 @@ class RawStampDeliveryFrame:
             np.array(background, copy=True, order="C"),
         )
         object.__setattr__(self, "bias_level_dn", bias)
+        object.__setattr__(self, "captured_flux_fraction", fraction)
+        object.__setattr__(
+            self,
+            "captured_flux_qa_pass",
+            bool(self.captured_flux_qa_pass),
+        )
+        object.__setattr__(self, "captured_flux_weight_e", capture_weight)
         object.__setattr__(self, "column_noise_dn_by_x", np.array(column, copy=True))
         for name in (
             "valid_mask",
@@ -214,6 +239,9 @@ class _CoaddAccumulator:
     raw_start_index: int | None = None
     final_dn: NDArray[np.uint64] | None = None
     background_expectation_e: NDArray[np.float64] | None = None
+    captured_flux_weighted_sum_e: float = 0.0
+    captured_flux_weight_sum_e: float = 0.0
+    captured_flux_qa_pass: bool = True
     bias_level_sum_dn: float = 0.0
     column_noise_sum_dn_by_x: NDArray[np.float64] | None = None
     valid_mask: NDArray[np.bool_] | None = None
@@ -229,6 +257,9 @@ class _CoaddAccumulator:
             self.raw_start_index = int(raw_frame_index)
             self.final_dn = np.zeros(self.stamp_shape, dtype=np.uint64)
             self.background_expectation_e = np.zeros(self.stamp_shape, dtype=np.float64)
+            self.captured_flux_weighted_sum_e = 0.0
+            self.captured_flux_weight_sum_e = 0.0
+            self.captured_flux_qa_pass = True
             self.column_noise_sum_dn_by_x = np.zeros(self.stamp_shape[1], dtype=np.float64)
             self.valid_mask = np.ones(self.stamp_shape, dtype=bool)
             self.fullwell_count = np.zeros(self.stamp_shape, dtype=np.uint16)
@@ -245,6 +276,11 @@ class _CoaddAccumulator:
         assert self.cosmic_count is not None
         self.final_dn += raw.final_dn.astype(np.uint64, copy=False)
         self.background_expectation_e += raw.background_expectation_e
+        self.captured_flux_weighted_sum_e += (
+            raw.captured_flux_fraction * raw.captured_flux_weight_e
+        )
+        self.captured_flux_weight_sum_e += raw.captured_flux_weight_e
+        self.captured_flux_qa_pass &= raw.captured_flux_qa_pass
         self.bias_level_sum_dn += raw.bias_level_dn
         self.column_noise_sum_dn_by_x += raw.column_noise_dn_by_x
         self.valid_mask &= raw.valid_mask
@@ -274,6 +310,12 @@ class _CoaddAccumulator:
         frame = RawStampDeliveryFrame(
             final_dn=self.final_dn,
             background_expectation_e=self.background_expectation_e,
+            captured_flux_fraction=(
+                self.captured_flux_weighted_sum_e
+                / self.captured_flux_weight_sum_e
+            ),
+            captured_flux_qa_pass=self.captured_flux_qa_pass,
+            captured_flux_weight_e=self.captured_flux_weight_sum_e,
             bias_level_dn=self.bias_level_sum_dn,
             column_noise_dn_by_x=self.column_noise_sum_dn_by_x,
             valid_mask=self.valid_mask,
@@ -288,6 +330,9 @@ class _CoaddAccumulator:
         self.raw_start_index = None
         self.final_dn = None
         self.background_expectation_e = None
+        self.captured_flux_weighted_sum_e = 0.0
+        self.captured_flux_weight_sum_e = 0.0
+        self.captured_flux_qa_pass = True
         self.bias_level_sum_dn = 0.0
         self.column_noise_sum_dn_by_x = None
         self.valid_mask = None
@@ -334,6 +379,18 @@ def _bundle_from_frames(
         coadd_factor=coadd_factor,
         final_dn=np.stack([frame.final_dn for frame in frames]),
         background_expectation_e=np.stack([frame.background_expectation_e for frame in frames]),
+        captured_flux_fraction=np.asarray(
+            [frame.captured_flux_fraction for frame in frames],
+            dtype=np.float64,
+        ),
+        captured_flux_denominator_e=np.asarray(
+            [frame.captured_flux_weight_e for frame in frames],
+            dtype=np.float64,
+        ),
+        captured_flux_qa_pass=np.asarray(
+            [frame.captured_flux_qa_pass for frame in frames],
+            dtype=bool,
+        ),
         bias_level_sum_dn=np.asarray([frame.bias_level_dn for frame in frames], dtype=np.float64),
         column_noise_sum_dn_by_x=np.stack([frame.column_noise_dn_by_x for frame in frames]),
         valid_mask=np.stack([frame.valid_mask for frame in frames]),
@@ -689,6 +746,12 @@ def run_independent_stamp_time_shard(
                     raise ValueError(
                         "rendered raw frame stamp shape differs from request.stamp_shape"
                     )
+                if not raw.captured_flux_qa_pass:
+                    raise RuntimeError(
+                        "captured-flux QA failed for absolute raw frame "
+                        f"{raw_frame_index}: detector-edge or requested-window "
+                        "PSF support truncation was reported"
+                    )
                 raw_buffer.append(raw)
                 raw_starts.append(raw_frame_index)
                 if len(raw_buffer) >= request.batch_size:
@@ -756,6 +819,41 @@ def raw_stamp_delivery_frame_from_photsim7(result: Any) -> RawStampDeliveryFrame
             "artifacts.background_output_policy='expectation'"
         )
     background = _to_numpy(components["background_expectation"])
+    support_truth = getattr(products, "psf_support_truth", None)
+    manifest_payload = getattr(result, "manifest_payload", None)
+    if support_truth is None or not isinstance(manifest_payload, Mapping):
+        raise ValueError("Photsim7 result lacks target PSF capture truth")
+    target_payload = manifest_payload.get("target")
+    if not isinstance(target_payload, Mapping) or "source_id" not in target_payload:
+        raise ValueError("Photsim7 manifest lacks target.source_id")
+    target_source_id = target_payload["source_id"]
+    support_schema = support_truth.to_schema()
+    support_sources = support_schema.get("sources")
+    if not isinstance(support_sources, list):
+        raise ValueError("Photsim7 PSF capture truth lacks sources")
+    target_support = [
+        item
+        for item in support_sources
+        if isinstance(item, Mapping)
+        and str(item.get("source_id")) == str(target_source_id)
+    ]
+    if len(target_support) != 1:
+        raise ValueError(
+            "Photsim7 PSF capture truth must contain exactly one target source"
+        )
+    target_capture = target_support[0]
+    fractions = target_capture.get("captured_flux_fraction")
+    truncation = target_capture.get("truncation")
+    if not isinstance(fractions, Mapping) or not isinstance(truncation, Mapping):
+        raise ValueError("Photsim7 target PSF capture truth is malformed")
+    captured_fraction = fractions.get("requested_window_valid_detector")
+    effective_photons = target_capture.get("effective_photon_count_electron")
+    if captured_fraction is None:
+        raise ValueError("target captured flux fraction is undefined")
+    capture_qa_pass = not (
+        bool(truncation.get("detector_edge", True))
+        or bool(truncation.get("requested_window", True))
+    )
     bias_metadata = getattr(detector, "bias_metadata", None)
     if bias_metadata is None:
         raise ValueError("Photsim7 result lacks bias/column calibration metadata")
@@ -783,6 +881,9 @@ def raw_stamp_delivery_frame_from_photsim7(result: Any) -> RawStampDeliveryFrame
     return RawStampDeliveryFrame(
         final_dn=final_dn,
         background_expectation_e=background,
+        captured_flux_fraction=float(captured_fraction),
+        captured_flux_qa_pass=capture_qa_pass,
+        captured_flux_weight_e=float(effective_photons),
         bias_level_dn=float(getattr(bias_metadata, "bias_level_adu")),
         column_noise_dn_by_x=column_vector,
         valid_mask=_to_numpy(getattr(products, "valid_detector_mask")),

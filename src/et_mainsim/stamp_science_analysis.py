@@ -2,7 +2,7 @@
 
 The formal HDF5 ``final_dn`` plane remains the only detector observation.
 This module derives calibrated electron light curves without materialising a
-90-day image cube: one deterministic, chunk-aligned training pass freezes the
+long-duration image cube: one deterministic, chunk-aligned training pass freezes the
 legacy-compatible optimal aperture, then one sequential raw pass emits the
 10/30/60/120/300-s cadence products.  The summed cadences all reuse that same
 aperture and are derived from the raw planes, while bounded samples from the
@@ -58,6 +58,7 @@ from .staged_stamp_delivery import (
 from .time_shards import ContinuousTimeShardPlan
 from .stamp_science_photometry import (
     SCIENCE_PHOTOMETRY_SCHEMA_ID,
+    SCIENCE_PHOTOMETRY_SCHEMA_VERSION,
     ScienceApertureDefinition,
     ScienceFluxUncertaintyModelResult,
     SciencePhotometryResult,
@@ -73,13 +74,34 @@ from .stamp_science_photometry import (
 )
 
 
-STAMP_SCIENCE_ANALYSIS_SCHEMA_ID = "et_mainsim.stamp_science_analysis.v1"
-STAMP_SCIENCE_ANALYSIS_SCHEMA_VERSION = 1
+STAMP_SCIENCE_ANALYSIS_SCHEMA_ID = "et_mainsim.stamp_science_analysis.v2"
+STAMP_SCIENCE_ANALYSIS_SCHEMA_VERSION = 2
+STAMP_SCIENCE_ANALYSIS_PUBLICATION_SCHEMA_ID = (
+    "et_mainsim.stamp_science_analysis_publication.v2"
+)
+STAMP_SCIENCE_ANALYSIS_PUBLICATION_SCHEMA_VERSION = 2
+STAMP_SCIENCE_ANALYSIS_PRODUCT_SET_SCHEMA_ID = (
+    "et_mainsim.stamp_science_analysis_product_set.v2"
+)
+STAMP_SCIENCE_ANALYSIS_PRODUCT_SET_SCHEMA_VERSION = 2
 _TIME_ATOL_SECONDS = 1e-8
 _REQUIRED_COADD_FACTORS = (1, 3, 6, 12, 30)
 _REFERENCE_LIGHTCURVE_SCHEMA_ID = (
-    "et_mainsim.stamp_science_reference_lightcurve.v1"
+    "et_mainsim.stamp_science_reference_lightcurve.v2"
 )
+_REFERENCE_LIGHTCURVE_SCHEMA_VERSION = 2
+_PHOTOMETRY_TABLE_SCHEMA_ID = "et_mainsim.stamp_science_photometry_table.v2"
+_PHOTOMETRY_TABLE_SCHEMA_VERSION = 2
+_APERTURE_DEFINITION_SCHEMA_ID = (
+    "et_mainsim.science_optimal_aperture_definition.v2"
+)
+_APERTURE_DEFINITION_SCHEMA_VERSION = 2
+_QUALITY_SUMMARY_SCHEMA_ID = "et_mainsim.stamp_science_quality_summary.v2"
+_QUALITY_SUMMARY_SCHEMA_VERSION = 2
+_REPRESENTATIVE_FRAMES_SCHEMA_ID = (
+    "et_mainsim.representative_calibrated_stamp_frames.v2"
+)
+_REPRESENTATIVE_FRAMES_SCHEMA_VERSION = 2
 _REFERENCE_LIGHTCURVE_REQUIRED_COLUMNS = tuple(
     sorted(
         (
@@ -94,6 +116,9 @@ _REFERENCE_LIGHTCURVE_REQUIRED_COLUMNS = tuple(
             "flux_expectation_bgsub_e_per_s",
             "aperture_valid",
             "quality_bitmask",
+            "captured_flux_fraction",
+            "captured_flux_denominator_e",
+            "captured_flux_qa_pass",
             "fitted_flux_expectation_e",
             "fitted_flux_expectation_e_per_s",
             "residual_expectation_e",
@@ -104,13 +129,14 @@ _REFERENCE_LIGHTCURVE_REQUIRED_COLUMNS = tuple(
 
 
 class StampScienceAnalysisContractError(ValueError):
-    """Raised when formal inputs or a publication violate the v1 contract."""
+    """Raised when formal inputs or a publication violate the v2 wire contract."""
 
 
 def _reference_lightcurve_contract_v1() -> dict[str, Any]:
     return {
         "artifact": "reference_lightcurve.ecsv",
         "schema_id": _REFERENCE_LIGHTCURVE_SCHEMA_ID,
+        "schema_version": _REFERENCE_LIGHTCURVE_SCHEMA_VERSION,
         "measured_flux_column": "flux_expectation_bgsub_e",
         "measured_rate_column": "flux_expectation_bgsub_e_per_s",
         "validity_column": "aperture_valid",
@@ -595,6 +621,45 @@ def _canonical_series_provenance_json(
     )
 
 
+def _require_input_capture_qa_all_true(
+    handle: Any,
+    *,
+    path: Path,
+    frame_count: int,
+) -> None:
+    """Scan the tiny cadence gate before any expensive analysis work starts."""
+
+    if "captured_flux_qa_pass" not in handle:
+        raise StampScienceAnalysisContractError(
+            "formal input lacks captured_flux_qa_pass"
+        )
+    dataset = handle["captured_flux_qa_pass"]
+    if dataset.shape != (frame_count,):
+        raise StampScienceAnalysisContractError(
+            "formal input captured_flux_qa_pass axis differs"
+        )
+    chunk_frames = (
+        int(dataset.chunks[0])
+        if dataset.chunks is not None and int(dataset.chunks[0]) > 0
+        else min(frame_count, 65_536)
+    )
+    for start in range(0, frame_count, chunk_frames):
+        values = np.asarray(
+            dataset[start : min(frame_count, start + chunk_frames)]
+        )
+        if values.dtype.kind not in {"b", "i", "u"} or not np.all(
+            (values == 0) | (values == 1)
+        ):
+            raise StampScienceAnalysisContractError(
+                "formal input captured_flux_qa_pass is not binary"
+            )
+        if not np.all(values == 1):
+            raise StampScienceAnalysisContractError(
+                "formal input captured_flux_qa_pass contains false: "
+                f"{path}"
+            )
+
+
 def _read_input_header(path: Path) -> _InputHeader:
     """Centralized adapter around reference_photometry's formal helpers."""
 
@@ -610,6 +675,11 @@ def _read_input_header(path: Path) -> _InputHeader:
                 )
             manifest = _formal_json_dataset(handle, "manifest_json")
             provenance = _formal_json_dataset(handle, "provenance_json")
+            _require_input_capture_qa_all_true(
+                handle,
+                path=formal.path,
+                frame_count=formal.frame_count,
+            )
         cross_manifest = _canonical_series_manifest_json(manifest)
         cross_provenance = _canonical_series_provenance_json(provenance)
         target_value = manifest.get(
@@ -784,6 +854,9 @@ def _validate_cross_product_headers(
 class _DeliveryBatch:
     final_dn: NDArray[np.unsignedinteger]
     background_expectation_e: NDArray[np.float64]
+    captured_flux_fraction: NDArray[np.float64]
+    captured_flux_denominator_e: NDArray[np.float64]
+    captured_flux_qa_pass: NDArray[np.bool_]
     bias_level_sum_dn: NDArray[np.float64]
     column_noise_sum_dn_by_x: NDArray[np.float64]
     valid_mask: NDArray[np.bool_]
@@ -875,6 +948,21 @@ def _read_delivery_batch(
     background = np.asarray(
         handle["background_expectation_e"][slc], dtype=np.float64
     )
+    captured_fraction = np.asarray(
+        handle["captured_flux_fraction"][slc], dtype=np.float64
+    )
+    captured_denominator = np.asarray(
+        handle["captured_flux_denominator_e"][slc], dtype=np.float64
+    )
+    captured_qa = _binary_batch_mask(
+        handle["captured_flux_qa_pass"][slc],
+        name="captured_flux_qa_pass",
+        shape=(n_frames,),
+    )
+    if not np.all(captured_qa):
+        raise StampScienceAnalysisContractError(
+            "formal input captured_flux_qa_pass contains false"
+        )
     bias = np.asarray(handle["bias_level_sum_dn"][slc], dtype=np.float64)
     column = np.asarray(
         handle["column_noise_sum_dn_by_x"][slc], dtype=np.float64
@@ -916,10 +1004,17 @@ def _read_delivery_batch(
     )
     if (
         background.shape != shape
+        or captured_fraction.shape != (n_frames,)
+        or captured_denominator.shape != (n_frames,)
         or bias.shape != (n_frames,)
         or column.shape != (n_frames, nx)
         or not np.all(np.isfinite(background))
         or np.any(background < 0.0)
+        or not np.all(np.isfinite(captured_fraction))
+        or np.any(captured_fraction < 0.0)
+        or np.any(captured_fraction > 1.0 + 1.0e-6)
+        or not np.all(np.isfinite(captured_denominator))
+        or np.any(captured_denominator <= 0.0)
         or not np.all(np.isfinite(bias))
         or not np.all(np.isfinite(column))
         or not np.all(np.isfinite(time))
@@ -947,6 +1042,9 @@ def _read_delivery_batch(
     return _DeliveryBatch(
         final_dn=final,
         background_expectation_e=background,
+        captured_flux_fraction=captured_fraction,
+        captured_flux_denominator_e=captured_denominator,
+        captured_flux_qa_pass=captured_qa,
         bias_level_sum_dn=bias,
         column_noise_sum_dn_by_x=column,
         valid_mask=valid,
@@ -966,6 +1064,9 @@ def _slice_batch(batch: _DeliveryBatch, selection: slice | NDArray[np.int64]) ->
     return _DeliveryBatch(
         final_dn=batch.final_dn[selection],
         background_expectation_e=batch.background_expectation_e[selection],
+        captured_flux_fraction=batch.captured_flux_fraction[selection],
+        captured_flux_denominator_e=batch.captured_flux_denominator_e[selection],
+        captured_flux_qa_pass=batch.captured_flux_qa_pass[selection],
         bias_level_sum_dn=batch.bias_level_sum_dn[selection],
         column_noise_sum_dn_by_x=batch.column_noise_sum_dn_by_x[selection],
         valid_mask=batch.valid_mask[selection],
@@ -1017,6 +1118,9 @@ def _concatenate_batches(
     return _DeliveryBatch(
         final_dn=concat("final_dn"),
         background_expectation_e=concat("background_expectation_e"),
+        captured_flux_fraction=concat("captured_flux_fraction"),
+        captured_flux_denominator_e=concat("captured_flux_denominator_e"),
+        captured_flux_qa_pass=concat("captured_flux_qa_pass"),
         bias_level_sum_dn=concat("bias_level_sum_dn"),
         column_noise_sum_dn_by_x=concat("column_noise_sum_dn_by_x"),
         valid_mask=concat("valid_mask"),
@@ -1069,12 +1173,31 @@ def _coadd_batch(batch: _DeliveryBatch, *, factor: int) -> _DeliveryBatch:
         batch.valid_mask.reshape(groups, factor, ny, nx),
         axis=1,
     )
+    capture_denominator = np.sum(
+        batch.captured_flux_denominator_e.reshape(groups, factor),
+        axis=1,
+        dtype=np.float64,
+    )
+    capture_fraction = np.sum(
+        (
+            batch.captured_flux_fraction
+            * batch.captured_flux_denominator_e
+        ).reshape(groups, factor),
+        axis=1,
+        dtype=np.float64,
+    ) / capture_denominator
     return _DeliveryBatch(
         final_dn=final,
         background_expectation_e=_grouped_sum(
             batch.background_expectation_e,
             groups=groups,
             factor=factor,
+        ),
+        captured_flux_fraction=capture_fraction,
+        captured_flux_denominator_e=capture_denominator,
+        captured_flux_qa_pass=np.all(
+            batch.captured_flux_qa_pass.reshape(groups, factor),
+            axis=1,
         ),
         bias_level_sum_dn=_grouped_sum(
             batch.bias_level_sum_dn,
@@ -1310,17 +1433,20 @@ def _train_aperture(
         noise_template_e=noise,
         permanent_valid_mask=permanent_valid,
     )
-    background_mask = build_local_background_mask_v1(
-        selected.aperture_mask,
-        exclusion_radius_pixels=request.policy.photometry.background_guard_pixels,
-        border_pixels=request.policy.photometry.background_border_pixels,
-        permanent_valid_mask=permanent_valid,
-    )
-    background_pixel_count = int(np.count_nonzero(background_mask))
-    if background_pixel_count < request.policy.photometry.minimum_background_pixels:
-        raise StampScienceAnalysisContractError(
-            "online-trained background mask has too few pixels"
+    background_mask: NDArray[np.bool_] | None = None
+    background_pixel_count = 0
+    if request.policy.photometry.local_background_enabled:
+        background_mask = build_local_background_mask_v1(
+            selected.aperture_mask,
+            exclusion_radius_pixels=request.policy.photometry.background_guard_pixels,
+            border_pixels=request.policy.photometry.background_border_pixels,
+            permanent_valid_mask=permanent_valid,
         )
+        background_pixel_count = int(np.count_nonzero(background_mask))
+        if background_pixel_count < request.policy.photometry.minimum_background_pixels:
+            raise StampScienceAnalysisContractError(
+                "online-trained background mask has too few pixels"
+            )
     peak_flat = int(np.argmax(np.where(permanent_valid, signal, -np.inf)))
     peak_yx = tuple(int(value) for value in np.unravel_index(peak_flat, signal.shape))
     return ScienceApertureDefinition(
@@ -1335,6 +1461,10 @@ def _train_aperture(
         training_raw_frame_indices=absolute,
         metadata={
             "template_fit": "through_origin_q_weighted_v1",
+            "background_strategy": request.policy.photometry.background_strategy,
+            "local_background_enabled": (
+                request.policy.photometry.local_background_enabled
+            ),
             "training_accumulator": (
                 "online_per_pixel_sufficient_statistics_v1"
             ),
@@ -1368,6 +1498,15 @@ class _CadenceCollector:
     background_expectation_aperture_parts: list[NDArray[np.float64]] = field(
         default_factory=list
     )
+    captured_flux_fraction_parts: list[NDArray[np.float64]] = field(
+        default_factory=list
+    )
+    captured_flux_denominator_parts: list[NDArray[np.float64]] = field(
+        default_factory=list
+    )
+    captured_flux_qa_parts: list[NDArray[np.bool_]] = field(
+        default_factory=list
+    )
 
     def add(
         self,
@@ -1383,6 +1522,11 @@ class _CadenceCollector:
         self.photometry_parts.append(result)
         self.raw_start_parts.append(batch.raw_frame_start_index)
         self.raw_stop_parts.append(batch.raw_frame_stop_index_exclusive)
+        self.captured_flux_fraction_parts.append(batch.captured_flux_fraction)
+        self.captured_flux_denominator_parts.append(
+            batch.captured_flux_denominator_e
+        )
+        self.captured_flux_qa_parts.append(batch.captured_flux_qa_pass)
         self.background_expectation_aperture_parts.append(
             np.sum(
                 batch.background_expectation_e[:, aperture_mask],
@@ -1404,6 +1548,9 @@ class _CadenceAnalysis:
     local_model: ScienceVariabilityModelResult
     uncertainty: ScienceFluxUncertaintyModelResult
     background_expectation_aperture_e: NDArray[np.float64]
+    captured_flux_fraction: NDArray[np.float64]
+    captured_flux_denominator_e: NDArray[np.float64]
+    captured_flux_qa_pass: NDArray[np.bool_]
     expectation_cdpp: Any
     local_cdpp: Any
 
@@ -1422,6 +1569,24 @@ _PHOTOMETRY_ARRAY_FIELDS = (
     "background_usable_pixel_count",
     "quality_bitmask",
 )
+
+
+def _unavailable_local_variability_model(
+    expectation_model: ScienceVariabilityModelResult,
+) -> ScienceVariabilityModelResult:
+    """Return an explicit unavailable diagnostic without fabricating flux."""
+
+    shape = expectation_model.raw_factor_sum.shape
+    unavailable = np.full(shape, np.nan, dtype=np.float64)
+    return ScienceVariabilityModelResult(
+        raw_factor_sum=np.array(expectation_model.raw_factor_sum, copy=True),
+        fitted_flux_e=unavailable.copy(),
+        residual_e=unavailable.copy(),
+        residual_ppm=unavailable.copy(),
+        fit_scale_e_per_raw_factor=float("nan"),
+        fit_intercept_e=float("nan"),
+        valid_mask=np.zeros(shape, dtype=bool),
+    )
 
 
 def _finish_cadence(
@@ -1454,6 +1619,17 @@ def _finish_cadence(
     background_expectation_aperture = np.concatenate(
         collector.background_expectation_aperture_parts
     )
+    captured_flux_fraction = np.concatenate(
+        collector.captured_flux_fraction_parts
+    )
+    captured_flux_denominator = np.concatenate(
+        collector.captured_flux_denominator_parts
+    )
+    captured_flux_qa = np.concatenate(collector.captured_flux_qa_parts)
+    if not np.all(captured_flux_qa):
+        raise StampScienceAnalysisContractError(
+            "reconstructed cadence captured_flux_qa_pass contains false"
+        )
     arrays = {
         name: np.concatenate(
             [np.asarray(getattr(item, name)) for item in collector.photometry_parts]
@@ -1472,13 +1648,20 @@ def _finish_cadence(
         raw_frame_start_index=local_start,
         raw_frame_stop_index_exclusive=local_stop,
     )
-    local_model = fit_science_variability_model_v1(
-        flux_e=arrays["flux_local_bgsub_e"],
-        aperture_valid=local_valid,
-        raw_relative_flux=raw_relative_flux,
-        raw_frame_start_index=local_start,
-        raw_frame_stop_index_exclusive=local_stop,
+    local_background_enabled = all(
+        bool(item.product_semantics.get("local_background_enabled", False))
+        for item in collector.photometry_parts
     )
+    if local_background_enabled:
+        local_model = fit_science_variability_model_v1(
+            flux_e=arrays["flux_local_bgsub_e"],
+            aperture_valid=local_valid,
+            raw_relative_flux=raw_relative_flux,
+            raw_frame_start_index=local_start,
+            raw_frame_stop_index_exclusive=local_stop,
+        )
+    else:
+        local_model = _unavailable_local_variability_model(expectation_model)
     uncertainty = compute_science_flux_uncertainty_model_v1(
         fitted_source_expectation_e=expectation_model.fitted_flux_e,
         aperture_mask=aperture_mask,
@@ -1500,18 +1683,20 @@ def _finish_cadence(
         minimum_accepted_bins=policy.minimum_accepted_bins,
         bin_origin_seconds=policy.bin_origin_seconds,
     )
-    local_cdpp = compute_science_cdpp_v1(
-        time_seconds=time,
-        exposure_seconds=exposure,
-        flux_e=arrays["flux_local_bgsub_e"],
-        aperture_valid=local_valid,
-        model_flux_e=local_model.fitted_flux_e,
-        residual_e=local_model.residual_e,
-        windows_minutes=policy.cdpp_windows_minutes,
-        minimum_coverage_fraction=policy.minimum_coverage_fraction,
-        minimum_accepted_bins=policy.minimum_accepted_bins,
-        bin_origin_seconds=policy.bin_origin_seconds,
-    )
+    local_cdpp = None
+    if local_background_enabled:
+        local_cdpp = compute_science_cdpp_v1(
+            time_seconds=time,
+            exposure_seconds=exposure,
+            flux_e=arrays["flux_local_bgsub_e"],
+            aperture_valid=local_valid,
+            model_flux_e=local_model.fitted_flux_e,
+            residual_e=local_model.residual_e,
+            windows_minutes=policy.cdpp_windows_minutes,
+            minimum_coverage_fraction=policy.minimum_coverage_fraction,
+            minimum_accepted_bins=policy.minimum_accepted_bins,
+            bin_origin_seconds=policy.bin_origin_seconds,
+        )
     return _CadenceAnalysis(
         factor=collector.factor,
         time_seconds=time,
@@ -1525,6 +1710,9 @@ def _finish_cadence(
         background_expectation_aperture_e=(
             background_expectation_aperture
         ),
+        captured_flux_fraction=captured_flux_fraction,
+        captured_flux_denominator_e=captured_flux_denominator,
+        captured_flux_qa_pass=captured_flux_qa,
         expectation_cdpp=expectation_cdpp,
         local_cdpp=local_cdpp,
     )
@@ -1533,6 +1721,9 @@ def _finish_cadence(
 _SEMANTIC_DATASET_NAMES = (
     "final_dn",
     "background_expectation_e",
+    "captured_flux_fraction",
+    "captured_flux_denominator_e",
+    "captured_flux_qa_pass",
     "bias_level_sum_dn",
     "column_noise_sum_dn_by_x",
     "valid_mask",
@@ -1594,6 +1785,9 @@ class _SemanticShardHasher:
         arrays: dict[str, NDArray[Any]] = {
             "final_dn": batch.final_dn,
             "background_expectation_e": batch.background_expectation_e,
+            "captured_flux_fraction": batch.captured_flux_fraction,
+            "captured_flux_denominator_e": batch.captured_flux_denominator_e,
+            "captured_flux_qa_pass": batch.captured_flux_qa_pass,
             "bias_level_sum_dn": batch.bias_level_sum_dn,
             "column_noise_sum_dn_by_x": batch.column_noise_sum_dn_by_x,
             "valid_mask": batch.valid_mask,
@@ -1755,11 +1949,14 @@ def _compare_parity_batch(
         "adc_low_count",
         "adc_high_count",
         "cosmic_count",
+        "captured_flux_qa_pass",
         "raw_frame_start_index",
         "raw_frame_stop_index_exclusive",
     )
     float_names = (
         "background_expectation_e",
+        "captured_flux_fraction",
+        "captured_flux_denominator_e",
         "bias_level_sum_dn",
         "column_noise_sum_dn_by_x",
         "time_start_seconds",
@@ -2015,18 +2212,21 @@ def _build_reference_aperture(
     policy: StampSciencePhotometryPolicy,
 ) -> ScienceApertureDefinition:
     base = build_reference_fixed13_aperture_v1(stamp_shape)
-    permanent_valid = np.ones(stamp_shape, dtype=bool)
-    background_mask = build_local_background_mask_v1(
-        base.aperture_mask,
-        exclusion_radius_pixels=policy.background_guard_pixels,
-        border_pixels=policy.background_border_pixels,
-        permanent_valid_mask=permanent_valid,
-    )
-    background_pixel_count = int(np.count_nonzero(background_mask))
-    if background_pixel_count < policy.minimum_background_pixels:
-        raise StampScienceAnalysisContractError(
-            "reference fixed13 background mask has too few pixels"
+    background_mask: NDArray[np.bool_] | None = None
+    background_pixel_count = 0
+    if policy.local_background_enabled:
+        permanent_valid = np.ones(stamp_shape, dtype=bool)
+        background_mask = build_local_background_mask_v1(
+            base.aperture_mask,
+            exclusion_radius_pixels=policy.background_guard_pixels,
+            border_pixels=policy.background_border_pixels,
+            permanent_valid_mask=permanent_valid,
         )
+        background_pixel_count = int(np.count_nonzero(background_mask))
+        if background_pixel_count < policy.minimum_background_pixels:
+            raise StampScienceAnalysisContractError(
+                "reference fixed13 background mask has too few pixels"
+            )
     return ScienceApertureDefinition(
         aperture_mask=base.aperture_mask,
         background_mask=background_mask,
@@ -2036,6 +2236,8 @@ def _build_reference_aperture(
         target_peak_yx=base.target_peak_yx,
         metadata={
             **dict(base.metadata),
+            "background_strategy": policy.background_strategy,
+            "local_background_enabled": policy.local_background_enabled,
             "background_mask_algorithm": (
                 "et_mainsim.local_background_mask_rectangular_v1"
             ),
@@ -2068,11 +2270,6 @@ def _stream_raw_product_analyses(
         raise StampScienceAnalysisContractError(
             "raw product analysis requires a representative aperture"
         )
-    for name, aperture in apertures.items():
-        if aperture.background_mask is None:
-            raise StampScienceAnalysisContractError(
-                f"analysis aperture {name} lacks a frozen local-background mask"
-            )
     accumulators = {
         factor: _FactorAccumulator(factor) for factor in request.policy.coadd_factors
     }
@@ -2193,7 +2390,6 @@ def _stream_raw_product_analyses(
                         continue
                     photometry_input = emitted.to_photometry_input()
                     for name, aperture in apertures.items():
-                        assert aperture.background_mask is not None
                         result = reduce_science_photometry_v1(
                             photometry_input,
                             aperture_mask=aperture.aperture_mask,
@@ -2298,6 +2494,11 @@ def _json_safe(value: Any) -> Any:
 
 
 def _cdpp_payload(result: Any) -> dict[str, Any]:
+    if result is None:
+        return {
+            "status": "not_computed",
+            "reason": "background_strategy_delivered_expectation_only",
+        }
     return {
         "metrics_by_window_minutes": {
             str(minutes): metric.to_dict()
@@ -2338,7 +2539,8 @@ def _aperture_payload(aperture: ScienceApertureDefinition) -> dict[str, Any]:
         files["noise_template_e"] = "noise_template_e.npy"
     return _json_safe(
         {
-            "schema_id": "et_mainsim.science_optimal_aperture_definition.v1",
+            "schema_id": _APERTURE_DEFINITION_SCHEMA_ID,
+            "schema_version": _APERTURE_DEFINITION_SCHEMA_VERSION,
             "algorithm": aperture.algorithm,
             "maximum_cumulative_snr": aperture.maximum_cumulative_snr,
             "signal_template_shape": list(aperture.signal_template_shape),
@@ -2414,10 +2616,36 @@ def _build_contract(
             "observation_product": "final_dn",
             "calibrated_electron_products_are_derived": True,
             "background_realization_used": False,
-            "background_products": [
-                "expectation_background_subtracted",
-                "local_background_diagnostic",
-            ],
+            "background_products": (
+                [
+                    "expectation_background_subtracted",
+                    "local_background_diagnostic",
+                ]
+                if request.policy.photometry.local_background_enabled
+                else ["expectation_background_subtracted"]
+            ),
+            "default_background_product": "background_expectation_e",
+            "background_strategy": (
+                request.policy.photometry.background_strategy
+            ),
+            "captured_flux_qa": {
+                "definition": (
+                    "pass_requires_no_detector_edge_or_requested_window_truncation"
+                ),
+                "fraction_denominator": (
+                    "source_effective_photon_count_electron"
+                ),
+                "post_crop_renormalization": False,
+                "cadences": {
+                    f"{int(round(float(analysis.exposure_seconds[0])))}s": {
+                        "all_pass": bool(np.all(analysis.captured_flux_qa_pass)),
+                        "minimum_fraction": float(
+                            np.min(analysis.captured_flux_fraction)
+                        ),
+                    }
+                    for _, analysis in sorted(analyses.items())
+                },
+            },
             "source_model": "through_origin_integrated_raw_relative_flux_v1",
             "flux_uncertainty_model": {
                 "schema_id": "et_mainsim.science_flux_uncertainty_model.v1",
@@ -2449,6 +2677,9 @@ def _build_contract(
             },
             "reference_lightcurve": _reference_lightcurve_contract_v1(),
             "science_photometry_schema_id": SCIENCE_PHOTOMETRY_SCHEMA_ID,
+            "science_photometry_schema_version": (
+                SCIENCE_PHOTOMETRY_SCHEMA_VERSION
+            ),
             "raw_frame_interval": {
                 "start_index": first_raw,
                 "stop_index_exclusive": last_raw,
@@ -2560,8 +2791,11 @@ def _write_authoritative_hdf5(
 ) -> None:
     import h5py
 
-    if aperture.background_mask is None:
-        raise StampScienceAnalysisContractError("aperture lacks background mask")
+    persisted_background_mask = (
+        np.zeros(aperture.aperture_mask.shape, dtype=bool)
+        if aperture.background_mask is None
+        else np.asarray(aperture.background_mask, dtype=bool)
+    )
     with h5py.File(path, "w") as handle:
         handle.attrs["schema_id"] = STAMP_SCIENCE_ANALYSIS_SCHEMA_ID
         handle.attrs["schema_version"] = STAMP_SCIENCE_ANALYSIS_SCHEMA_VERSION
@@ -2599,7 +2833,7 @@ def _write_authoritative_hdf5(
         )
         aperture_group.create_dataset(
             "background_mask",
-            data=np.asarray(aperture.background_mask, dtype=bool),
+            data=persisted_background_mask,
         )
         if aperture.signal_template_e is not None:
             aperture_group.create_dataset(
@@ -2642,6 +2876,11 @@ def _write_authoritative_hdf5(
                 "background_expectation_aperture_e": (
                     analysis.background_expectation_aperture_e
                 ),
+                "captured_flux_fraction": analysis.captured_flux_fraction,
+                "captured_flux_denominator_e": (
+                    analysis.captured_flux_denominator_e
+                ),
+                "captured_flux_qa_pass": analysis.captured_flux_qa_pass,
                 "flux_uncertainty_e": analysis.uncertainty.uncertainty_e,
                 "source_variance_e2": analysis.uncertainty.source_variance_e2,
                 "background_variance_e2": (
@@ -2739,6 +2978,11 @@ def _write_portable_ecsv_v1(
                 "background_expectation_aperture_e": (
                     analysis.background_expectation_aperture_e
                 ),
+                "captured_flux_fraction": analysis.captured_flux_fraction,
+                "captured_flux_denominator_e": (
+                    analysis.captured_flux_denominator_e
+                ),
+                "captured_flux_qa_pass": analysis.captured_flux_qa_pass,
                 "flux_uncertainty_e": analysis.uncertainty.uncertainty_e,
                 "source_variance_e2": analysis.uncertainty.source_variance_e2,
                 "background_variance_e2": (
@@ -2777,7 +3021,8 @@ def _write_portable_ecsv_v1(
         tables.append(table)
     combined = vstack(tables, metadata_conflicts="error")
     combined.meta = {
-        "schema_id": "et_mainsim.stamp_science_photometry_table.v1",
+        "schema_id": _PHOTOMETRY_TABLE_SCHEMA_ID,
+        "schema_version": _PHOTOMETRY_TABLE_SCHEMA_VERSION,
         "observation_product": "final_dn",
         "background_realization_used": False,
     }
@@ -2823,6 +3068,11 @@ def _write_reference_lightcurve_ecsv_v1(
                     ),
                     "aperture_valid": analysis.photometry["aperture_valid"],
                     "quality_bitmask": analysis.photometry["quality_bitmask"],
+                    "captured_flux_fraction": analysis.captured_flux_fraction,
+                    "captured_flux_denominator_e": (
+                        analysis.captured_flux_denominator_e
+                    ),
+                    "captured_flux_qa_pass": analysis.captured_flux_qa_pass,
                     "fitted_flux_expectation_e": (
                         analysis.expectation_model.fitted_flux_e
                     ),
@@ -2842,6 +3092,7 @@ def _write_reference_lightcurve_ecsv_v1(
     combined = vstack(tables, metadata_conflicts="error")
     combined.meta = {
         "schema_id": _REFERENCE_LIGHTCURVE_SCHEMA_ID,
+        "schema_version": _REFERENCE_LIGHTCURVE_SCHEMA_VERSION,
         "time_alignment": "simulation_raw_frame_index",
         "flux_factor_semantics": "dimensionless_relative_flux",
         "measured_flux_semantics": (
@@ -2921,6 +3172,8 @@ def _write_cdpp_ecsv_v1(
             ("expectation_background", analysis.expectation_cdpp),
             ("local_background", analysis.local_cdpp),
         ):
+            if result is None:
+                continue
             for window, metric in sorted(result.metrics_by_window_minutes.items()):
                 rows.append(
                     (
@@ -2987,10 +3240,19 @@ def _quality_summary_v1(
             "model_uncertainty_valid_count": int(
                 np.count_nonzero(analysis.uncertainty.valid_mask)
             ),
+            "captured_flux_qa_pass_count": int(
+                np.count_nonzero(analysis.captured_flux_qa_pass)
+            ),
+            "captured_flux_qa_fail_count": int(
+                np.count_nonzero(~analysis.captured_flux_qa_pass)
+            ),
+            "minimum_captured_flux_fraction": float(
+                np.min(analysis.captured_flux_fraction)
+            ),
         }
     return {
-        "schema_id": "et_mainsim.stamp_science_quality_summary.v1",
-        "schema_version": 1,
+        "schema_id": _QUALITY_SUMMARY_SCHEMA_ID,
+        "schema_version": _QUALITY_SUMMARY_SCHEMA_VERSION,
         "centroid_coordinate_system": "zero_based_stamp_local_x_column_y_row",
         "cadences": cadences,
     }
@@ -3115,10 +3377,8 @@ def _write_representative_frames_hdf5(
     )
     calibrated_bgsub = calibrated - background
     with h5py.File(path, "w") as handle:
-        handle.attrs["schema_id"] = (
-            "et_mainsim.representative_calibrated_stamp_frames.v1"
-        )
-        handle.attrs["schema_version"] = 1
+        handle.attrs["schema_id"] = _REPRESENTATIVE_FRAMES_SCHEMA_ID
+        handle.attrs["schema_version"] = _REPRESENTATIVE_FRAMES_SCHEMA_VERSION
         handle.attrs["complete"] = False
         handle.attrs["observation_product"] = "final_dn"
         handle.attrs["background_realization_used"] = False
@@ -3126,6 +3386,24 @@ def _write_representative_frames_hdf5(
         handle.create_dataset("calibrated_e", data=calibrated)
         handle.create_dataset("calibrated_bgsub_e", data=calibrated_bgsub)
         handle.create_dataset("background_expectation_e", data=background)
+        handle.create_dataset(
+            "captured_flux_fraction",
+            data=np.concatenate(
+                [item.captured_flux_fraction for item in batches]
+            ),
+        )
+        handle.create_dataset(
+            "captured_flux_denominator_e",
+            data=np.concatenate(
+                [item.captured_flux_denominator_e for item in batches]
+            ),
+        )
+        handle.create_dataset(
+            "captured_flux_qa_pass",
+            data=np.concatenate(
+                [item.captured_flux_qa_pass for item in batches]
+            ),
+        )
         handle.create_dataset(
             "valid_mask",
             data=np.concatenate([item.valid_mask for item in batches], axis=0),
@@ -3214,10 +3492,6 @@ def _write_analysis_artifacts(
     representative_frames: tuple[_RepresentativeFrame, ...],
     raw_identities: Sequence[Mapping[str, Any]],
 ) -> None:
-    if aperture.background_mask is None:
-        raise StampScienceAnalysisContractError(
-            "analysis aperture lacks a background mask required for publication"
-        )
     cdpp = _all_cdpp_payload(analyses)
     _write_authoritative_hdf5(
         staging / "photometry.h5",
@@ -3257,7 +3531,11 @@ def _write_analysis_artifacts(
     np.save(staging / "aperture_mask.npy", aperture.aperture_mask, allow_pickle=False)
     np.save(
         staging / "background_mask.npy",
-        aperture.background_mask,
+        (
+            np.zeros(aperture.aperture_mask.shape, dtype=bool)
+            if aperture.background_mask is None
+            else aperture.background_mask
+        ),
         allow_pickle=False,
     )
     optional_template_names: list[str] = []
@@ -3299,8 +3577,8 @@ def _write_analysis_artifacts(
         "figures/representative_frames.png",
     )
     publication_manifest = {
-        "schema_id": "et_mainsim.stamp_science_analysis_publication.v1",
-        "schema_version": 1,
+        "schema_id": STAMP_SCIENCE_ANALYSIS_PUBLICATION_SCHEMA_ID,
+        "schema_version": STAMP_SCIENCE_ANALYSIS_PUBLICATION_SCHEMA_VERSION,
         "complete": True,
         "ready": True,
         "authoritative_product": "photometry.h5",
@@ -3352,7 +3630,7 @@ def _validate_reference_lightcurve_ecsv_v1(
     expected_contract = _reference_lightcurve_contract_v1()
     if contract.get("reference_lightcurve") != expected_contract:
         raise StampScienceAnalysisContractError(
-            "analysis contract lacks the v1 reference-lightcurve contract"
+            "analysis contract lacks the v2 reference-lightcurve contract"
         )
     try:
         table = Table.read(path, format="ascii.ecsv")
@@ -3360,7 +3638,11 @@ def _validate_reference_lightcurve_ecsv_v1(
         raise StampScienceAnalysisContractError(
             "reference-lightcurve ECSV cannot be read"
         ) from error
-    if table.meta.get("schema_id") != _REFERENCE_LIGHTCURVE_SCHEMA_ID:
+    if (
+        table.meta.get("schema_id") != _REFERENCE_LIGHTCURVE_SCHEMA_ID
+        or table.meta.get("schema_version")
+        != _REFERENCE_LIGHTCURVE_SCHEMA_VERSION
+    ):
         raise StampScienceAnalysisContractError(
             "reference-lightcurve ECSV schema is invalid"
         )
@@ -3422,6 +3704,12 @@ def _validate_reference_lightcurve_ecsv_v1(
                 "residual_expectation_ppm": np.asarray(
                     group["residual_expectation_ppm"], dtype=np.float64
                 ),
+                "captured_flux_fraction": np.asarray(
+                    group["captured_flux_fraction"], dtype=np.float64
+                ),
+                "captured_flux_denominator_e": np.asarray(
+                    group["captured_flux_denominator_e"], dtype=np.float64
+                ),
             }
             for column, expected in float_columns.items():
                 actual = np.asarray(table[column], dtype=np.float64)[selected]
@@ -3465,9 +3753,57 @@ def _validate_reference_lightcurve_ecsv_v1(
                     "reference-lightcurve ECSV column differs from HDF5: "
                     "aperture_valid"
                 )
+            captured_qa = np.asarray(
+                table["captured_flux_qa_pass"], dtype=bool
+            )[selected]
+            if not np.array_equal(
+                captured_qa,
+                np.asarray(group["captured_flux_qa_pass"], dtype=bool),
+            ):
+                raise StampScienceAnalysisContractError(
+                    "reference-lightcurve ECSV column differs from HDF5: "
+                    "captured_flux_qa_pass"
+                )
     if len(table) != total_expected_rows:
         raise StampScienceAnalysisContractError(
             "reference-lightcurve ECSV row count differs from HDF5"
+        )
+
+
+def _validate_portable_photometry_ecsv_v2(path: Path) -> None:
+    """Reject pre-v2 table layouts even when a manifest re-hashes the file."""
+
+    from astropy.table import Table
+
+    try:
+        table = Table.read(path, format="ascii.ecsv")
+    except (OSError, UnicodeError, TypeError, ValueError) as error:
+        raise StampScienceAnalysisContractError(
+            "portable photometry ECSV cannot be read"
+        ) from error
+    required = {
+        "cadence_seconds",
+        "time_start_seconds",
+        "exposure_seconds",
+        "flux_expectation_bgsub_e",
+        "background_expectation_aperture_e",
+        "captured_flux_fraction",
+        "captured_flux_denominator_e",
+        "captured_flux_qa_pass",
+        "aperture_valid",
+        "quality_bitmask",
+    }
+    if (
+        table.meta.get("schema_id") != _PHOTOMETRY_TABLE_SCHEMA_ID
+        or table.meta.get("schema_version") != _PHOTOMETRY_TABLE_SCHEMA_VERSION
+        or not required.issubset(table.colnames)
+    ):
+        raise StampScienceAnalysisContractError(
+            "portable photometry ECSV v2 schema is invalid"
+        )
+    if not np.all(np.asarray(table["captured_flux_qa_pass"], dtype=bool)):
+        raise StampScienceAnalysisContractError(
+            "portable photometry ECSV captured_flux_qa_pass contains false"
         )
 
 
@@ -3488,8 +3824,9 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     manifest = _read_json_object(manifest_path, label="analysis manifest")
     if (
         manifest.get("schema_id")
-        != "et_mainsim.stamp_science_analysis_publication.v1"
-        or manifest.get("schema_version") != 1
+        != STAMP_SCIENCE_ANALYSIS_PUBLICATION_SCHEMA_ID
+        or manifest.get("schema_version")
+        != STAMP_SCIENCE_ANALYSIS_PUBLICATION_SCHEMA_VERSION
         or manifest.get("complete") is not True
         or manifest.get("ready") is not True
         or manifest.get("authoritative_product") != "photometry.h5"
@@ -3502,6 +3839,29 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     if not isinstance(contract, dict) or not isinstance(artifacts, dict):
         raise StampScienceAnalysisContractError(
             "analysis manifest lacks contract/artifact identities"
+        )
+    captured_contract = contract.get("captured_flux_qa")
+    captured_cadences = (
+        captured_contract.get("cadences")
+        if isinstance(captured_contract, Mapping)
+        else None
+    )
+    if (
+        contract.get("schema_id") != STAMP_SCIENCE_ANALYSIS_SCHEMA_ID
+        or contract.get("schema_version") != STAMP_SCIENCE_ANALYSIS_SCHEMA_VERSION
+        or contract.get("science_photometry_schema_id")
+        != SCIENCE_PHOTOMETRY_SCHEMA_ID
+        or contract.get("science_photometry_schema_version")
+        != SCIENCE_PHOTOMETRY_SCHEMA_VERSION
+        or not isinstance(captured_cadences, Mapping)
+        or not captured_cadences
+        or any(
+            not isinstance(record, Mapping) or record.get("all_pass") is not True
+            for record in captured_cadences.values()
+        )
+    ):
+        raise StampScienceAnalysisContractError(
+            "analysis contract schema or captured-flux gate is invalid"
         )
     for name, expected in artifacts.items():
         relative = Path(name) if isinstance(name, str) else Path()
@@ -3588,6 +3948,9 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                 "residual_expectation_e",
                 "residual_expectation_ppm",
                 "background_expectation_aperture_e",
+                "captured_flux_fraction",
+                "captured_flux_denominator_e",
+                "captured_flux_qa_pass",
                 "flux_uncertainty_e",
                 "source_variance_e2",
                 "background_variance_e2",
@@ -3631,6 +3994,26 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             uncertainty_valid = np.asarray(
                 group["uncertainty_valid"], dtype=bool
             )
+            captured_fraction = np.asarray(
+                group["captured_flux_fraction"], dtype=np.float64
+            )
+            captured_denominator = np.asarray(
+                group["captured_flux_denominator_e"], dtype=np.float64
+            )
+            captured_qa = np.asarray(group["captured_flux_qa_pass"])
+            if (
+                not np.all(np.isfinite(captured_fraction))
+                or np.any(captured_fraction < 0.0)
+                or np.any(captured_fraction > 1.0 + 1.0e-6)
+                or not np.all(np.isfinite(captured_denominator))
+                or np.any(captured_denominator <= 0.0)
+                or captured_qa.dtype.kind not in {"b", "i", "u"}
+                or not np.all((captured_qa == 0) | (captured_qa == 1))
+                or not np.all(captured_qa == 1)
+            ):
+                raise StampScienceAnalysisContractError(
+                    f"authoritative HDF5 cadence {name} capture QA did not pass"
+                )
             uncertainty = np.asarray(group["flux_uncertainty_e"], dtype=np.float64)
             component_total = sum(
                 np.asarray(group[item], dtype=np.float64)
@@ -3700,9 +4083,36 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         raise StampScienceAnalysisContractError(
             "portable and authoritative aperture masks differ"
         )
-    _read_json_object(root / "aperture_definition.json", label="aperture definition")
+    aperture_definition = _read_json_object(
+        root / "aperture_definition.json", label="aperture definition"
+    )
+    if (
+        aperture_definition.get("schema_id") != _APERTURE_DEFINITION_SCHEMA_ID
+        or aperture_definition.get("schema_version")
+        != _APERTURE_DEFINITION_SCHEMA_VERSION
+    ):
+        raise StampScienceAnalysisContractError(
+            "aperture definition schema is invalid"
+        )
     _read_json_object(root / "cdpp.json", label="CDPP product")
-    _read_json_object(root / "quality_summary.json", label="quality summary")
+    quality_summary = _read_json_object(
+        root / "quality_summary.json", label="quality summary"
+    )
+    quality_cadences = quality_summary.get("cadences")
+    if (
+        quality_summary.get("schema_id") != _QUALITY_SUMMARY_SCHEMA_ID
+        or quality_summary.get("schema_version") != _QUALITY_SUMMARY_SCHEMA_VERSION
+        or not isinstance(quality_cadences, Mapping)
+        or not quality_cadences
+        or any(
+            not isinstance(record, Mapping)
+            or record.get("captured_flux_qa_fail_count") != 0
+            for record in quality_cadences.values()
+        )
+    ):
+        raise StampScienceAnalysisContractError(
+            "quality summary schema or captured-flux gate is invalid"
+        )
     for name in (
         "photometry.ecsv",
         "reference_lightcurve.ecsv",
@@ -3711,6 +4121,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     ):
         if (root / name).stat().st_size <= 0:
             raise StampScienceAnalysisContractError(f"portable ECSV is empty: {name}")
+    _validate_portable_photometry_ecsv_v2(root / "photometry.ecsv")
     _validate_reference_lightcurve_ecsv_v1(
         root / "reference_lightcurve.ecsv",
         authoritative_hdf5_path=hdf_path,
@@ -3732,6 +4143,9 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             "calibrated_e",
             "calibrated_bgsub_e",
             "background_expectation_e",
+            "captured_flux_fraction",
+            "captured_flux_denominator_e",
+            "captured_flux_qa_pass",
             "valid_mask",
             "saturated_mask",
             "cosmic_mask",
@@ -3745,12 +4159,16 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             "input_shard_semantic_sha256",
         }
         if (
-            rep_schema != "et_mainsim.representative_calibrated_stamp_frames.v1"
-            or int(handle.attrs.get("schema_version", -1)) != 1
+            rep_schema != _REPRESENTATIVE_FRAMES_SCHEMA_ID
+            or int(handle.attrs.get("schema_version", -1))
+            != _REPRESENTATIVE_FRAMES_SCHEMA_VERSION
             or bool(handle.attrs.get("complete", False)) is not True
             or not required_rep.issubset(handle)
             or handle["final_dn"].shape[0] != 3
             or handle["final_dn"].dtype.kind != "u"
+            or not np.all(
+                np.asarray(handle["captured_flux_qa_pass"], dtype=bool)
+            )
         ):
             raise StampScienceAnalysisContractError(
                 "representative calibrated-frame product is invalid"
@@ -3820,8 +4238,9 @@ def validate_stamp_science_analysis_product_set_v1(
     products = manifest.get("products")
     if (
         manifest.get("schema_id")
-        != "et_mainsim.stamp_science_analysis_product_set.v1"
-        or manifest.get("schema_version") != 1
+        != STAMP_SCIENCE_ANALYSIS_PRODUCT_SET_SCHEMA_ID
+        or manifest.get("schema_version")
+        != STAMP_SCIENCE_ANALYSIS_PRODUCT_SET_SCHEMA_VERSION
         or manifest.get("complete") is not True
         or manifest.get("ready") is not True
         or not isinstance(products, Mapping)
@@ -4239,8 +4658,8 @@ def analyze_stamp_science_product_set_v1(
                 )
                 _validate_staged_analysis_v1(product_root)
             product_set_manifest = {
-                "schema_id": "et_mainsim.stamp_science_analysis_product_set.v1",
-                "schema_version": 1,
+                "schema_id": STAMP_SCIENCE_ANALYSIS_PRODUCT_SET_SCHEMA_ID,
+                "schema_version": STAMP_SCIENCE_ANALYSIS_PRODUCT_SET_SCHEMA_VERSION,
                 "complete": True,
                 "ready": True,
                 "formal_profile_id": request.analysis_context.get(
@@ -4280,9 +4699,10 @@ def analyze_stamp_science_product_set_v1(
 
 
 STAMP_SCIENCE_ANALYSIS_REQUEST_SCHEMA_ID = (
-    "et_mainsim.stamp_science_analysis_request.v1"
+    "et_mainsim.stamp_science_analysis_request.v2"
 )
-STAMP_SCIENCE_FORMAL_PROFILE_ID = "et_stamp_science_formal_10s_v1"
+STAMP_SCIENCE_ANALYSIS_REQUEST_SCHEMA_VERSION = 2
+STAMP_SCIENCE_FORMAL_PROFILE_ID = "et_stamp_science_formal_10s_v2"
 
 
 def collect_formal_analysis_code_identity_v1(
@@ -5209,7 +5629,7 @@ def write_stamp_science_analysis_request_v1(
             }
     payload = {
         "schema_id": STAMP_SCIENCE_ANALYSIS_REQUEST_SCHEMA_ID,
-        "schema_version": 1,
+        "schema_version": STAMP_SCIENCE_ANALYSIS_REQUEST_SCHEMA_VERSION,
         "formal_profile_id": STAMP_SCIENCE_FORMAL_PROFILE_ID,
         "production_manifest": dict(production.manifest_binding),
         "source_identity": dict(production.source_identity),
@@ -5579,7 +5999,8 @@ def load_stamp_science_analysis_request_v1(
     )
     if (
         payload["schema_id"] != STAMP_SCIENCE_ANALYSIS_REQUEST_SCHEMA_ID
-        or payload["schema_version"] != 1
+        or payload["schema_version"]
+        != STAMP_SCIENCE_ANALYSIS_REQUEST_SCHEMA_VERSION
     ):
         raise StampScienceAnalysisContractError(
             "unsupported analysis request schema/version"

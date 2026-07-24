@@ -2,8 +2,8 @@
 
 The Aster, varlc, and wdlc tracks share this producer.  Their input adapters
 freeze dimensionless 10-second source factors, while this module owns the
-common 90-day time plan, explicit 12-degree PSF reference geometry, DVA-off
-science spec, target table, and immutable production manifest.
+common long-duration time plan, explicit 12-degree PSF reference geometry,
+DVA-off science spec, target table, and immutable production manifest.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from .galaxy_stamp_production import (
     DEFAULT_MAX_RAW_FRAMES_PER_SHARD,
     DEFAULT_RAW_EXPOSURE_SECONDS,
     DEFAULT_STAMP_SHAPE,
+    FORMAL_STAMP_CENTERING_POLICY,
     GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
     STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE,
     _atomic_json,
@@ -177,7 +178,7 @@ class ScienceStampProductionConfig:
         except (TypeError, ValueError) as error:
             raise ValueError("stamp_shape must contain two positive integers") from error
         if (rows, cols) != DEFAULT_STAMP_SHAPE:
-            raise ValueError("formal science production freezes stamp_shape at 100x300")
+            raise ValueError("formal science production freezes stamp_shape at 27x27")
         device = str(self.device).strip().lower()
         if device not in {"cpu", "cuda"}:
             raise ValueError("device must be 'cpu' or 'cuda'")
@@ -497,7 +498,7 @@ def _validate_reference_position(
         <= REFERENCE_DETECTOR_ROWS - 1 - half_y
     ):
         raise ValueError(
-            "reference detector position must keep the full 100x300 stamp "
+            "reference detector position must keep the full 27x27 stamp "
             "inside main_rd"
         )
 
@@ -707,6 +708,7 @@ def prepare_science_independent_production(
             "delivery": {
                 "execution_mode": config.delivery_execution_mode,
                 "stamp_shape": list(config.stamp_shape),
+                "stamp_centering_policy": FORMAL_STAMP_CENTERING_POLICY,
                 "raw_exposure_seconds": config.raw_exposure_seconds,
                 "cadence_seconds": list(config.cadence_seconds),
                 "coadd_sizes": list(config.coadd_sizes),
@@ -1087,6 +1089,7 @@ def run_science_independent_target(
                 "run_id": str(manifest["run_id"]),
                 "production_track": str(manifest["production_track"]),
                 "case": resolved_case,
+                "stamp_centering_policy": FORMAL_STAMP_CENTERING_POLICY,
                 "rng_trace_scope": dict(rng_trace_scope),
                 "physical_rng_pairing": dict(physical_rng_pairing),
                 "production_manifest": str(resolved_manifest_path),

@@ -24,6 +24,9 @@ def _fake_adapter(raw: _Raw):
     return RawStampDeliveryFrame(
         final_dn=np.full(shape, value, dtype=np.uint16),
         background_expectation_e=np.full(shape, value * 0.5, dtype=np.float64),
+        captured_flux_fraction=1.0 - raw.frame_index * 1.0e-4,
+        captured_flux_qa_pass=True,
+        captured_flux_weight_e=float(value * 10),
         bias_level_dn=float(value),
         column_noise_dn_by_x=np.full(shape[1], value * 0.25, dtype=np.float64),
         valid_mask=np.ones(shape, dtype=bool),
@@ -103,6 +106,14 @@ def test_streamed_independent_shard_writes_raw_and_all_coadds(tmp_path) -> None:
     assert raw.final_dn.dtype == np.dtype(np.uint16)
     np.testing.assert_array_equal(raw.final_dn[:, 0, 0], [1, 2, 3, 4, 5, 6])
     np.testing.assert_allclose(raw.background_expectation_e[:, 0, 0], [0.5, 1, 1.5, 2, 2.5, 3])
+    np.testing.assert_allclose(
+        raw.captured_flux_fraction,
+        1.0 - np.arange(6) * 1.0e-4,
+    )
+    np.testing.assert_array_equal(
+        raw.captured_flux_qa_pass,
+        [True, True, True, True, True, True],
+    )
     assert raw.manifest["scene_policy"] == "independent_target"
     assert raw.manifest["time_shard"] == shard.to_manifest_dict()
     assert raw.manifest["caller_manifest"] == request.manifest
@@ -120,6 +131,15 @@ def test_streamed_independent_shard_writes_raw_and_all_coadds(tmp_path) -> None:
     assert coadd3.final_dn.dtype == np.dtype(np.uint64)
     np.testing.assert_array_equal(coadd3.final_dn[:, 0, 0], [6, 15])
     np.testing.assert_allclose(coadd3.background_expectation_e[:, 0, 0], [3.0, 7.5])
+    np.testing.assert_allclose(
+        coadd3.captured_flux_fraction,
+        [
+            np.average([1.0, 0.9999, 0.9998], weights=[10.0, 20.0, 30.0]),
+            np.average([0.9997, 0.9996, 0.9995], weights=[40.0, 50.0, 60.0]),
+        ],
+    )
+    np.testing.assert_allclose(coadd3.captured_flux_denominator_e, [60.0, 150.0])
+    np.testing.assert_array_equal(coadd3.captured_flux_qa_pass, [True, True])
     np.testing.assert_allclose(coadd3.bias_level_sum_dn, [6.0, 15.0])
     np.testing.assert_allclose(coadd3.column_noise_sum_dn_by_x[:, 0], [1.5, 3.75])
     np.testing.assert_array_equal(coadd3.fullwell_count[:, 0, 0], [1, 0])
@@ -198,6 +218,63 @@ def test_independent_shard_publishes_no_member_if_one_coadd_fails(
     assert not list(request.shard_root.parent.glob(".shard_00007.*.partial"))
 
 
+def test_independent_shard_fails_closed_when_captured_flux_qa_fails(tmp_path) -> None:
+    """A requested-window or detector truncation must publish no formal shard."""
+
+    import pytest
+
+    from et_mainsim.independent_stamp_production import (
+        IndependentStampShardRequest,
+        RawStampDeliveryFrame,
+        run_independent_stamp_time_shard,
+    )
+    from et_mainsim.time_shards import ContinuousTimeShard
+
+    request = IndependentStampShardRequest(
+        output_root=tmp_path,
+        target_source_id=42,
+        stamp_shape=(13, 13),
+        shard=ContinuousTimeShard(
+            shard_id=0,
+            raw_start_index=0,
+            raw_stop_index=3,
+            coadd_sizes=(3,),
+            raw_exposure_seconds=10.0,
+        ),
+        gain_e_per_dn=2.0,
+        manifest={"run_id": "capture-gate"},
+        provenance={"code": "test"},
+    )
+
+    def truncated_adapter(raw: _Raw) -> RawStampDeliveryFrame:
+        frame = _fake_adapter(raw)
+        if raw.frame_index != 1:
+            return frame
+        return RawStampDeliveryFrame(
+            final_dn=frame.final_dn,
+            background_expectation_e=frame.background_expectation_e,
+            captured_flux_fraction=0.999,
+            captured_flux_qa_pass=False,
+            captured_flux_weight_e=frame.captured_flux_weight_e,
+            bias_level_dn=frame.bias_level_dn,
+            column_noise_dn_by_x=frame.column_noise_dn_by_x,
+            valid_mask=frame.valid_mask,
+            fullwell_mask=frame.fullwell_mask,
+            adc_low_mask=frame.adc_low_mask,
+            adc_high_mask=frame.adc_high_mask,
+            cosmic_mask=frame.cosmic_mask,
+        )
+
+    with pytest.raises(RuntimeError, match="captured-flux QA failed.*frame 1"):
+        run_independent_stamp_time_shard(
+            request,
+            render_raw=_fake_render,
+            adapt_raw=truncated_adapter,
+        )
+
+    assert not request.shard_root.exists()
+
+
 def test_independent_shard_refuses_existing_complete_product(tmp_path) -> None:
     from et_mainsim.independent_stamp_production import (
         IndependentStampShardRequest,
@@ -256,6 +333,23 @@ def test_photsim7_adapter_maps_delivery_calibration_and_quality_planes() -> None
             array=np.fliplr(np.eye(shape[0], dtype=bool)),
         ),
         cosmic_events=SimpleNamespace(mask=np.tri(*shape, dtype=bool)),
+        psf_support_truth=SimpleNamespace(
+            to_schema=lambda: {
+                "sources": [
+                    {
+                        "source_id": 42,
+                        "effective_photon_count_electron": 1_000.0,
+                        "captured_flux_fraction": {
+                            "requested_window_valid_detector": 0.999_8,
+                        },
+                        "truncation": {
+                            "detector_edge": False,
+                            "requested_window": True,
+                        },
+                    }
+                ]
+            }
+        ),
     )
     detector_result = SimpleNamespace(
         bias_metadata=SimpleNamespace(
@@ -269,6 +363,7 @@ def test_photsim7_adapter_maps_delivery_calibration_and_quality_planes() -> None
         renderer_components={
             "background_expectation": np.full(shape, 41.5, dtype=np.float32)
         },
+        manifest_payload={"target": {"source_id": 42}},
     )
 
     delivery = raw_stamp_delivery_frame_from_photsim7(result)
@@ -288,3 +383,5 @@ def test_photsim7_adapter_maps_delivery_calibration_and_quality_planes() -> None
         products.adc_high_clipped_mask.array,
     )
     np.testing.assert_array_equal(delivery.cosmic_mask, products.cosmic_events.mask)
+    assert delivery.captured_flux_fraction == 0.999_8
+    assert delivery.captured_flux_qa_pass is False

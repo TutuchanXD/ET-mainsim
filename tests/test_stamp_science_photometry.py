@@ -453,10 +453,11 @@ def test_local_background_contract_is_explicit_frozen_and_versioned() -> None:
     )
 
     policy = StampSciencePhotometryPolicy()
+    assert policy.background_strategy == "delivered_expectation_only"
+    assert policy.local_background_enabled is False
     assert policy.local_background_policy_version == 1
     assert policy.local_background_estimator == "per_frame_median"
     assert policy.local_background_sigma_clipping == "none"
-
     with pytest.raises(
         SciencePhotometryContractError,
         match="local_background_policy_version",
@@ -488,6 +489,20 @@ def test_local_background_contract_is_explicit_frozen_and_versioned() -> None:
         "per_frame_median"
     )
     assert result.product_semantics["local_background_sigma_clipping"] == "none"
+
+
+def test_public_science_photometry_wire_schema_is_v2() -> None:
+    """Expectation-background-only products must not reuse the old v1 ID."""
+
+    from et_mainsim.stamp_science_photometry import (
+        SCIENCE_PHOTOMETRY_SCHEMA_ID,
+        SCIENCE_PHOTOMETRY_SCHEMA_VERSION,
+    )
+
+    assert SCIENCE_PHOTOMETRY_SCHEMA_ID == (
+        "et_mainsim.stamp_science_photometry.v2"
+    )
+    assert SCIENCE_PHOTOMETRY_SCHEMA_VERSION == 2
 
 
 def test_dual_background_photometry_uses_final_dn_and_records_quality(
@@ -607,6 +622,77 @@ def test_science_photometry_flags_insufficient_local_background() -> None:
     )
 
 
+def test_expectation_background_is_complete_without_a_local_background_mask() -> None:
+    """A compact stamp must reduce from its delivered background component alone."""
+
+    from et_mainsim.stamp_science_photometry import (
+        ScienceQualityFlag,
+        reduce_science_photometry_v1,
+    )
+
+    frames = np.zeros((2, 27, 27), dtype=float)
+    frames[:, 13, 13] = [100.0, 125.0]
+    aperture = np.zeros((27, 27), dtype=bool)
+    aperture[13, 13] = True
+
+    result = reduce_science_photometry_v1(
+        _delivery_from_calibrated_bgsub(
+            frames,
+            background_expectation_e=37.0,
+        ),
+        aperture_mask=aperture,
+    )
+
+    np.testing.assert_allclose(result.flux_expectation_bgsub_e, [100.0, 125.0])
+    np.testing.assert_array_equal(result.aperture_valid, [True, True])
+    assert not np.any(
+        result.quality_bitmask & int(ScienceQualityFlag.INSUFFICIENT_BACKGROUND)
+    )
+    assert not np.any(result.background_mask)
+    assert result.product_semantics["default_background_product"] == (
+        "background_expectation_e"
+    )
+    assert result.product_semantics["local_background_enabled"] is False
+
+
+def test_default_optimal_aperture_training_supports_a_27_by_27_stamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The formal default must not reserve 1,024 pixels for local background."""
+
+    import photsim7.aperture as legacy_aperture
+
+    def choose_peak(signal, noise, plot=False):
+        import torch
+
+        mask = torch.zeros_like(signal, dtype=torch.bool)
+        mask[13, 13] = True
+        return mask, 20.0
+
+    monkeypatch.setattr(legacy_aperture, "maximize_cumulative_snr", choose_peak)
+    from et_mainsim.stamp_science_photometry import (
+        StampSciencePhotometryPolicy,
+        train_science_optimal_aperture_v1,
+    )
+
+    signal = np.zeros((4, 27, 27), dtype=float)
+    signal[:, 13, 13] = 100.0
+    trained = train_science_optimal_aperture_v1(
+        _delivery_from_calibrated_bgsub(signal),
+        raw_relative_flux=np.ones(4),
+        training_raw_frame_indices=np.arange(4),
+        read_noise_e_per_pixel=5.0,
+        quantization_noise_e_per_pixel=0.0,
+        policy=StampSciencePhotometryPolicy(),
+    )
+
+    assert trained.aperture_mask.shape == (27, 27)
+    assert trained.background_mask is None
+    assert trained.metadata["background_strategy"] == (
+        "delivered_expectation_only"
+    )
+
+
 def test_train_aperture_recovers_baseline_template_with_varying_q(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -644,6 +730,7 @@ def test_train_aperture_recovers_baseline_template_with_varying_q(
         read_noise_e_per_pixel=3.0,
         quantization_noise_e_per_pixel=0.5,
         policy=StampSciencePhotometryPolicy(
+            background_strategy="delivered_expectation_plus_local_diagnostic",
             background_guard_pixels=1,
             background_border_pixels=1,
             minimum_background_pixels=2,
@@ -698,6 +785,7 @@ def test_train_aperture_excludes_bad_samples_per_pixel(
         read_noise_e_per_pixel=1.0,
         quantization_noise_e_per_pixel=0.0,
         policy=StampSciencePhotometryPolicy(
+            background_strategy="delivered_expectation_plus_local_diagnostic",
             background_guard_pixels=1,
             background_border_pixels=1,
             minimum_background_pixels=2,

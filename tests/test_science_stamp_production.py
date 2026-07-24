@@ -377,7 +377,7 @@ def test_science_production_config_freezes_90_day_matrix(tmp_path) -> None:
     assert config.raw_exposure_seconds == 10.0
     assert config.cadence_seconds == (30.0, 60.0, 120.0, 300.0)
     assert config.coadd_sizes == (3, 6, 12, 30)
-    assert config.stamp_shape == (100, 300)
+    assert config.stamp_shape == (27, 27)
     assert config.delivery_execution_mode == "staged_local_scratch_v1"
 
 
@@ -464,7 +464,10 @@ def test_prepare_science_production_publishes_generic_reference_field_manifest(
     assert manifest["input"]["time_alignment"] == "simulation_raw_frame_index"
     assert manifest["input"]["native_absolute_time_used"] is False
     assert manifest["delivery"]["execution_mode"] == "staged_local_scratch_v1"
-    assert manifest["delivery"]["stamp_shape"] == [100, 300]
+    assert manifest["delivery"]["stamp_shape"] == [27, 27]
+    assert manifest["delivery"]["stamp_centering_policy"] == (
+        "nearest_integer_np_rint"
+    )
     assert set(manifest["delivery"]["time_plan_identity"]) == {
         "sha256",
         "size_bytes",
@@ -472,6 +475,21 @@ def test_prepare_science_production_publishes_generic_reference_field_manifest(
     assert manifest["simulation_spec_base"]["dynamic_effects"]["dva"][
         "enabled"
     ] is False
+    response = manifest["simulation_spec_base"]["detector_response"]
+    assert response["enable_inter_pixel_response"] is True
+    assert response["inter_prv_rms"] == {"value": 1.0, "unit": "%"}
+    assert response["enable_intra_pixel_response"] is True
+    assert response["intra_prv_rms"] == {"value": 1.0, "unit": "%"}
+    assert response["enable_pixel_phase_response"] is True
+    readout = manifest["simulation_spec_base"]["readout"]
+    assert readout["readout_noise"] == {
+        "value": 5.0,
+        "unit": "electron / pix",
+    }
+    assert readout["column_noise_sigma_adu"] == {
+        "value": 0.0,
+        "unit": "adu",
+    }
     assert len(manifest["targets"]) == 1
     target = manifest["targets"][0]
     assert target["source_id_int64"] == 3_331_147
@@ -511,7 +529,7 @@ def test_prepare_science_production_publishes_generic_reference_field_manifest(
 
 @pytest.mark.parametrize(
     ("xpix", "ypix"),
-    [(149.0, 4_500.0), (8_750.0, 4_500.0), (2_000.0, 49.0), (2_000.0, 9_070.0)],
+    [(12.0, 4_500.0), (8_887.0, 4_500.0), (2_000.0, 12.0), (2_000.0, 9_107.0)],
 )
 def test_prepare_rejects_a_reference_position_whose_full_stamp_crosses_detector(
     tmp_path,
@@ -558,7 +576,7 @@ def test_prepare_rejects_a_reference_position_whose_full_stamp_crosses_detector(
         device="cpu",
     )
 
-    with pytest.raises(ValueError, match="full 100x300 stamp"):
+    with pytest.raises(ValueError, match="full 27x27 stamp"):
         prepare_science_independent_production(config)
     assert not config.run_root.exists()
 
@@ -831,6 +849,9 @@ def test_science_worker_keeps_static_injected_rng_pairing_and_generic_provenance
     )
 
     assert render_calls[0]["source_variability"] is None
+    assert requests[0].manifest["stamp_centering_policy"] == (
+        "nearest_integer_np_rint"
+    )
     np.testing.assert_array_equal(
         render_calls[1]["source_variability"].relative_flux,
         np.ones((1, 3)),

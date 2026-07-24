@@ -23,6 +23,7 @@ def _science_policy(*, require_direct_coadd_parity: bool = True):
         direct_coadd_samples_per_shard=1,
         require_direct_coadd_parity=require_direct_coadd_parity,
         photometry=StampSciencePhotometryPolicy(
+            background_strategy="delivered_expectation_plus_local_diagnostic",
             cdpp_windows_minutes=(1,),
             minimum_coverage_fraction=1.0,
             minimum_accepted_bins=2,
@@ -69,6 +70,9 @@ def _raw_planes(
     return {
         "final_dn": final,
         "background_expectation_e": background,
+        "captured_flux_fraction": np.ones(n_frames),
+        "captured_flux_denominator_e": q * 1_000.0,
+        "captured_flux_qa_pass": np.ones(n_frames, dtype=bool),
         "bias_level_sum_dn": bias,
         "column_noise_sum_dn_by_x": column,
         "valid_mask": np.ones((n_frames, ny, nx), dtype=bool),
@@ -102,6 +106,13 @@ def _coadd_planes(raw: dict[str, np.ndarray], *, factor: int):
     return {
         "final_dn": grouped_sum("final_dn").astype(np.uint64),
         "background_expectation_e": grouped_sum("background_expectation_e"),
+        "captured_flux_fraction": np.ones(n),
+        "captured_flux_denominator_e": grouped_sum(
+            "captured_flux_denominator_e"
+        ),
+        "captured_flux_qa_pass": np.all(
+            raw["captured_flux_qa_pass"].reshape(n, factor), axis=1
+        ),
         "bias_level_sum_dn": grouped_sum("bias_level_sum_dn"),
         "column_noise_sum_dn_by_x": grouped_sum("column_noise_sum_dn_by_x"),
         "valid_mask": np.all(
@@ -153,6 +164,9 @@ def _write_bundle(
         coadd_factor=factor,
         final_dn=planes["final_dn"],
         background_expectation_e=planes["background_expectation_e"],
+        captured_flux_fraction=planes["captured_flux_fraction"],
+        captured_flux_denominator_e=planes["captured_flux_denominator_e"],
+        captured_flux_qa_pass=planes["captured_flux_qa_pass"],
         bias_level_sum_dn=planes["bias_level_sum_dn"],
         column_noise_sum_dn_by_x=planes["column_noise_sum_dn_by_x"],
         valid_mask=planes["valid_mask"],
@@ -575,7 +589,7 @@ def test_identity_bound_request_cli_loads_injected_q_for_new_and_galaxy_manifest
     output = tmp_path / "cli-output"
     payload = {
         "schema_id": backend.STAMP_SCIENCE_ANALYSIS_REQUEST_SCHEMA_ID,
-        "schema_version": 1,
+        "schema_version": backend.STAMP_SCIENCE_ANALYSIS_REQUEST_SCHEMA_VERSION,
         "production_manifest": backend._cli_file_binding(production_manifest),
         "source_id": "fixture-1",
         "case": "injected",
@@ -640,7 +654,7 @@ def test_request_cli_rejects_bound_production_manifest_identity_drift(
     np.savez(snapshot, source_id=np.asarray("fixture-1"), factors=q)
     payload = {
         "schema_id": backend.STAMP_SCIENCE_ANALYSIS_REQUEST_SCHEMA_ID,
-        "schema_version": 1,
+        "schema_version": backend.STAMP_SCIENCE_ANALYSIS_REQUEST_SCHEMA_VERSION,
         "formal_profile_id": backend.STAMP_SCIENCE_FORMAL_PROFILE_ID,
         "production_manifest": binding,
         "source_identity": {
@@ -723,7 +737,7 @@ def test_static_cli_loads_unity_q_and_reuses_paired_injected_publication(
     )
     payload = {
         "schema_id": backend.STAMP_SCIENCE_ANALYSIS_REQUEST_SCHEMA_ID,
-        "schema_version": 1,
+        "schema_version": backend.STAMP_SCIENCE_ANALYSIS_REQUEST_SCHEMA_VERSION,
         "production_manifest": backend._cli_file_binding(production_manifest),
         "source_id": "fixture-1",
         "case": "static",
@@ -892,6 +906,112 @@ def test_formal_series_analysis_streams_bounded_slices_and_publishes_all_product
     )
     assert validation.complete is True
     assert validation.cadence_seconds == (10, 30)
+
+
+@pytest.mark.parametrize(
+    ("product", "frame_index"),
+    (("raw", 1), ("direct_coadd", -1)),
+)
+def test_analysis_fails_closed_before_publication_when_any_input_capture_qa_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    product: str,
+    frame_index: int,
+) -> None:
+    """A false raw or unsampled direct-coadd capture gate blocks publication."""
+
+    import photsim7.aperture as legacy_aperture
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    raw_paths, coadd_paths, q = _series_fixture(tmp_path / "inputs")
+    tampered = raw_paths[0] if product == "raw" else coadd_paths[3][0]
+    with h5py.File(tampered, "r+") as handle:
+        handle["captured_flux_qa_pass"][frame_index] = False
+
+    import et_mainsim.stamp_science_analysis as backend
+
+    output_dir = tmp_path / f"blocked-{product}"
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="captured_flux_qa_pass.*false",
+    ):
+        backend.analyze_stamp_science_series_v1(
+            _request(
+                tmp_path,
+                raw_paths=raw_paths,
+                coadd_paths=coadd_paths,
+                q=q,
+                output_name=output_dir.name,
+            )
+        )
+
+    assert not output_dir.exists()
+    assert not tuple(tmp_path.glob(f".{output_dir.name}.*.partial"))
+
+
+def test_27_by_27_expectation_only_analysis_publishes_optimal_aperture_and_capture_qa(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compact formal products must not depend on stamp-local background pixels."""
+
+    import photsim7.aperture as legacy_aperture
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    raw_paths, coadd_paths, q = _series_fixture(
+        tmp_path,
+        stamp_shape=(27, 27),
+        target_yx=(13, 13),
+    )
+    request = _request(
+        tmp_path,
+        raw_paths=raw_paths,
+        coadd_paths=coadd_paths,
+        q=q,
+        output_name="compact-analysis",
+    )
+    request = replace(
+        request,
+        policy=replace(
+            request.policy,
+            photometry=replace(
+                request.policy.photometry,
+                background_strategy="delivered_expectation_only",
+            ),
+        ),
+    )
+
+    import et_mainsim.stamp_science_analysis as backend
+
+    publication = backend.analyze_stamp_science_series_v1(request)
+    manifest = json.loads(publication.manifest_path.read_text(encoding="utf-8"))
+
+    assert manifest["contract"]["default_background_product"] == (
+        "background_expectation_e"
+    )
+    assert manifest["contract"]["background_products"] == [
+        "expectation_background_subtracted"
+    ]
+    assert manifest["contract"]["captured_flux_qa"]["cadences"]["10s"] == {
+        "all_pass": True,
+        "minimum_fraction": 1.0,
+    }
+    assert not np.any(np.load(publication.background_mask_path, allow_pickle=False))
+    with h5py.File(publication.hdf5_path, "r") as handle:
+        raw = handle["cadences/10s"]
+        assert raw["captured_flux_fraction"].shape == (12,)
+        np.testing.assert_allclose(raw["captured_flux_fraction"], 1.0)
+        np.testing.assert_array_equal(raw["captured_flux_qa_pass"], True)
+        assert np.all(np.isnan(raw["flux_local_bgsub_e"]))
+        assert np.all(np.isfinite(raw["flux_expectation_bgsub_e"]))
 
 
 def test_input_hdf_byte_identity_prefers_a_complete_staged_receipt(
@@ -1184,6 +1304,95 @@ def test_published_analysis_validator_rejects_a_tampered_portable_artifact(
     with pytest.raises(
         backend.StampScienceAnalysisContractError,
         match="artifact hash/readback mismatch",
+    ):
+        backend.validate_stamp_science_analysis_v1(publication.output_dir)
+
+
+def test_published_analysis_readback_rejects_false_captured_flux_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even a re-hashed HDF5 cannot publish a cadence that failed capture QA."""
+
+    import photsim7.aperture as legacy_aperture
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    raw_paths, coadd_paths, q = _series_fixture(tmp_path)
+    import et_mainsim.stamp_science_analysis as backend
+
+    publication = backend.analyze_stamp_science_series_v1(
+        _request(
+            tmp_path,
+            raw_paths=raw_paths,
+            coadd_paths=coadd_paths,
+            q=q,
+        )
+    )
+    with h5py.File(publication.hdf5_path, "r+") as handle:
+        handle["cadences/10s/captured_flux_qa_pass"][0] = False
+
+    manifest = json.loads(publication.manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["photometry.h5"] = backend._file_identity(
+        publication.hdf5_path
+    )
+    publication.manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="authoritative HDF5 cadence 10s capture QA did not pass",
+    ):
+        backend.validate_stamp_science_analysis_v1(publication.output_dir)
+
+
+def test_published_analysis_readback_rejects_legacy_photometry_table_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-hashed v1 portable table cannot masquerade as the v2 layout."""
+
+    import photsim7.aperture as legacy_aperture
+    from astropy.table import Table
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    raw_paths, coadd_paths, q = _series_fixture(tmp_path)
+    import et_mainsim.stamp_science_analysis as backend
+
+    publication = backend.analyze_stamp_science_series_v1(
+        _request(
+            tmp_path,
+            raw_paths=raw_paths,
+            coadd_paths=coadd_paths,
+            q=q,
+        )
+    )
+    table = Table.read(publication.ecsv_path, format="ascii.ecsv")
+    table.meta["schema_id"] = "et_mainsim.stamp_science_photometry_table.v1"
+    table.meta["schema_version"] = 1
+    table.write(publication.ecsv_path, format="ascii.ecsv", overwrite=True)
+
+    manifest = json.loads(publication.manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["photometry.ecsv"] = backend._file_identity(
+        publication.ecsv_path
+    )
+    publication.manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="portable photometry ECSV v2 schema is invalid",
     ):
         backend.validate_stamp_science_analysis_v1(publication.output_dir)
 
@@ -1586,8 +1795,14 @@ def test_formal_request_writer_derives_noise_and_freezes_ready_profile(
         output_dir=tmp_path / "analysis",
     )
     request = backend.load_stamp_science_analysis_request_v1(request_path)
+    request_payload = json.loads(request_path.read_text(encoding="utf-8"))
 
     assert result == request_path.resolve()
+    assert request_payload["schema_id"] == (
+        "et_mainsim.stamp_science_analysis_request.v2"
+    )
+    assert request_payload["schema_version"] == 2
+    assert request_payload["formal_profile_id"] == "et_stamp_science_formal_10s_v2"
     assert request.read_noise_e_per_pixel == pytest.approx(6.0)
     assert request.quantization_noise_e_per_pixel == pytest.approx(
         1.4 / np.sqrt(12.0)
@@ -1609,6 +1824,17 @@ def test_formal_request_writer_derives_noise_and_freezes_ready_profile(
     )
     assert request.code_identity == automatic_code_identity
     assert backend.validate_stamp_science_analysis_request_ready_v1(request) is request
+
+    stale_request = tmp_path / "stale-v1-request.json"
+    stale_payload = dict(request_payload)
+    stale_payload["schema_id"] = "et_mainsim.stamp_science_analysis_request.v1"
+    stale_payload["schema_version"] = 1
+    stale_request.write_text(json.dumps(stale_payload), encoding="utf-8")
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="unsupported analysis request schema/version",
+    ):
+        backend.load_stamp_science_analysis_request_v1(stale_request)
 
     explicit_context = dict(request.analysis_context)
     explicit_context["input_discovery"] = {
@@ -1953,8 +2179,9 @@ def test_product_set_contract_has_rates_tables_figures_and_product_specific_clea
         publication.manifest_path.read_text(encoding="utf-8")
     )
     assert product_set_manifest["schema_id"] == (
-        "et_mainsim.stamp_science_analysis_product_set.v1"
+        "et_mainsim.stamp_science_analysis_product_set.v2"
     )
+    assert product_set_manifest["schema_version"] == 2
     assert product_set_manifest["complete"] is True
     assert product_set_manifest["ready"] is True
     assert set(product_set_manifest["products"]) == {
@@ -1974,8 +2201,11 @@ def test_product_set_contract_has_rates_tables_figures_and_product_specific_clea
         "flux_expectation_bgsub_e",
         "flux_expectation_bgsub_e_per_s",
         "aperture_valid",
-        "quality_bitmask",
-        "fitted_flux_expectation_e",
+            "quality_bitmask",
+            "captured_flux_fraction",
+            "captured_flux_denominator_e",
+            "captured_flux_qa_pass",
+            "fitted_flux_expectation_e",
         "fitted_flux_expectation_e_per_s",
         "residual_expectation_e",
         "residual_expectation_ppm",
@@ -1986,6 +2216,17 @@ def test_product_set_contract_has_rates_tables_figures_and_product_specific_clea
     ):
         manifest = json.loads(product.manifest_path.read_text(encoding="utf-8"))
         assert manifest["ready"] is True
+        assert manifest["schema_id"] == (
+            "et_mainsim.stamp_science_analysis_publication.v2"
+        )
+        assert manifest["schema_version"] == 2
+        assert manifest["contract"]["schema_id"] == (
+            "et_mainsim.stamp_science_analysis.v2"
+        )
+        assert manifest["contract"]["schema_version"] == 2
+        assert manifest["contract"]["science_photometry_schema_id"] == (
+            "et_mainsim.stamp_science_photometry.v2"
+        )
         assert manifest["contract"]["request_code_identity"] == {
             "git_commit": "unit-test"
         }
@@ -1994,7 +2235,8 @@ def test_product_set_contract_has_rates_tables_figures_and_product_specific_clea
         }
         assert manifest["contract"]["reference_lightcurve"] == {
             "artifact": "reference_lightcurve.ecsv",
-            "schema_id": "et_mainsim.stamp_science_reference_lightcurve.v1",
+            "schema_id": "et_mainsim.stamp_science_reference_lightcurve.v2",
+            "schema_version": 2,
             "measured_flux_column": "flux_expectation_bgsub_e",
             "measured_rate_column": "flux_expectation_bgsub_e_per_s",
             "validity_column": "aperture_valid",
@@ -2022,8 +2264,9 @@ def test_product_set_contract_has_rates_tables_figures_and_product_specific_clea
             format="ascii.ecsv",
         )
         assert reference.meta["schema_id"] == (
-            "et_mainsim.stamp_science_reference_lightcurve.v1"
+            "et_mainsim.stamp_science_reference_lightcurve.v2"
         )
+        assert reference.meta["schema_version"] == 2
         assert reference_columns <= set(reference.colnames)
         cadence_10s = np.asarray(reference["cadence_seconds"]) == 10
         with h5py.File(product.hdf5_path, "r") as handle:

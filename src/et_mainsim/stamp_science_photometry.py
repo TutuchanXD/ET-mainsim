@@ -21,11 +21,19 @@ from numpy.typing import ArrayLike, NDArray
 from .reference_photometry import ReferencePhotometryInput
 
 
-SCIENCE_PHOTOMETRY_SCHEMA_ID = "et_mainsim.stamp_science_photometry.v1"
-SCIENCE_PHOTOMETRY_SCHEMA_VERSION = 1
+SCIENCE_PHOTOMETRY_SCHEMA_ID = "et_mainsim.stamp_science_photometry.v2"
+SCIENCE_PHOTOMETRY_SCHEMA_VERSION = 2
 _LOCAL_BACKGROUND_POLICY_VERSION = 1
 _LOCAL_BACKGROUND_ESTIMATOR = "per_frame_median"
 _LOCAL_BACKGROUND_SIGMA_CLIPPING = "none"
+_EXPECTATION_BACKGROUND_STRATEGY = "delivered_expectation_only"
+_LOCAL_DIAGNOSTIC_BACKGROUND_STRATEGY = (
+    "delivered_expectation_plus_local_diagnostic"
+)
+_BACKGROUND_STRATEGIES = {
+    _EXPECTATION_BACKGROUND_STRATEGY,
+    _LOCAL_DIAGNOSTIC_BACKGROUND_STRATEGY,
+}
 
 
 class SciencePhotometryContractError(ValueError):
@@ -54,6 +62,7 @@ class StampSciencePhotometryPolicy:
     training_blocks_per_shard: int = 4
     training_block_frames: int = 64
     minimum_training_valid_fraction: float = 0.8
+    background_strategy: str = _EXPECTATION_BACKGROUND_STRATEGY
     background_guard_pixels: int = 8
     background_border_pixels: int = 1
     minimum_background_pixels: int = 1_024
@@ -94,6 +103,11 @@ class StampSciencePhotometryPolicy:
         object.__setattr__(self, "minimum_coverage_fraction", coverage)
         object.__setattr__(self, "minimum_training_valid_fraction", training_fraction)
         object.__setattr__(self, "bin_origin_seconds", origin)
+        if self.background_strategy not in _BACKGROUND_STRATEGIES:
+            raise SciencePhotometryContractError(
+                "background_strategy must be delivered_expectation_only or "
+                "delivered_expectation_plus_local_diagnostic"
+            )
         for name in (
             "minimum_accepted_bins",
             "training_blocks_per_shard",
@@ -135,6 +149,12 @@ class StampSciencePhotometryPolicy:
             "local_background_policy_version",
             background_policy_version,
         )
+
+    @property
+    def local_background_enabled(self) -> bool:
+        """Return whether the replaceable stamp-local diagnostic was requested."""
+
+        return self.background_strategy == _LOCAL_DIAGNOSTIC_BACKGROUND_STRATEGY
 
 
 @dataclass(frozen=True)
@@ -903,17 +923,20 @@ def train_science_optimal_aperture_v1(
         noise_template_e=noise,
         permanent_valid_mask=permanent_valid,
     )
-    background_mask = build_local_background_mask_v1(
-        selection.aperture_mask,
-        exclusion_radius_pixels=resolved_policy.background_guard_pixels,
-        border_pixels=resolved_policy.background_border_pixels,
-        permanent_valid_mask=permanent_valid,
-    )
-    background_pixel_count = int(np.count_nonzero(background_mask))
-    if background_pixel_count < resolved_policy.minimum_background_pixels:
-        raise SciencePhotometryContractError(
-            "trained background mask has fewer pixels than minimum_background_pixels"
+    background_mask: NDArray[np.bool_] | None = None
+    background_pixel_count = 0
+    if resolved_policy.local_background_enabled:
+        background_mask = build_local_background_mask_v1(
+            selection.aperture_mask,
+            exclusion_radius_pixels=resolved_policy.background_guard_pixels,
+            border_pixels=resolved_policy.background_border_pixels,
+            permanent_valid_mask=permanent_valid,
         )
+        background_pixel_count = int(np.count_nonzero(background_mask))
+        if background_pixel_count < resolved_policy.minimum_background_pixels:
+            raise SciencePhotometryContractError(
+                "trained background mask has fewer pixels than minimum_background_pixels"
+            )
     peak_flat = int(np.argmax(np.where(permanent_valid, signal, -np.inf)))
     peak_yx = tuple(
         int(value) for value in np.unravel_index(peak_flat, signal.shape)
@@ -930,6 +953,8 @@ def train_science_optimal_aperture_v1(
         training_raw_frame_indices=training_indices,
         metadata={
             "template_fit": "through_origin_q_weighted_v1",
+            "background_strategy": resolved_policy.background_strategy,
+            "local_background_enabled": resolved_policy.local_background_enabled,
             "minimum_training_valid_fraction": (
                 resolved_policy.minimum_training_valid_fraction
             ),
@@ -1149,7 +1174,7 @@ def reduce_science_photometry_v1(
     delivery: ReferencePhotometryInput,
     *,
     aperture_mask: ArrayLike,
-    background_mask: ArrayLike,
+    background_mask: ArrayLike | None = None,
     minimum_background_pixels: int = 32,
     centroid_support_radius_pixels: int = 1,
 ) -> SciencePhotometryResult:
@@ -1163,23 +1188,28 @@ def reduce_science_photometry_v1(
         name="aperture_mask",
         shape=(ny, nx),
     )
-    background = _bool_2d(
-        background_mask,
-        name="background_mask",
-        shape=(ny, nx),
-    )
-    if np.any(aperture & background):
-        raise SciencePhotometryContractError(
-            "aperture_mask and background_mask must not overlap"
+    local_background_enabled = background_mask is not None
+    if local_background_enabled:
+        background = _bool_2d(
+            background_mask,
+            name="background_mask",
+            shape=(ny, nx),
         )
-    minimum_background = _positive_integer(
-        minimum_background_pixels,
-        name="minimum_background_pixels",
-    )
-    if minimum_background > int(np.count_nonzero(background)):
-        raise SciencePhotometryContractError(
-            "minimum_background_pixels exceeds the frozen background mask"
+        if np.any(aperture & background):
+            raise SciencePhotometryContractError(
+                "aperture_mask and background_mask must not overlap"
+            )
+        minimum_background = _positive_integer(
+            minimum_background_pixels,
+            name="minimum_background_pixels",
         )
+        if minimum_background > int(np.count_nonzero(background)):
+            raise SciencePhotometryContractError(
+                "minimum_background_pixels exceeds the frozen background mask"
+            )
+    else:
+        background = np.zeros((ny, nx), dtype=bool)
+        minimum_background = 0
     centroid_radius = _nonnegative_integer(
         centroid_support_radius_pixels,
         name="centroid_support_radius_pixels",
@@ -1220,18 +1250,20 @@ def reduce_science_photometry_v1(
         )
 
     background_usable = usable[:, background]
-    background_counts = np.count_nonzero(
-        background_usable,
-        axis=1,
-    ).astype(np.int64, copy=False)
+    background_counts = np.zeros(n_frames, dtype=np.int64)
     local_background = np.full(n_frames, np.nan, dtype=np.float64)
-    for frame_index in range(n_frames):
-        if background_counts[frame_index] < minimum_background:
-            continue
-        values = calibrated_bgsub[frame_index, background][
-            background_usable[frame_index]
-        ]
-        local_background[frame_index] = float(np.median(values))
+    if local_background_enabled:
+        background_counts = np.count_nonzero(
+            background_usable,
+            axis=1,
+        ).astype(np.int64, copy=False)
+        for frame_index in range(n_frames):
+            if background_counts[frame_index] < minimum_background:
+                continue
+            values = calibrated_bgsub[frame_index, background][
+                background_usable[frame_index]
+            ]
+            local_background[frame_index] = float(np.median(values))
 
     local_flux = np.full(n_frames, np.nan, dtype=np.float64)
     local_valid = aperture_valid & np.isfinite(local_background)
@@ -1246,17 +1278,21 @@ def reduce_science_photometry_v1(
         ScienceQualityFlag.APERTURE_SATURATED
     )
     quality[cosmic_counts > 0] |= int(ScienceQualityFlag.APERTURE_COSMIC)
-    quality[~np.isfinite(local_background)] |= int(
-        ScienceQualityFlag.INSUFFICIENT_BACKGROUND
-    )
+    if local_background_enabled:
+        quality[~np.isfinite(local_background)] |= int(
+            ScienceQualityFlag.INSUFFICIENT_BACKGROUND
+        )
 
     centroid_support = _dilate_mask(aperture, radius=centroid_radius)
     centroid_frames = np.zeros_like(calibrated_bgsub)
     finite_local = np.isfinite(local_background)
-    centroid_frames[finite_local] = (
-        calibrated_bgsub[finite_local]
-        - local_background[finite_local, None, None]
-    )
+    if local_background_enabled:
+        centroid_frames[finite_local] = (
+            calibrated_bgsub[finite_local]
+            - local_background[finite_local, None, None]
+        )
+    else:
+        centroid_frames[:] = calibrated_bgsub
     centroid_frames[~usable | ~centroid_support[None, :, :]] = 0.0
     np.maximum(centroid_frames, 0.0, out=centroid_frames)
     centroid_totals = np.sum(centroid_frames, axis=(1, 2), dtype=np.float64)
@@ -1310,6 +1346,13 @@ def reduce_science_photometry_v1(
             "observation_product": "final_dn",
             "calibrated_electron_product": "derived",
             "expectation_background_product": "background_expectation_e",
+            "default_background_product": "background_expectation_e",
+            "background_strategy": (
+                _LOCAL_DIAGNOSTIC_BACKGROUND_STRATEGY
+                if local_background_enabled
+                else _EXPECTATION_BACKGROUND_STRATEGY
+            ),
+            "local_background_enabled": local_background_enabled,
             "local_background_role": "replaceable_diagnostic_estimator",
             "local_background_policy_version": _LOCAL_BACKGROUND_POLICY_VERSION,
             "local_background_estimator": _LOCAL_BACKGROUND_ESTIMATOR,

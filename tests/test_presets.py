@@ -130,6 +130,14 @@ def test_shipped_full_frame_presets_are_typed_and_complete() -> None:
     smoke = load_preset("et-full-frame-smoke")
     production = load_preset("et-full-frame-production")
 
+    for loaded in (smoke, production):
+        assert loaded.simulation_spec.readout.readout_noise.to_value(
+            "electron / pix"
+        ) == pytest.approx(5.0)
+        assert loaded.simulation_spec.readout.column_noise_sigma_adu.to_value(
+            "adu"
+        ) == pytest.approx(0.0)
+
     assert smoke.simulation_spec.detector.shape == (64, 64)
     assert smoke.simulation_spec.observation.resolved_n_frames == 1
     assert smoke.simulation_spec.psf.field_id == 0
