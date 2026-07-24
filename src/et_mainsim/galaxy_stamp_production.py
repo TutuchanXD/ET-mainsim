@@ -64,7 +64,19 @@ DEFAULT_RAW_EXPOSURE_SECONDS = 10.0
 DEFAULT_DURATION_DAYS = 90.0
 DEFAULT_CADENCE_SECONDS = (30.0, 60.0, 120.0, 300.0)
 DEFAULT_MAX_RAW_FRAMES_PER_SHARD = 8_640  # one day at 10 s
-DEFAULT_STAMP_SHAPE = (100, 300)
+DEFAULT_STAMP_SHAPE = (27, 27)
+FORMAL_STAMP_CENTERING_POLICY = "nearest_integer_np_rint"
+FORMAL_INTER_PRV_RMS_PERCENT = 1.0
+FORMAL_INTRA_PRV_RMS_PERCENT = 1.0
+FORMAL_READOUT_NOISE_E_PER_PIXEL = 5.0
+FORMAL_COLUMN_NOISE_SIGMA_ADU = 0.0
+FORMAL_PIXEL_PHASE_PROFILE_PATH = (
+    "detector/pixel_response_profile_teff5500_feh-0.1_logg4.4_"
+    "pfc_v240423.npy"
+)
+FORMAL_PIXEL_PHASE_PROFILE_SHA256 = (
+    "6d3339298b9876a1e8e1afd36f606dc4d31fd5eab5054710d4de81c6d3f271bd"
+)
 
 ProductionCase = Literal["static", "injected"]
 DeliveryExecutionMode = Literal[
@@ -516,6 +528,8 @@ class GalaxyStampProductionConfig:
             raise ValueError("stamp_shape must contain two positive integers") from error
         if ny <= 0 or nx <= 0:
             raise ValueError("stamp_shape must contain two positive integers")
+        if (ny, nx) != DEFAULT_STAMP_SHAPE:
+            raise ValueError("formal Galaxy production freezes stamp_shape at 27x27")
         device = str(self.device).strip().lower()
         if device not in {"cpu", "cuda"}:
             raise ValueError("device must be 'cpu' or 'cuda'")
@@ -584,8 +598,8 @@ def build_galaxy_independent_production_spec(
     """Create the approved independent-stamp scientific configuration.
 
     The preset supplies the ET physical defaults and temperature-driven legacy
-    breathing.  This function freezes the SD-20 fail-closed detector-response
-    policy, the 10-s global time axis, and the SD-24 expectation companion.
+    breathing.  This function freezes the approved detector-response policy,
+    the 10-s global time axis, and the SD-24 expectation companion.
     """
 
     if isinstance(n_raw_frames, (bool, np.bool_)) or int(n_raw_frames) <= 0:
@@ -605,13 +619,28 @@ def build_galaxy_independent_production_spec(
     base = load_preset("et-stamp-production").simulation_spec
     response = replace(
         base.detector_response,
-        enable_inter_pixel_response=False,
-        enable_intra_pixel_response=False,
-        enable_pixel_phase_response=False,
+        enable_inter_pixel_response=True,
+        inter_prv_rms=FORMAL_INTER_PRV_RMS_PERCENT * u.percent,
+        inter_prv_nominal=100.0 * u.percent,
+        enable_intra_pixel_response=True,
+        intra_prv_rms=FORMAL_INTRA_PRV_RMS_PERCENT * u.percent,
+        enable_pixel_phase_response=True,
+        pixel_response_profile_mod="flux conserved",
+        pixel_phase_profile_path=FORMAL_PIXEL_PHASE_PROFILE_PATH,
         scripted_sensitivity_enabled=False,
         whole_pixel_gain_normal_enabled=False,
         whole_pixel_gain_sinusoidal_enabled=False,
         enable_flat_field_correction=False,
+    )
+    readout = replace(
+        base.readout,
+        readout_noise=(
+            FORMAL_READOUT_NOISE_E_PER_PIXEL * base.readout.readout_noise.unit
+        ),
+        column_noise_sigma_adu=(
+            FORMAL_COLUMN_NOISE_SIGMA_ADU
+            * base.readout.column_noise_sigma_adu.unit
+        ),
     )
     return replace(
         base,
@@ -624,6 +653,7 @@ def build_galaxy_independent_production_spec(
             frame_start_s=None,
         ),
         detector_response=response,
+        readout=readout,
         artifacts=replace(
             base.artifacts,
             background_output_policy=BackgroundOutputPolicy.EXPECTATION,
@@ -704,7 +734,7 @@ def _target_table_filename(detector_id: str) -> str:
 def prepare_galaxy_independent_production(
     config: GalaxyStampProductionConfig,
 ) -> GalaxyStampProductionPreparation:
-    """Freeze 90-day-ready Galaxy inputs and globally aligned shard plan.
+    """Freeze long-duration Galaxy inputs and a globally aligned shard plan.
 
     This performs no image rendering.  It deliberately writes the factor
     snapshots inside the output run root, so the formal worker never needs to
@@ -866,6 +896,7 @@ def prepare_galaxy_independent_production(
         "delivery": {
             "execution_mode": config.delivery_execution_mode,
             "stamp_shape": list(config.stamp_shape),
+            "stamp_centering_policy": FORMAL_STAMP_CENTERING_POLICY,
             "raw_exposure_seconds": config.raw_exposure_seconds,
             "cadence_seconds": list(config.cadence_seconds),
             "coadd_sizes": list(config.coadd_sizes),
@@ -1276,12 +1307,11 @@ def run_galaxy_independent_target(
             manifest={
                 "run_id": str(manifest["run_id"]),
                 "case": case,
+                "stamp_centering_policy": FORMAL_STAMP_CENTERING_POLICY,
                 "rng_trace_scope": dict(rng_trace_scope),
                 "physical_rng_pairing": dict(physical_rng_pairing),
-                "galaxy_production_manifest": str(resolved_manifest_path),
-                "galaxy_production_manifest_identity": dict(
-                    production_manifest_identity
-                ),
+                "production_manifest": str(resolved_manifest_path),
+                "production_manifest_identity": dict(production_manifest_identity),
                 "target_input_truth": source_truth,
                 "simulation_spec_sha256": target_spec_sha256,
                 "renderer_options": renderer_options,
@@ -1330,6 +1360,13 @@ __all__ = [
     "DEFAULT_MAX_RAW_FRAMES_PER_SHARD",
     "DEFAULT_RAW_EXPOSURE_SECONDS",
     "DEFAULT_STAMP_SHAPE",
+    "FORMAL_COLUMN_NOISE_SIGMA_ADU",
+    "FORMAL_INTER_PRV_RMS_PERCENT",
+    "FORMAL_INTRA_PRV_RMS_PERCENT",
+    "FORMAL_PIXEL_PHASE_PROFILE_PATH",
+    "FORMAL_PIXEL_PHASE_PROFILE_SHA256",
+    "FORMAL_READOUT_NOISE_E_PER_PIXEL",
+    "FORMAL_STAMP_CENTERING_POLICY",
     "GALAXY_STAMP_PRODUCTION_SCHEMA_ID",
     "GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION",
     "GalaxyStampProductionConfig",

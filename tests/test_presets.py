@@ -71,6 +71,18 @@ def test_project_requires_semantic_registry_identity_release() -> None:
     assert "et-coord>=0.1.1,<0.2" in payload["project"]["dependencies"]
 
 
+def test_project_declares_matplotlib_for_formal_analysis_figures() -> None:
+    payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "matplotlib>=3.10,<4" in payload["project"]["dependencies"]
+
+
+def test_project_declares_torch_for_formal_analysis_apertures() -> None:
+    payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "torch>=2.7,<3" in payload["project"]["dependencies"]
+
+
 def test_required_photsim7_runtime_capabilities_are_importable() -> None:
     from et_mainsim.workflows.full_frame import _science_api
 
@@ -117,6 +129,14 @@ def test_shipped_full_frame_presets_are_typed_and_complete() -> None:
 
     smoke = load_preset("et-full-frame-smoke")
     production = load_preset("et-full-frame-production")
+
+    for loaded in (smoke, production):
+        assert loaded.simulation_spec.readout.readout_noise.to_value(
+            "electron / pix"
+        ) == pytest.approx(5.0)
+        assert loaded.simulation_spec.readout.column_noise_sigma_adu.to_value(
+            "adu"
+        ) == pytest.approx(0.0)
 
     assert smoke.simulation_spec.detector.shape == (64, 64)
     assert smoke.simulation_spec.observation.resolved_n_frames == 1

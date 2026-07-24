@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
@@ -38,6 +39,11 @@ from .stamp_delivery import (
     STAMP_DELIVERY_OBSERVATION_PRODUCT,
     STAMP_DELIVERY_SCHEMA_ID,
     STAMP_DELIVERY_SCHEMA_VERSION,
+)
+from .staged_stamp_delivery import (
+    STAMP_SHARD_PUBLICATION_RECEIPT_FILENAME,
+    STAMP_SHARD_PUBLICATION_RECEIPT_SCHEMA_ID,
+    STAMP_SHARD_PUBLICATION_RECEIPT_SCHEMA_VERSION,
 )
 from .time_shards import ContinuousTimeShard, ContinuousTimeShardPlan
 
@@ -136,6 +142,35 @@ def _json_object(path: Path, *, label: str) -> dict[str, Any]:
     return payload
 
 
+def _json_object_from_bytes(raw: bytes, *, label: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GalaxyCampaignDeliveryQCError(
+            f"{label} is not valid JSON"
+        ) from error
+    if not isinstance(payload, dict):
+        raise GalaxyCampaignDeliveryQCError(f"{label} must be a JSON object")
+    return payload
+
+
+def _read_manifest_snapshot(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError as error:
+        raise GalaxyCampaignDeliveryQCError(
+            f"cannot read production manifest: {path}"
+        ) from error
+
+
+def _snapshot_file_identity(path: Path, raw: bytes) -> dict[str, Any]:
+    return {
+        "path": str(path),
+        "size_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def _resolve_relative_resource(
     run_root: Path,
     relative_path: Any,
@@ -164,6 +199,57 @@ def _same_file_identity(actual: Mapping[str, Any], expected: Mapping[str, Any]) 
     return actual.get("sha256") == expected.get("sha256") and actual.get(
         "size_bytes"
     ) == expected.get("size_bytes")
+
+
+def _exact_json_value(actual: Any, expected: Any) -> bool:
+    """Compare JSON values without Python's bool/int or int/float coercions."""
+
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return set(actual) == set(expected) and all(
+            _exact_json_value(actual[key], value) for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _exact_json_value(actual_value, expected_value)
+            for actual_value, expected_value in zip(actual, expected, strict=True)
+        )
+    return bool(actual == expected)
+
+
+def _strict_receipt_json_object(path: Path) -> dict[str, Any]:
+    """Read a receipt while rejecting links, duplicate keys and non-objects."""
+
+    if path.is_symlink() or not path.is_file():
+        raise GalaxyCampaignDeliveryQCError(
+            "publication receipt must be a regular non-symlink file"
+        )
+
+    def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise GalaxyCampaignDeliveryQCError(
+                    f"publication receipt contains duplicate JSON key: {key}"
+                )
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GalaxyCampaignDeliveryQCError(
+            "publication receipt is not strict UTF-8 JSON"
+        ) from error
+    if not isinstance(payload, dict):
+        raise GalaxyCampaignDeliveryQCError(
+            "publication receipt must contain one JSON object"
+        )
+    return payload
 
 
 @dataclass(frozen=True)
@@ -295,10 +381,19 @@ class GalaxyCampaignDeliveryQCResult:
 
 def _load_campaign(
     manifest_path: Path,
+    *,
+    manifest_bytes: bytes | None = None,
 ) -> tuple[
     Path, dict[str, Any], ContinuousTimeShardPlan, tuple[int, ...], tuple[int, int]
 ]:
-    manifest = _json_object(manifest_path, label="production manifest")
+    manifest = (
+        _json_object(manifest_path, label="production manifest")
+        if manifest_bytes is None
+        else _json_object_from_bytes(
+            manifest_bytes,
+            label="production manifest",
+        )
+    )
     if manifest.get("schema_id") != GALAXY_STAMP_PRODUCTION_SCHEMA_ID:
         raise GalaxyCampaignDeliveryQCError("unsupported Galaxy production manifest")
     if int(manifest.get("schema_version", 0)) != GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION:
@@ -680,6 +775,193 @@ def _validate_delivery_header(
             )
 
 
+def _publication_receipt_record(
+    *,
+    source_id: int,
+    shard_id: int,
+    path: Path,
+) -> dict[str, Any]:
+    return {
+        "source_id": str(source_id),
+        "shard_id": int(shard_id),
+        "product": "publication_receipt",
+        "path": str(path),
+    }
+
+
+def _validate_optional_publication_receipt(
+    path: Path,
+    *,
+    run_root: Path,
+    production_manifest_path: Path,
+    production_manifest_identity: Mapping[str, Any],
+    run_id: str,
+    case: CampaignCase,
+    source_id: int,
+    shard: ContinuousTimeShard,
+    bundles: tuple[_ExpectedBundle, ...],
+) -> None:
+    """Validate one present publisher receipt without re-reading HDF payloads.
+
+    The publisher calculated each SHA-256 from both scratch and destination
+    before the atomic directory rename.  Campaign QC therefore validates the
+    immutable receipt binding, exact paths and current sizes; it deliberately
+    avoids a second multi-terabyte hash sweep.
+    """
+
+    payload = _strict_receipt_json_object(path)
+    expected_root_keys = {
+        "schema_id",
+        "schema_version",
+        "complete",
+        "run_id",
+        "case",
+        "target_source_id_int64",
+        "shard",
+        "production_manifest",
+        "members",
+    }
+    if set(payload) != expected_root_keys:
+        raise GalaxyCampaignDeliveryQCError(
+            "publication receipt has unexpected or missing root fields"
+        )
+    fixed_identity = {
+        "schema_id": STAMP_SHARD_PUBLICATION_RECEIPT_SCHEMA_ID,
+        "schema_version": STAMP_SHARD_PUBLICATION_RECEIPT_SCHEMA_VERSION,
+        "complete": True,
+        "run_id": run_id,
+        "case": case,
+        "target_source_id_int64": source_id,
+    }
+    for field, expected_value in fixed_identity.items():
+        if not _exact_json_value(payload[field], expected_value):
+            raise GalaxyCampaignDeliveryQCError(
+                f"publication receipt {field} conflicts with the campaign"
+            )
+
+    expected_shard = {
+        "shard_id": int(shard.shard_id),
+        "raw_start_index": int(shard.raw_start_index),
+        "raw_stop_index": int(shard.raw_stop_index),
+        "coadd_sizes": [int(value) for value in shard.coadd_sizes],
+        "raw_exposure_seconds": float(shard.raw_exposure_seconds),
+    }
+    if not _exact_json_value(payload["shard"], expected_shard):
+        raise GalaxyCampaignDeliveryQCError(
+            "publication receipt shard conflicts with the frozen time plan"
+        )
+
+    try:
+        manifest_relative_path = production_manifest_path.relative_to(
+            run_root
+        ).as_posix()
+    except ValueError as error:  # pragma: no cover - campaign loader guarantees this
+        raise GalaxyCampaignDeliveryQCError(
+            "production manifest escapes the prepared run root"
+        ) from error
+    expected_manifest = {
+        "path_relative_to_run_root": manifest_relative_path,
+        "size_bytes": int(production_manifest_identity["size_bytes"]),
+        "sha256": str(production_manifest_identity["sha256"]),
+    }
+    if not _exact_json_value(payload["production_manifest"], expected_manifest):
+        raise GalaxyCampaignDeliveryQCError(
+            "publication receipt production manifest identity conflicts"
+        )
+
+    members = payload["members"]
+    expected_by_name = {bundle.filename: bundle for bundle in bundles}
+    if not isinstance(members, dict) or set(members) != set(expected_by_name):
+        raise GalaxyCampaignDeliveryQCError(
+            "publication receipt members differ from the exact shard delivery set"
+        )
+    for name, bundle in expected_by_name.items():
+        member_receipt = members[name]
+        if not isinstance(member_receipt, dict) or set(member_receipt) != {
+            "path_relative_to_run_root",
+            "size_bytes",
+            "sha256",
+        }:
+            raise GalaxyCampaignDeliveryQCError(
+                f"publication receipt member {name} has invalid fields"
+            )
+        member_path = bundle.path
+        if member_path.is_symlink() or not member_path.is_file():
+            raise GalaxyCampaignDeliveryQCError(
+                f"publication receipt member {name} is not a regular file"
+            )
+        expected_relative_path = member_path.relative_to(run_root).as_posix()
+        if not _exact_json_value(
+            member_receipt["path_relative_to_run_root"],
+            expected_relative_path,
+        ):
+            raise GalaxyCampaignDeliveryQCError(
+                f"publication receipt member {name} path conflicts"
+            )
+        if not _exact_json_value(
+            member_receipt["size_bytes"],
+            int(member_path.stat().st_size),
+        ):
+            raise GalaxyCampaignDeliveryQCError(
+                f"publication receipt member {name} size conflicts"
+            )
+        sha256 = member_receipt["sha256"]
+        if (
+            not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+        ):
+            raise GalaxyCampaignDeliveryQCError(
+                f"publication receipt member {name} SHA-256 is invalid"
+            )
+
+
+def _invalid_optional_publication_receipts(
+    *,
+    run_root: Path,
+    production_manifest_path: Path,
+    production_manifest_identity: Mapping[str, Any],
+    run_id: str,
+    case: CampaignCase,
+    expected_bundles: tuple[_ExpectedBundle, ...],
+) -> tuple[Mapping[str, Any], ...]:
+    grouped: dict[tuple[int, int], list[_ExpectedBundle]] = {}
+    for bundle in expected_bundles:
+        grouped.setdefault(
+            (bundle.source_id, bundle.shard.shard_id),
+            [],
+        ).append(bundle)
+
+    invalid: list[Mapping[str, Any]] = []
+    for (source_id, shard_id), group in sorted(grouped.items()):
+        bundles = tuple(group)
+        shard = bundles[0].shard
+        receipt_path = bundles[0].path.parent / STAMP_SHARD_PUBLICATION_RECEIPT_FILENAME
+        if not receipt_path.exists() and not receipt_path.is_symlink():
+            continue
+        try:
+            _validate_optional_publication_receipt(
+                receipt_path,
+                run_root=run_root,
+                production_manifest_path=production_manifest_path,
+                production_manifest_identity=production_manifest_identity,
+                run_id=run_id,
+                case=case,
+                source_id=source_id,
+                shard=shard,
+                bundles=bundles,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            record = _publication_receipt_record(
+                source_id=source_id,
+                shard_id=shard_id,
+                path=receipt_path,
+            )
+            record["error"] = str(error)
+            invalid.append(record)
+    return tuple(invalid)
+
+
 def _unexpected_files(
     *,
     run_root: Path,
@@ -722,8 +1004,12 @@ def _unexpected_files(
         if not shard_root.is_dir() or shard_root.is_symlink():
             residuals.add(str(shard_root))
             continue
+        allowed_member_names = {
+            *expected_member_names,
+            STAMP_SHARD_PUBLICATION_RECEIPT_FILENAME,
+        }
         for member in shard_root.iterdir():
-            if member.name not in expected_member_names or member.is_symlink():
+            if member.name not in allowed_member_names or member.is_symlink():
                 residuals.add(str(member))
 
     for pattern in ("*.partial", "*.incoming", "*.lock"):
@@ -744,8 +1030,14 @@ def audit_galaxy_campaign_delivery_v1(
 
     if not isinstance(request, GalaxyCampaignDeliveryQCRequest):
         raise TypeError("request must be GalaxyCampaignDeliveryQCRequest")
+    frozen_manifest_bytes = _read_manifest_snapshot(request.production_manifest_path)
+    manifest_identity = _snapshot_file_identity(
+        request.production_manifest_path,
+        frozen_manifest_bytes,
+    )
     run_root, manifest, time_plan, _coadd_sizes, stamp_shape = _load_campaign(
-        request.production_manifest_path
+        request.production_manifest_path,
+        manifest_bytes=frozen_manifest_bytes,
     )
     run_id_value = manifest.get("run_id")
     if not isinstance(run_id_value, str) or not run_id_value.strip():
@@ -797,11 +1089,26 @@ def audit_galaxy_campaign_delivery_v1(
         summary["valid_bundle_count"] += 1
         valid_count += 1
 
+    invalid.extend(
+        _invalid_optional_publication_receipts(
+            run_root=run_root,
+            production_manifest_path=request.production_manifest_path,
+            production_manifest_identity=manifest_identity,
+            run_id=run_id,
+            case=request.case,
+            expected_bundles=expected,
+        )
+    )
+
     unexpected, partials = _unexpected_files(
         run_root=run_root,
         case=request.case,
         expected_paths={bundle.path.resolve() for bundle in expected},
     )
+    if _read_manifest_snapshot(request.production_manifest_path) != frozen_manifest_bytes:
+        raise GalaxyCampaignDeliveryQCError(
+            "production manifest changed during campaign QC"
+        )
     return GalaxyCampaignDeliveryQCResult(
         production_manifest_path=request.production_manifest_path,
         run_root=run_root,
@@ -817,7 +1124,7 @@ def audit_galaxy_campaign_delivery_v1(
         partial_artifacts=partials,
         product_summaries=product_summaries,
         time_plan=time_plan,
-        manifest_identity=file_identity(request.production_manifest_path),
+        manifest_identity=manifest_identity,
         time_plan_identity=file_identity(
             _resolve_relative_resource(
                 run_root,

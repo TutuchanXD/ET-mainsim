@@ -1141,6 +1141,9 @@ def _as_positive_formal_gain(
 _FORMAL_REQUIRED_DATASETS = (
     "final_dn",
     "background_expectation_e",
+    "captured_flux_fraction",
+    "captured_flux_denominator_e",
+    "captured_flux_qa_pass",
     "bias_level_sum_dn",
     "column_noise_sum_dn_by_x",
     "valid_mask",
@@ -1354,6 +1357,8 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
         raise RuntimeError("h5py is required to read formal stamp delivery bundles") from error
 
     from .stamp_delivery import (
+        STAMP_DELIVERY_CAPTURE_DENOMINATOR,
+        STAMP_DELIVERY_CAPTURE_QA_DEFINITION,
         STAMP_DELIVERY_OBSERVATION_PRODUCT,
         STAMP_DELIVERY_SCHEMA_ID,
         STAMP_DELIVERY_SCHEMA_VERSION,
@@ -1395,6 +1400,21 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
             raise ReferencePhotometryContractError(
                 "formal delivery must not expose a background realization"
             )
+        if (
+            _h5_scalar_string(
+                handle.attrs.get("captured_flux_fraction_denominator"),
+                name="captured_flux_fraction_denominator",
+            )
+            != STAMP_DELIVERY_CAPTURE_DENOMINATOR
+            or _h5_scalar_string(
+                handle.attrs.get("captured_flux_qa_definition"),
+                name="captured_flux_qa_definition",
+            )
+            != STAMP_DELIVERY_CAPTURE_QA_DEFINITION
+        ):
+            raise ReferencePhotometryContractError(
+                "formal delivery captured-flux semantics are unsupported"
+            )
         missing = [name for name in _FORMAL_REQUIRED_DATASETS if name not in handle]
         if missing:
             raise ReferencePhotometryContractError(
@@ -1410,6 +1430,9 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
         n_frames, ny, nx = (int(size) for size in final.shape)
         expected_shapes = {
             "background_expectation_e": (n_frames, ny, nx),
+            "captured_flux_fraction": (n_frames,),
+            "captured_flux_denominator_e": (n_frames,),
+            "captured_flux_qa_pass": (n_frames,),
             "valid_mask": (n_frames, ny, nx),
             "fullwell_count": (n_frames, ny, nx),
             "adc_low_count": (n_frames, ny, nx),
@@ -1533,8 +1556,8 @@ def _formal_gain_crop(
 
     Scalar and static stamp-map gains were fully bounded and validated while
     parsing the header.  A formal per-frame gain cube is intentionally read
-    only for the current 13x13 crop, so a 90-day production reduction never
-    loads the full calibration cube into memory.
+    only for the current stamp crop, so a long-duration production reduction
+    never loads the full calibration cube into memory.
     """
 
     if header.gain_mode == "scalar":

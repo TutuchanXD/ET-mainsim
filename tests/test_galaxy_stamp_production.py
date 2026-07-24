@@ -374,6 +374,9 @@ def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch
         == production.DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE
     )
     assert manifest["delivery"]["time_plan_relative_path"] == "inputs/time_shards.json"
+    assert manifest["delivery"]["stamp_centering_policy"] == (
+        "nearest_integer_np_rint"
+    )
     assert manifest["targets"][0]["factor_snapshot_relative_path"] == (
         "inputs/galaxy_factor_snapshots/source_42.npz"
     )
@@ -457,7 +460,7 @@ def test_run_target_rejects_delivery_mode_output_root_mismatch_before_runtime_se
         )
 
 
-def test_formal_galaxy_production_spec_freezes_delivery_and_sd20_policy() -> None:
+def test_formal_galaxy_production_spec_freezes_approved_detector_policy() -> None:
     from et_mainsim.galaxy_stamp_production import (
         build_galaxy_independent_production_spec,
     )
@@ -477,14 +480,52 @@ def test_formal_galaxy_production_spec_freezes_delivery_and_sd20_policy() -> Non
     assert spec.artifacts.background_output_policy.value == "expectation"
     assert spec.sky.subtract_nonstellar_mean is False
     assert spec.detector.pixel_scale.to_value("arcsec / pix") == 4.83
-    assert spec.detector_response.enable_inter_pixel_response is False
-    assert spec.detector_response.enable_intra_pixel_response is False
-    assert spec.detector_response.enable_pixel_phase_response is False
+    assert spec.detector_response.enable_inter_pixel_response is True
+    assert spec.detector_response.inter_prv_rms.to_value("%") == 1.0
+    assert spec.detector_response.inter_prv_nominal.to_value("%") == 100.0
+    assert spec.detector_response.enable_intra_pixel_response is True
+    assert spec.detector_response.intra_prv_rms.to_value("%") == 1.0
+    assert spec.detector_response.enable_pixel_phase_response is True
+    assert spec.detector_response.pixel_response_profile_mod == "flux conserved"
+    assert spec.detector_response.pixel_phase_profile_path == (
+        "detector/pixel_response_profile_teff5500_feh-0.1_logg4.4_"
+        "pfc_v240423.npy"
+    )
     assert spec.detector_response.scripted_sensitivity_enabled is False
     assert spec.detector_response.whole_pixel_gain_normal_enabled is False
     assert spec.detector_response.whole_pixel_gain_sinusoidal_enabled is False
     assert spec.detector_response.enable_flat_field_correction is False
+    assert spec.readout.readout_noise.to_value("electron / pix") == 5.0
+    assert spec.readout.column_noise_sigma_adu.to_value("adu") == 0.0
     assert spec.rng.run_seed == 12345
+
+
+def test_galaxy_production_config_defaults_to_approved_compact_stamp(tmp_path) -> None:
+    from et_mainsim.galaxy_stamp_production import GalaxyStampProductionConfig
+
+    config = GalaxyStampProductionConfig(
+        input_fits=tmp_path / "galaxy.fits",
+        output_root=tmp_path / "results",
+        run_id="galaxy-compact-v1",
+        data_root=tmp_path / "photsim-data",
+        focalplane_registry=tmp_path / "focalplane",
+    )
+
+    assert config.stamp_shape == (27, 27)
+
+
+def test_galaxy_production_config_rejects_noncanonical_stamp_shape(tmp_path) -> None:
+    from et_mainsim.galaxy_stamp_production import GalaxyStampProductionConfig
+
+    with pytest.raises(ValueError, match="freezes stamp_shape at 27x27"):
+        GalaxyStampProductionConfig(
+            input_fits=tmp_path / "galaxy.fits",
+            output_root=tmp_path / "results",
+            run_id="galaxy-noncanonical-v1",
+            data_root=tmp_path / "photsim-data",
+            focalplane_registry=tmp_path / "focalplane",
+            stamp_shape=(21, 21),
+        )
 
 
 def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
@@ -726,6 +767,9 @@ def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
         "injected",
     ]
     assert render_calls[0]["source_variability"] is None
+    assert requests[0].manifest["stamp_centering_policy"] == (
+        "nearest_integer_np_rint"
+    )
     assert render_calls[1]["source_variability"].relative_flux.shape == (1, 3)
     assert render_calls[0]["rng_trace_scope"] == {
         "workflow": "galaxy-independent-stamp-production",
@@ -839,11 +883,13 @@ def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
     assert requests[3].manifest["physical_rng_pairing"][
         "canonical_context_scope"]["detector_id"] == "main_ld"
     assert requests[3].output_root == scratch_case_root
-    assert requests[3].manifest["galaxy_production_manifest"] == str(
+    assert requests[3].manifest["production_manifest"] == str(
         staged_manifest_path.resolve()
     )
     staged_identity = production.file_identity(staged_manifest_path)
-    assert requests[3].manifest["galaxy_production_manifest_identity"] == {
+    assert requests[3].manifest["production_manifest_identity"] == {
         "sha256": staged_identity["sha256"],
         "size_bytes": staged_identity["size_bytes"],
     }
+    assert "galaxy_production_manifest" not in requests[3].manifest
+    assert "galaxy_production_manifest_identity" not in requests[3].manifest

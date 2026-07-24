@@ -29,6 +29,9 @@ def _bundle_payload(
         "coadd_factor": coadd_factor,
         "final_dn": final_dn,
         "background_expectation_e": np.full((n_frames, ny, nx), 3.5),
+        "captured_flux_fraction": np.ones(n_frames),
+        "captured_flux_denominator_e": np.full(n_frames, 1_000.0),
+        "captured_flux_qa_pass": np.ones(n_frames, dtype=bool),
         "bias_level_sum_dn": np.array([100.0, 100.0]),
         "column_noise_sum_dn_by_x": np.array(
             [[-0.25, 0.0, 0.25, 0.5], [-0.25, 0.0, 0.25, 0.5]]
@@ -109,6 +112,41 @@ def test_atomic_write_readback_and_reference_adapter(tmp_path) -> None:
         read_stamp_delivery_bundle(path).final_dn,
         bundle.final_dn,
     )
+
+
+def test_formal_delivery_roundtrips_captured_flux_truth_and_qa(tmp_path) -> None:
+    """Capture truth is a cadence vector; final_dn remains the sole observation."""
+
+    from et_mainsim.stamp_delivery import (
+        StampDeliveryBundle,
+        read_stamp_delivery_bundle,
+        write_stamp_delivery_bundle,
+    )
+
+    payload = _bundle_payload()
+    payload["captured_flux_fraction"] = np.asarray([1.0, 0.999_8])
+    payload["captured_flux_qa_pass"] = np.asarray([True, False])
+    payload["captured_flux_denominator_e"] = np.asarray([1_000.0, 1_250.0])
+    path = tmp_path / "capture-truth.h5"
+
+    write_stamp_delivery_bundle(
+        path,
+        StampDeliveryBundle.from_arrays(**payload),
+    )
+    restored = read_stamp_delivery_bundle(path)
+
+    np.testing.assert_allclose(restored.captured_flux_fraction, [1.0, 0.999_8])
+    np.testing.assert_array_equal(restored.captured_flux_qa_pass, [True, False])
+    np.testing.assert_allclose(
+        restored.captured_flux_denominator_e,
+        [1_000.0, 1_250.0],
+    )
+    with h5py.File(path, "r") as handle:
+        assert handle.attrs["observation_product"] == "final_dn"
+        assert bool(handle.attrs["background_realization_used"]) is False
+        assert handle["captured_flux_fraction"].shape == (2,)
+        assert handle["captured_flux_qa_pass"].shape == (2,)
+        assert handle["captured_flux_denominator_e"].shape == (2,)
 
 
 def test_validation_streams_hdf5_without_materializing_the_bundle(
@@ -201,6 +239,29 @@ def test_reader_rejects_an_incomplete_or_tampered_bundle(tmp_path) -> None:
         read_stamp_delivery_bundle(path)
 
 
+def test_reader_rejects_tampered_captured_flux_qa_semantics(tmp_path) -> None:
+    from et_mainsim.stamp_delivery import (
+        StampDeliveryBundle,
+        StampDeliveryBundleContractError,
+        read_stamp_delivery_bundle,
+        write_stamp_delivery_bundle,
+    )
+
+    path = tmp_path / "capture-semantics.h5"
+    write_stamp_delivery_bundle(
+        path,
+        StampDeliveryBundle.from_arrays(**_bundle_payload()),
+    )
+    with h5py.File(path, "r+") as handle:
+        handle.attrs["captured_flux_qa_definition"] = "crop_renormalized"
+
+    with pytest.raises(
+        StampDeliveryBundleContractError,
+        match="captured_flux_qa_definition",
+    ):
+        read_stamp_delivery_bundle(path)
+
+
 def test_raw_products_reject_non_single_raw_frame_intervals() -> None:
     from et_mainsim.stamp_delivery import (
         StampDeliveryBundle,
@@ -239,6 +300,9 @@ def test_streaming_appender_keeps_partial_invisible_until_complete(tmp_path) -> 
     frame_fields = (
         "final_dn",
         "background_expectation_e",
+        "captured_flux_fraction",
+        "captured_flux_denominator_e",
+        "captured_flux_qa_pass",
         "bias_level_sum_dn",
         "column_noise_sum_dn_by_x",
         "valid_mask",
@@ -295,6 +359,9 @@ def test_streaming_appender_rejects_a_gap_between_raw_batches(tmp_path) -> None:
     frame_fields = (
         "final_dn",
         "background_expectation_e",
+        "captured_flux_fraction",
+        "captured_flux_denominator_e",
+        "captured_flux_qa_pass",
         "bias_level_sum_dn",
         "column_noise_sum_dn_by_x",
         "valid_mask",
@@ -351,6 +418,9 @@ def test_streaming_appender_aborts_a_partial_product_on_context_exit(tmp_path) -
     for name in (
         "final_dn",
         "background_expectation_e",
+        "captured_flux_fraction",
+        "captured_flux_denominator_e",
+        "captured_flux_qa_pass",
         "bias_level_sum_dn",
         "column_noise_sum_dn_by_x",
         "valid_mask",

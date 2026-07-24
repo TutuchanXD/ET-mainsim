@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -13,6 +14,73 @@ import pytest
 RAW_EXPOSURE_SECONDS = 10.0
 RUN_ID = "campaign-qc-fixture"
 SOURCE_IDS = (41, 42)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_publication_receipt(
+    manifest_path: Path,
+    *,
+    source_id: int,
+    shard_id: int,
+    overrides: dict[str, object] | None = None,
+) -> Path:
+    from et_mainsim.time_shards import ContinuousTimeShardPlan
+
+    run_root = manifest_path.parent
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    time_plan = ContinuousTimeShardPlan.from_manifest_dict(
+        json.loads(
+            (run_root / manifest["delivery"]["time_plan_relative_path"]).read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    shard = time_plan.shards[shard_id]
+    shard_root = (
+        run_root
+        / "cases"
+        / "injected"
+        / "stamps"
+        / f"target_{source_id}"
+        / "delivery"
+        / f"shard_{shard_id:05d}"
+    )
+    members = {}
+    for path in sorted(shard_root.glob("*.h5")):
+        members[path.name] = {
+            "path_relative_to_run_root": path.relative_to(run_root).as_posix(),
+            "size_bytes": path.stat().st_size,
+            "sha256": _sha256(path),
+        }
+    payload: dict[str, object] = {
+        "schema_id": "et_mainsim.stamp_shard_publication_receipt.v1",
+        "schema_version": 1,
+        "complete": True,
+        "run_id": RUN_ID,
+        "case": "injected",
+        "target_source_id_int64": source_id,
+        "shard": {
+            "shard_id": shard.shard_id,
+            "raw_start_index": shard.raw_start_index,
+            "raw_stop_index": shard.raw_stop_index,
+            "coadd_sizes": list(shard.coadd_sizes),
+            "raw_exposure_seconds": shard.raw_exposure_seconds,
+        },
+        "production_manifest": {
+            "path_relative_to_run_root": "production_manifest.json",
+            "size_bytes": manifest_path.stat().st_size,
+            "sha256": _sha256(manifest_path),
+        },
+        "members": members,
+    }
+    if overrides:
+        payload.update(overrides)
+    receipt_path = shard_root / "publication_receipt.json"
+    receipt_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    return receipt_path
 
 
 def _write_fixture_run(tmp_path: Path) -> Path:
@@ -89,6 +157,9 @@ def _write_fixture_run(tmp_path: Path) -> Path:
                     coadd_factor=factor,
                     final_dn=np.full(shape, 1024, dtype=dtype),
                     background_expectation_e=np.zeros(shape),
+                    captured_flux_fraction=np.ones(n_frames),
+                    captured_flux_denominator_e=np.full(n_frames, 1_000.0),
+                    captured_flux_qa_pass=np.ones(n_frames, dtype=bool),
                     bias_level_sum_dn=np.zeros(n_frames),
                     column_noise_sum_dn_by_x=np.zeros((n_frames, 4)),
                     valid_mask=np.ones(shape, dtype=bool),
@@ -168,6 +239,113 @@ def test_campaign_qc_accepts_complete_manifest_anchored_delivery(
     assert payload["products"]["raw"]["expected_bundle_count"] == 4
     assert payload["products"]["coadd_30s"]["expected_bundle_count"] == 4
     assert payload["products"]["coadd_60s"]["valid_bundle_count"] == 4
+
+
+def test_campaign_qc_strictly_accepts_optional_bound_publication_receipts(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.galaxy_campaign_qc import (
+        GalaxyCampaignDeliveryQCRequest,
+        audit_galaxy_campaign_delivery_v1,
+    )
+
+    manifest_path = _write_fixture_run(tmp_path)
+    for source_id in SOURCE_IDS:
+        for shard_id in (0, 1):
+            _write_publication_receipt(
+                manifest_path,
+                source_id=source_id,
+                shard_id=shard_id,
+            )
+
+    result = audit_galaxy_campaign_delivery_v1(
+        GalaxyCampaignDeliveryQCRequest(
+            production_manifest_path=manifest_path,
+            case="injected",
+        )
+    )
+
+    assert result.ready is True
+    assert result.invalid_bundle_count == 0
+    assert result.partial_artifacts == ()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_error"),
+    (
+        ({"case": "static"}, "case"),
+        ({"run_id": "another-run"}, "run_id"),
+        ({"members": {}}, "members"),
+        (
+            {
+                "production_manifest": {
+                    "path_relative_to_run_root": "production_manifest.json",
+                    "size_bytes": 1,
+                    "sha256": "0" * 64,
+                }
+            },
+            "production manifest",
+        ),
+    ),
+)
+def test_campaign_qc_rejects_a_present_but_unbound_publication_receipt(
+    tmp_path: Path,
+    overrides: dict[str, object],
+    expected_error: str,
+) -> None:
+    from et_mainsim.galaxy_campaign_qc import (
+        GalaxyCampaignDeliveryQCRequest,
+        audit_galaxy_campaign_delivery_v1,
+    )
+
+    manifest_path = _write_fixture_run(tmp_path)
+    receipt_path = _write_publication_receipt(
+        manifest_path,
+        source_id=41,
+        shard_id=0,
+        overrides=overrides,
+    )
+
+    result = audit_galaxy_campaign_delivery_v1(
+        GalaxyCampaignDeliveryQCRequest(
+            production_manifest_path=manifest_path,
+            case="injected",
+        )
+    )
+
+    assert result.ready is False
+    assert result.invalid_bundle_count == 1
+    assert result.invalid_bundles[0]["path"] == str(receipt_path)
+    assert result.invalid_bundles[0]["product"] == "publication_receipt"
+    assert expected_error in result.invalid_bundles[0]["error"]
+
+
+def test_campaign_qc_rejects_manifest_drift_during_the_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import et_mainsim.galaxy_campaign_qc as campaign_qc
+
+    manifest_path = _write_fixture_run(tmp_path)
+    original_load = campaign_qc._load_campaign
+
+    def _load_then_drift(*args, **kwargs):
+        result = original_load(*args, **kwargs)
+        manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+        return result
+
+    monkeypatch.setattr(campaign_qc, "_load_campaign", _load_then_drift)
+
+    with pytest.raises(
+        campaign_qc.GalaxyCampaignDeliveryQCError,
+        match="production manifest changed during campaign QC",
+    ):
+        campaign_qc.audit_galaxy_campaign_delivery_v1(
+            campaign_qc.GalaxyCampaignDeliveryQCRequest(
+                production_manifest_path=manifest_path,
+                case="injected",
+            )
+        )
 
 
 def test_campaign_qc_reports_missing_and_rejects_noncanonical_time_axis(

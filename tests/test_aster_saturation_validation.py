@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 from types import SimpleNamespace
 
 import numpy as np
@@ -64,8 +65,29 @@ def test_prepare_aster_g6_freezes_explicit_psf_inputs_and_time_plan(tmp_path) ->
     assert manifest["target"]["psf_id"] == 6
     assert manifest["target"]["psf_node_angle_deg"] == 12.0
     assert manifest["target"]["coordinate_mode"] == "explicit_psf_no_sky_coordinate"
+    assert manifest["simulation_spec_base"]["dynamic_effects"]["dva"][
+        "enabled"
+    ] is False
     assert manifest["delivery"]["coadd_sizes"] == [3, 6, 12, 30]
+    assert manifest["delivery"]["stamp_shape"] == [27, 27]
+    assert manifest["delivery"]["stamp_centering_policy"] == (
+        "nearest_integer_np_rint"
+    )
     assert manifest["delivery"]["time_plan_relative_path"] == "inputs/time_shards.json"
+    detector_response = manifest["simulation_spec_base"]["detector_response"]
+    assert detector_response["enable_inter_pixel_response"] is True
+    assert detector_response["inter_prv_rms"] == {"value": 1.0, "unit": "%"}
+    assert detector_response["enable_intra_pixel_response"] is True
+    assert detector_response["intra_prv_rms"] == {"value": 1.0, "unit": "%"}
+    assert detector_response["enable_pixel_phase_response"] is True
+    assert detector_response["pixel_response_profile_mod"] == "flux conserved"
+    assert manifest["simulation_spec_base"]["readout"]["readout_noise"] == {
+        "value": 5.0,
+        "unit": "electron / pix",
+    }
+    assert manifest["simulation_spec_base"]["readout"][
+        "column_noise_sigma_adu"
+    ] == {"value": 0.0, "unit": "adu"}
     assert prepared.time_plan.accepted_raw_frame_count == 60
     assert len(prepared.time_plan.shards) == 1
 
@@ -148,6 +170,18 @@ def test_aster_g6_worker_uses_paired_rng_and_formal_delivery_contract(
             device="cpu",
         )
     )
+    real_file_identity = validation.file_identity
+
+    def _runtime_file_identity(path):
+        if str(path).endswith(validation.FORMAL_PIXEL_PHASE_PROFILE_PATH):
+            return {
+                "path": str(path),
+                "size_bytes": 1,
+                "sha256": validation.FORMAL_PIXEL_PHASE_PROFILE_SHA256,
+            }
+        return real_file_identity(path)
+
+    monkeypatch.setattr(validation, "file_identity", _runtime_file_identity)
     api = SimpleNamespace(
         PreparedStarCatalog=PreparedStarCatalog,
         SourceVariability=SourceVariability,
@@ -207,7 +241,11 @@ def test_aster_g6_worker_uses_paired_rng_and_formal_delivery_contract(
         9000000000000000622,
         9000000000000000622,
     ]
-    assert [request.stamp_shape for request in requests] == [(100, 300), (100, 300)]
+    assert [request.stamp_shape for request in requests] == [(27, 27), (27, 27)]
+    assert [request.manifest["stamp_centering_policy"] for request in requests] == [
+        "nearest_integer_np_rint",
+        "nearest_integer_np_rint",
+    ]
     assert [request.batch_size for request in requests] == [7, 7]
     assert requests[0].manifest["target_input_truth"]["variability"]["enabled"] is False
     assert requests[1].manifest["target_input_truth"]["variability"]["enabled"] is True
@@ -219,3 +257,73 @@ def test_aster_g6_worker_uses_paired_rng_and_formal_delivery_contract(
     assert render_calls[0]["rng_trace_scope"]["science_realization_id"] == (
         "aster-g6-psf6-paired-v1"
     )
+
+
+def test_aster_g6_runtime_contract_rejects_manifest_or_profile_drift(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.aster_saturation_validation as validation
+
+    source_dat, source_log, variability = _write_aster_inputs(tmp_path)
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    prepared = validation.prepare_aster_g6_saturation_validation(
+        validation.AsterG6SaturationValidationConfig(
+            source_dat=source_dat,
+            source_log=source_log,
+            variability_ecsv=variability,
+            output_root=tmp_path / "output",
+            run_id="aster-g6-runtime-contract",
+            data_root=data_root,
+            n_raw_frames=60,
+            max_raw_frames_per_shard=60,
+            device="cpu",
+        )
+    )
+    manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        validation,
+        "file_identity",
+        lambda _path: {
+            "path": "fixture-profile",
+            "size_bytes": 1,
+            "sha256": validation.FORMAL_PIXEL_PHASE_PROFILE_SHA256,
+        },
+    )
+    validation._require_aster_g6_runtime_contract(manifest, data_root=data_root)
+
+    stale_centering = copy.deepcopy(manifest)
+    stale_centering["delivery"]["stamp_centering_policy"] = "floor"
+    with pytest.raises(ValueError, match="stamp centering"):
+        validation._require_aster_g6_runtime_contract(
+            stale_centering,
+            data_root=data_root,
+        )
+
+    prv_off = copy.deepcopy(manifest)
+    prv_off["simulation_spec_base"]["detector_response"][
+        "enable_inter_pixel_response"
+    ] = False
+    prv_off["simulation_spec_base_sha256"] = validation._canonical_json_sha256(
+        prv_off["simulation_spec_base"]
+    )
+    with pytest.raises(ValueError, match="detector response"):
+        validation._require_aster_g6_runtime_contract(prv_off, data_root=data_root)
+
+    bad_hash = copy.deepcopy(manifest)
+    bad_hash["simulation_spec_base_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="simulation spec identity"):
+        validation._require_aster_g6_runtime_contract(bad_hash, data_root=data_root)
+
+    monkeypatch.setattr(
+        validation,
+        "file_identity",
+        lambda _path: {
+            "path": "fixture-profile",
+            "size_bytes": 1,
+            "sha256": "0" * 64,
+        },
+    )
+    with pytest.raises(ValueError, match="pixel-phase profile identity"):
+        validation._require_aster_g6_runtime_contract(manifest, data_root=data_root)

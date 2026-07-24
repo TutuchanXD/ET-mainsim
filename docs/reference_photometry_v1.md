@@ -1,9 +1,14 @@
 # Reference photometry v1
 
 `et_mainsim.reference_photometry` supplies the first standard reduction for
-formal stamp-delivery HDF5 bundles.  It is deliberately conservative:
+formal `et_mainsim.stamp_delivery_bundle.v2` HDF5 bundles.  It is deliberately conservative:
 the only detector observation is `final_dn`; every electron-domain quantity
 emitted by this reducer is a calibration-derived analysis product.
+
+The `_v1` suffix in this module names the **reference-photometry algorithm/API
+version**. It does not name the formal HDF5 wire schema. The current formal
+input is delivery bundle schema v2; historical delivery schema v1 is discussed
+separately below and is not accepted for new production.
 
 > **Scope boundary.** This document describes the reusable fixed-aperture
 > reduction primitive and its API. It is not by itself the current Galaxy
@@ -14,9 +19,11 @@ emitted by this reducer is a calibration-derived analysis product.
 > In particular, the historical 60 s CLI example below is not the authoritative
 > v3 coverage-aware product.
 
-## Required bundle contract
+## Required input contracts
 
-The selected HDF5 group (the root by default) must contain these datasets.
+The generic historical composite-HDF5 adapter accepts a selected group (the
+root by default) with these datasets. This table is not the formal delivery-v2
+wire schema.
 
 | Dataset | Shape | Unit / meaning |
 | --- | --- | --- |
@@ -29,8 +36,9 @@ The selected HDF5 group (the root by default) must contain these datasets.
 | `cosmic_mask` | `(n_cadence, ny, nx)` | Cosmic-affected binary mask; every stored value is exactly `0` or `1`. |
 | `time_index` | `(n_cadence,)` | Absolute cadence start coordinate. |
 
-The group or root attributes must also include `gain_e_per_dn` and
-`time_index_unit`.  The accepted time units are `frame_index` and `seconds`.
+For the generic in-memory/composite input, the group or root attributes must
+also include `gain_e_per_dn` and `time_index_unit`. The accepted time units are
+`frame_index` and `seconds`.
 For `frame_index`, `raw_frame_seconds` is mandatory.  An optional
 `exposure_seconds` or `coadd_exposure_seconds` scalar/dataset provides the
 actual accumulated exposure in each delivered cadence; it is required for a
@@ -42,12 +50,29 @@ display-only index or an unqualified midpoint.  It is absolute from the run
 origin, so time-sharded products retain common 30/90/390-minute CDPP bin
 boundaries.
 
-正式 `et_mainsim.stamp_delivery_bundle.v1` 不使用历史的 `time_index` 字段，
-而是使用 `time_start_seconds` 与 `exposure_seconds`。请调用
-`reduce_stamp_delivery_bundle_v1(path)`，它会严格读取该正式 schema 并经由
+正式 `et_mainsim.stamp_delivery_bundle.v2` 不使用历史 composite 格式的
+`time_index` 字段，而是使用 `time_start_seconds` 与 `exposure_seconds`。
+它还要求根属性
+`captured_flux_fraction_denominator="source_effective_photon_count_electron"` 和
+`captured_flux_qa_definition="no_detector_edge_or_requested_window_truncation"`。
+请调用 `reduce_stamp_delivery_bundle_v1(path)`，它会严格读取 v2 formal schema 并经由
 已验证的 adapter 建立本模块输入；不要把正式 bundle 传给
 `reduce_reference_photometry_bundle_v1()`，后者只服务于旧式 composite HDF5
 格式。
+
+formal v2 读取器除 `final_dn`、校准平面、quality count/mask 和绝对时间
+半开区间外，还强制验证下列三个 `(n_cadence,)` dataset：
+
+| Dataset | 单位 / 语义 |
+| --- | --- |
+| `captured_flux_fraction` | 目标 PSF 在 requested-window/有效 detector 交集中的截获比例；不做 post-crop renormalization。 |
+| `captured_flux_denominator_e` | 正电子数分母；语义为 `source_effective_photon_count_electron`。 |
+| `captured_flux_qa_pass` | 二元 capture QA；通过要求无 detector-edge 且无 requested-window 截断。 |
+
+raw 产品直接保留 Photsim7 真值。coadd 产品使用
+`sum(fraction * denominator) / sum(denominator)`，分母求和，QA 作逻辑 AND。
+正式 production worker 在任一 raw cadence 的 capture QA 失败时不发布该
+target-time shard；分析发布合同也要求所有 cadence 通过。
 
 对于一个目标跨多个连续 time shard 的正式生产，请调用
 `reduce_stamp_delivery_series_v1(bundle_paths)`。它只流式读取中心 `13×13`
@@ -90,6 +115,15 @@ and sums `calibrated_e` over the aperture.  It never reads or subtracts a
 background-realization image.  Removing a realization would remove real
 Poisson noise from the observation and would make the result physically
 misleading.
+
+`background_expectation_e` 是公共正式测光的默认本底产品。对 `27×27` stamp，
+expectation-only 链路不需要 1024 个 stamp-local 背景像素。局部背景只在
+`delivered_expectation_plus_local_diagnostic` 模式下可选启用；它是可替换的诊断
+估计量，不是默认本底，也不是第二个 detector observation。
+
+reference reducer 会验证 formal v2 capture 字段的 shape 与声明语义，但不会用
+`captured_flux_fraction` 除测得光通量，也不会对 crop 后 PSF 做重归一。这三个
+capture 量是定量漏光审计与发布 gate，不是默认孔径修正。
 
 The v1 quality policy is strict: if any aperture pixel is invalid, saturated,
 or cosmic-affected in a cadence, that cadence's `flux_e` is `NaN`.  The
@@ -144,7 +178,43 @@ production.  它不是 legacy PCA/SG/detrend 标准流程的 CDPP；若将来需
 科学指标，必须先冻结趋势模型、训练/拟合样本与不确定度口径，不能把它与本模块的
 reference/residual MAD 指标混称。
 
-## Formal standard-analysis CLI/API
+## Formal v2 与历史 delivery v1 的边界
+
+当前 `read_stamp_delivery_bundle()`、`validate_stamp_delivery_bundle()`、
+`reduce_stamp_delivery_bundle_v1()` 和流式 series reader 都只接受
+`et_mainsim.stamp_delivery_bundle.v2` / schema version 2。历史 delivery v1 缺少三个
+capture 字段及其根属性语义，不能与 v2 shard 混拼，不能就地改 schema
+label，也不是新正式生产的可接受输入。
+
+仍需要查阅历史 v1 时，应使用与当时 schema 配套的冻结环境只读打开，
+并将任何迁移结果写为新的、可追溯产品。不得根据 v1 中缺失的信息伪造
+`captured_flux_fraction=1` 或 `captured_flux_qa_pass=true`。函数名中的 `_v1`
+继续保留以稳定算法/API 调用，与 HDF5 delivery schema 版本无关。
+
+## 公共最优孔径分析后端
+
+`reference_photometry_v1` 保留了中心 `13×13` 固定孔径的可复现基准；正式科学
+交付还调用 `analyze_stamp_science_product_set_v1()`，在同一次 raw 流式读取中
+原子发布两套产品：
+
+- `reference_fixed13_v1`：中心 `13×13` 对照孔径，用于稳定 QA 与跨版本比较；
+- `science_optimal_aperture_v1`：用冻结 `q(t)`、有效像素和背景/噪声期望训练，
+  并复用 `photsim7.aperture.maximize_cumulative_snr` 的 science-optimal mask。
+
+同一 science-optimal mask 用于 10/30/60/120/300 s 全部 cadence；较长 cadence 由
+raw 语义累积，正式 direct-coadd bundle 用于有界采样 parity 验证。paired static
+分析必须复用同一目标已发布的 injected 孔径，防止孔径选择吸收真实光变差异。
+
+顶层 `product_set_manifest.json` 绑定两套不可变产品目录。每套目录的权威产品是
+`photometry.h5`，并交付 `photometry.ecsv`、`reference_lightcurve.ecsv`、
+`centroid_quality.ecsv`、`cdpp.json`/`cdpp.ecsv`、`quality_summary.json`、
+`aperture_definition.json`、`aperture_mask.npy`、`background_mask.npy`、可选训练
+template、`representative_calibrated_frames.h5` 与快看图。产品中包含每 cadence 的
+capture fraction/denominator/QA、expectation-background 光变、quality bitmask、质心、模型
+不确定度、注入模型残差和 CDPP。所有电子域图像与光变都从 `final_dn`
+派生；`final_dn` 仍是唯一真实观测。
+
+## 历史 Galaxy standard-analysis CLI/API
 
 `et_mainsim.standard_stamp_analysis` packages the above primitive functions
 into the maintained post-processing entry point for a completed formal Galaxy
