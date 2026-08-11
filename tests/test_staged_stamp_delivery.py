@@ -130,12 +130,11 @@ def _make_staged_shard(
     return production_manifest, staged_case_root, shard
 
 
-def test_publish_staged_shard_accepts_legacy_provenance_only_for_galaxy_v3(
+def test_publish_staged_shard_accepts_legacy_provenance_only_for_galaxy_v2(
     tmp_path,
 ) -> None:
     from et_mainsim.galaxy_stamp_production import (
         GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
-        GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
     )
     from et_mainsim.staged_stamp_delivery import (
         StagedStampShardPublishRequest,
@@ -145,7 +144,7 @@ def test_publish_staged_shard_accepts_legacy_provenance_only_for_galaxy_v3(
     production_manifest, staged_case_root, shard = _make_staged_shard(
         tmp_path,
         production_schema_id=GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
-        production_schema_version=GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
+        production_schema_version=2,
         legacy_galaxy_provenance=True,
     )
     formal_case_root = production_manifest.parent / "cases" / "injected"

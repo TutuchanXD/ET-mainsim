@@ -36,6 +36,7 @@ from .galaxy_stamp_production import (
     _canonical_json_sha256,
     _file_content_identity,
     _finite_positive,
+    _formal_pixel_phase_profile_asset_identity,
     _galaxy_physical_rng_pairing_metadata,
     _load_time_plan,
     _normalise_case,
@@ -594,6 +595,9 @@ def prepare_science_independent_production(
         device=config.device,
         run_seed=config.run_seed,
     )
+    pixel_phase_profile_identity = _formal_pixel_phase_profile_asset_identity(
+        config.data_root
+    )
 
     run_root = config.run_root
     try:
@@ -720,6 +724,9 @@ def prepare_science_independent_production(
             },
             "simulation_spec_base": spec_json,
             "simulation_spec_base_sha256": _canonical_json_sha256(spec_json),
+            "immutable_assets": {
+                "pixel_phase_profile": pixel_phase_profile_identity,
+            },
             "targets": records,
             "target_tables": {REFERENCE_DETECTOR_ID: target_table},
             "software_provenance_at_prepare": collect_provenance(

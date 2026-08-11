@@ -10,6 +10,28 @@ import numpy as np
 import pytest
 
 
+def _write_formal_pixel_phase_profile(data_root: Path, monkeypatch):
+    import et_mainsim.galaxy_stamp_production as common_production
+
+    profile = data_root / common_production.FORMAL_PIXEL_PHASE_PROFILE_PATH
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    payload = b"formal pixel-phase profile fixture\n"
+    profile.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setattr(
+        common_production,
+        "FORMAL_PIXEL_PHASE_PROFILE_SHA256",
+        digest,
+    )
+    return {
+        "relative_path": common_production.FORMAL_PIXEL_PHASE_PROFILE_PATH,
+        "file_identity": {
+            "sha256": digest,
+            "size_bytes": len(payload),
+        },
+    }
+
+
 def _write_minimal_task_manifest(tmp_path: Path) -> Path:
     from et_mainsim.stamp_inputs import file_identity
     from et_mainsim.time_shards import plan_continuous_time_shards
@@ -426,6 +448,7 @@ def test_prepare_science_production_publishes_generic_reference_field_manifest(
     input_root.mkdir()
     data_root.mkdir()
     focalplane.mkdir()
+    profile_record = _write_formal_pixel_phase_profile(data_root, monkeypatch)
     curve = _curve()
     object.__setattr__(curve, "factors", curve.factors[:3])
     monkeypatch.setattr(
@@ -460,6 +483,7 @@ def test_prepare_science_production_publishes_generic_reference_field_manifest(
     manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["schema_id"] == "et_mainsim.science_stamp_production.v1"
+    assert manifest["immutable_assets"]["pixel_phase_profile"] == profile_record
     assert manifest["production_track"] == "varlc"
     assert manifest["input"]["time_alignment"] == "simulation_raw_frame_index"
     assert manifest["input"]["native_absolute_time_used"] is False
@@ -549,6 +573,7 @@ def test_prepare_rejects_a_reference_position_whose_full_stamp_crosses_detector(
     input_root.mkdir()
     data_root.mkdir()
     focalplane.mkdir()
+    _write_formal_pixel_phase_profile(data_root, monkeypatch)
     curve = _curve()
     object.__setattr__(curve, "factors", curve.factors[:3])
     object.__setattr__(curve, "detector_xpix", xpix)
@@ -626,6 +651,7 @@ def test_science_worker_rejects_factor_snapshot_identity_drift_before_services(
     input_root.mkdir()
     data_root.mkdir()
     focalplane.mkdir()
+    _write_formal_pixel_phase_profile(data_root, monkeypatch)
     curve = _curve()
     object.__setattr__(curve, "factors", curve.factors[:3])
     monkeypatch.setattr(

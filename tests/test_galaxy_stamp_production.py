@@ -1,11 +1,31 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import shutil
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
+
+def _write_formal_pixel_phase_profile(data_root, monkeypatch):
+    import et_mainsim.galaxy_stamp_production as production
+
+    profile = data_root / production.FORMAL_PIXEL_PHASE_PROFILE_PATH
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    payload = b"formal pixel-phase profile fixture\n"
+    profile.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setattr(production, "FORMAL_PIXEL_PHASE_PROFILE_SHA256", digest)
+    return profile, {
+        "relative_path": production.FORMAL_PIXEL_PHASE_PROFILE_PATH,
+        "file_identity": {
+            "sha256": digest,
+            "size_bytes": len(payload),
+        },
+    }
 
 
 def _stub_detector_physical_pixel_shape(
@@ -290,8 +310,11 @@ def test_prepare_rejects_invalid_physical_mapping_before_creating_run_root(
     assert not config.run_root.exists()
 
 
-def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch) -> None:
-    """The actual preparation manifest must exercise the v2 relative records."""
+def test_prepare_v3_manifest_records_relocatable_resources_and_assets(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """The v3 manifest must bind relocatable inputs and immutable data assets."""
 
     import et_mainsim.galaxy_stamp_production as production
     import et_mainsim.stamp_inputs as stamp_inputs
@@ -303,6 +326,7 @@ def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch
     registry = tmp_path / "registry"
     data_root.mkdir()
     registry.mkdir()
+    _, profile_record = _write_formal_pixel_phase_profile(data_root, monkeypatch)
     curve = GalaxyLightCurve(
         source_id=42,
         gaia_g_mag=11.5,
@@ -356,7 +380,7 @@ def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch
         production.GalaxyStampProductionConfig(
             input_fits=input_fits,
             output_root=tmp_path / "prepared",
-            run_id="galaxy-v2",
+            run_id="galaxy-v3",
             data_root=data_root,
             focalplane_registry=registry,
             source_ids=(42,),
@@ -368,7 +392,8 @@ def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch
     )
     manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
 
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
+    assert manifest["immutable_assets"]["pixel_phase_profile"] == profile_record
     assert (
         manifest["delivery"]["execution_mode"]
         == production.DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE
@@ -384,7 +409,7 @@ def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch
         "inputs/target_tables/targets_main_lu.ecsv"
     )
 
-    relocated = tmp_path / "h100" / "galaxy-v2"
+    relocated = tmp_path / "h100" / "galaxy-v3"
     shutil.copytree(prepared.run_root, relocated)
     relocated_manifest_path, relocated_manifest = production._load_manifest(
         relocated / "production_manifest.json"
@@ -394,6 +419,138 @@ def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch
         relocated_manifest,
     )
     assert recovered_plan.accepted_raw_frame_count == 3
+
+
+def test_load_manifest_rejects_legacy_v2_schema_explicitly(tmp_path) -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
+    manifest_path = tmp_path / "legacy-v2.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="legacy.*version 2.*unsupported.*v3"):
+        production._load_manifest(manifest_path)
+
+
+def test_formal_pixel_phase_profile_contract_fails_closed_on_manifest_and_asset_drift(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
+    data_root = tmp_path / "data"
+    profile, profile_record = _write_formal_pixel_phase_profile(
+        data_root,
+        monkeypatch,
+    )
+    spec = {
+        "detector_response": {
+            "enable_pixel_phase_response": True,
+            "pixel_phase_profile_path": production.FORMAL_PIXEL_PHASE_PROFILE_PATH,
+        }
+    }
+    manifest = {
+        "simulation_spec_base": spec,
+        "simulation_spec_base_sha256": production._canonical_json_sha256(spec),
+        "immutable_assets": {"pixel_phase_profile": profile_record},
+    }
+
+    assert production._require_formal_pixel_phase_profile_contract(
+        manifest,
+        data_root=data_root,
+    ) == profile_record
+
+    stale_spec_identity = copy.deepcopy(manifest)
+    stale_spec_identity["simulation_spec_base_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="simulation spec identity"):
+        production._require_formal_pixel_phase_profile_contract(
+            stale_spec_identity,
+            data_root=data_root,
+        )
+
+    wrong_profile_path = copy.deepcopy(manifest)
+    wrong_profile_path["simulation_spec_base"]["detector_response"][
+        "pixel_phase_profile_path"
+    ] = "detector/other.npy"
+    wrong_profile_path["simulation_spec_base_sha256"] = (
+        production._canonical_json_sha256(wrong_profile_path["simulation_spec_base"])
+    )
+    with pytest.raises(ValueError, match="pixel-phase profile path"):
+        production._require_formal_pixel_phase_profile_contract(
+            wrong_profile_path,
+            data_root=data_root,
+        )
+
+    stale_manifest_identity = copy.deepcopy(manifest)
+    stale_manifest_identity["immutable_assets"]["pixel_phase_profile"][
+        "file_identity"
+    ]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="manifest.*pixel-phase profile identity"):
+        production._require_formal_pixel_phase_profile_contract(
+            stale_manifest_identity,
+            data_root=data_root,
+        )
+
+    profile.write_bytes(profile.read_bytes() + b"drift")
+    with pytest.raises(ValueError, match="runtime pixel-phase profile identity"):
+        production._require_formal_pixel_phase_profile_contract(
+            manifest,
+            data_root=data_root,
+        )
+
+
+def test_runtime_paths_requires_formal_pixel_phase_profile_contract(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_coord
+    import et_mainsim.galaxy_stamp_production as production
+    import et_mainsim.stamp_inputs as stamp_inputs
+
+    data_root = tmp_path / "data"
+    registry = tmp_path / "registry"
+    data_root.mkdir()
+    registry.mkdir()
+    payload = {
+        "runtime_defaults": {
+            "data_root": str(data_root),
+            "focalplane_registry": str(registry),
+        },
+        "input": {"focalplane_registry": {"owner_attestation": {}}},
+    }
+    monkeypatch.setattr(
+        production,
+        "_require_formal_pixel_phase_profile_contract",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("formal pixel-phase profile contract rejected")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        stamp_inputs,
+        "focalplane_registry_identity",
+        lambda _path: {},
+    )
+    monkeypatch.setattr(
+        et_coord,
+        "verify_semantic_registry_owner_attestation",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(production, "_validate_formal_registry_gate", lambda *_args: None)
+
+    with pytest.raises(ValueError, match="pixel-phase profile contract rejected"):
+        production._runtime_paths(
+            payload,
+            data_root=None,
+            focalplane_registry=None,
+        )
 
 
 def test_delivery_execution_mode_defaults_legacy_manifests_and_rejects_unknown() -> None:

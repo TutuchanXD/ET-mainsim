@@ -1,12 +1,35 @@
 from __future__ import annotations
 
-import json
 import copy
+import hashlib
+import json
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from astropy.table import Table
+
+
+def _write_formal_pixel_phase_profile(data_root, monkeypatch):
+    import et_mainsim.galaxy_stamp_production as common_production
+
+    profile = data_root / common_production.FORMAL_PIXEL_PHASE_PROFILE_PATH
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    payload = b"formal pixel-phase profile fixture\n"
+    profile.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setattr(
+        common_production,
+        "FORMAL_PIXEL_PHASE_PROFILE_SHA256",
+        digest,
+    )
+    return profile, {
+        "relative_path": common_production.FORMAL_PIXEL_PHASE_PROFILE_PATH,
+        "file_identity": {
+            "sha256": digest,
+            "size_bytes": len(payload),
+        },
+    }
 
 
 def _write_aster_inputs(tmp_path, *, n_frames: int = 60):
@@ -33,7 +56,10 @@ def _write_aster_inputs(tmp_path, *, n_frames: int = 60):
     return source_dat, source_log, variability
 
 
-def test_prepare_aster_g6_freezes_explicit_psf_inputs_and_time_plan(tmp_path) -> None:
+def test_prepare_aster_g6_freezes_explicit_psf_inputs_and_time_plan(
+    tmp_path,
+    monkeypatch,
+) -> None:
     from et_mainsim.aster_saturation_validation import (
         AsterG6SaturationValidationConfig,
         prepare_aster_g6_saturation_validation,
@@ -42,6 +68,7 @@ def test_prepare_aster_g6_freezes_explicit_psf_inputs_and_time_plan(tmp_path) ->
     source_dat, source_log, variability = _write_aster_inputs(tmp_path)
     data_root = tmp_path / "data"
     data_root.mkdir()
+    _, profile_record = _write_formal_pixel_phase_profile(data_root, monkeypatch)
     prepared = prepare_aster_g6_saturation_validation(
         AsterG6SaturationValidationConfig(
             source_dat=source_dat,
@@ -58,6 +85,8 @@ def test_prepare_aster_g6_freezes_explicit_psf_inputs_and_time_plan(tmp_path) ->
 
     manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
     assert manifest["schema_id"] == "et_mainsim.aster_g6_saturation_validation.v1"
+    assert manifest["schema_version"] == 2
+    assert manifest["immutable_assets"]["pixel_phase_profile"] == profile_record
     assert manifest["observation_product"] == "final_dn"
     assert manifest["scientific_scope"]["purpose"] == "saturation_response_validation"
     assert manifest["scientific_scope"]["not_precision_photometry"] is True
@@ -157,6 +186,7 @@ def test_aster_g6_worker_uses_paired_rng_and_formal_delivery_contract(
     source_dat, source_log, variability = _write_aster_inputs(tmp_path)
     data_root = tmp_path / "data"
     data_root.mkdir()
+    _write_formal_pixel_phase_profile(data_root, monkeypatch)
     prepared = validation.prepare_aster_g6_saturation_validation(
         validation.AsterG6SaturationValidationConfig(
             source_dat=source_dat,
@@ -170,18 +200,6 @@ def test_aster_g6_worker_uses_paired_rng_and_formal_delivery_contract(
             device="cpu",
         )
     )
-    real_file_identity = validation.file_identity
-
-    def _runtime_file_identity(path):
-        if str(path).endswith(validation.FORMAL_PIXEL_PHASE_PROFILE_PATH):
-            return {
-                "path": str(path),
-                "size_bytes": 1,
-                "sha256": validation.FORMAL_PIXEL_PHASE_PROFILE_SHA256,
-            }
-        return real_file_identity(path)
-
-    monkeypatch.setattr(validation, "file_identity", _runtime_file_identity)
     api = SimpleNamespace(
         PreparedStarCatalog=PreparedStarCatalog,
         SourceVariability=SourceVariability,
@@ -268,6 +286,7 @@ def test_aster_g6_runtime_contract_rejects_manifest_or_profile_drift(
     source_dat, source_log, variability = _write_aster_inputs(tmp_path)
     data_root = tmp_path / "data"
     data_root.mkdir()
+    profile, _ = _write_formal_pixel_phase_profile(data_root, monkeypatch)
     prepared = validation.prepare_aster_g6_saturation_validation(
         validation.AsterG6SaturationValidationConfig(
             source_dat=source_dat,
@@ -282,15 +301,6 @@ def test_aster_g6_runtime_contract_rejects_manifest_or_profile_drift(
         )
     )
     manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
-    monkeypatch.setattr(
-        validation,
-        "file_identity",
-        lambda _path: {
-            "path": "fixture-profile",
-            "size_bytes": 1,
-            "sha256": validation.FORMAL_PIXEL_PHASE_PROFILE_SHA256,
-        },
-    )
     validation._require_aster_g6_runtime_contract(manifest, data_root=data_root)
 
     stale_centering = copy.deepcopy(manifest)
@@ -316,14 +326,24 @@ def test_aster_g6_runtime_contract_rejects_manifest_or_profile_drift(
     with pytest.raises(ValueError, match="simulation spec identity"):
         validation._require_aster_g6_runtime_contract(bad_hash, data_root=data_root)
 
-    monkeypatch.setattr(
-        validation,
-        "file_identity",
-        lambda _path: {
-            "path": "fixture-profile",
-            "size_bytes": 1,
-            "sha256": "0" * 64,
-        },
-    )
+    profile.write_bytes(profile.read_bytes() + b"drift")
     with pytest.raises(ValueError, match="pixel-phase profile identity"):
         validation._require_aster_g6_runtime_contract(manifest, data_root=data_root)
+
+
+def test_aster_manifest_loader_rejects_legacy_v1_schema_explicitly(tmp_path) -> None:
+    import et_mainsim.aster_saturation_validation as validation
+
+    manifest_path = tmp_path / "legacy-v1.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_id": validation.ASTER_G6_SATURATION_SCHEMA_ID,
+                "schema_version": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="legacy.*version 1.*unsupported.*v2"):
+        validation._load_manifest(manifest_path)

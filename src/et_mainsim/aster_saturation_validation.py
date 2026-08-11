@@ -27,7 +27,8 @@ from .galaxy_stamp_production import (
     DEFAULT_STAMP_SHAPE,
     FORMAL_STAMP_CENTERING_POLICY,
     FORMAL_PIXEL_PHASE_PROFILE_PATH,
-    FORMAL_PIXEL_PHASE_PROFILE_SHA256,
+    _formal_pixel_phase_profile_asset_identity,
+    _require_formal_pixel_phase_profile_contract,
 )
 from .science_stamp_production import build_science_independent_production_spec
 from .independent_stamp_production import (
@@ -45,7 +46,7 @@ from .time_shards import (
 
 
 ASTER_G6_SATURATION_SCHEMA_ID = "et_mainsim.aster_g6_saturation_validation.v1"
-ASTER_G6_SATURATION_SCHEMA_VERSION = 1
+ASTER_G6_SATURATION_SCHEMA_VERSION = 2
 DEFAULT_ASTER_G6_SOURCE_ID = 9000000000000000622
 DEFAULT_ASTER_G6_MAG = 6.0
 DEFAULT_ASTER_G6_PSF_ID = 6
@@ -212,11 +213,13 @@ def _require_aster_g6_runtime_contract(
         or manifest.get("background_realization_delivered") is not False
     ):
         raise ValueError("Aster saturation observation/background contract differs")
-    profile_identity = file_identity(
-        data_root / FORMAL_PIXEL_PHASE_PROFILE_PATH
-    )
-    if profile_identity.get("sha256") != FORMAL_PIXEL_PHASE_PROFILE_SHA256:
-        raise ValueError("Aster saturation pixel-phase profile identity changed")
+    try:
+        _require_formal_pixel_phase_profile_contract(
+            manifest,
+            data_root=data_root,
+        )
+    except ValueError as error:
+        raise ValueError("Aster saturation pixel-phase profile identity changed") from error
 
 
 def _resolve_manifest_resource(
@@ -495,6 +498,9 @@ def prepare_aster_g6_saturation_validation(
         device=config.device,
         run_seed=config.run_seed,
     )
+    pixel_phase_profile_identity = _formal_pixel_phase_profile_asset_identity(
+        config.data_root
+    )
     from astropy.table import Table
 
     inputs_root = run_root / "inputs"
@@ -579,6 +585,9 @@ def prepare_aster_g6_saturation_validation(
         },
         "simulation_spec_base": spec_json,
         "simulation_spec_base_sha256": _canonical_json_sha256(spec_json),
+        "immutable_assets": {
+            "pixel_phase_profile": pixel_phase_profile_identity,
+        },
         "software_provenance_at_prepare": collect_provenance(
             Path(__file__).resolve().parents[2]
         ),
@@ -598,7 +607,16 @@ def _load_manifest(path: Path | str) -> tuple[Path, dict[str, Any]]:
         payload = json.load(stream)
     if payload.get("schema_id") != ASTER_G6_SATURATION_SCHEMA_ID:
         raise ValueError("unsupported Aster saturation validation manifest")
-    if int(payload.get("schema_version", 0)) != ASTER_G6_SATURATION_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if not isinstance(schema_version, bool) and schema_version == 1:
+        raise ValueError(
+            "legacy Aster saturation manifest version 1 is unsupported; "
+            "prepare a v2 manifest"
+        )
+    if (
+        isinstance(schema_version, bool)
+        or schema_version != ASTER_G6_SATURATION_SCHEMA_VERSION
+    ):
         raise ValueError("unsupported Aster saturation validation manifest version")
     return manifest_path, payload
 
