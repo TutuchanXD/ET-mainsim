@@ -94,6 +94,18 @@ _REFERENCE_LIGHTCURVE_SCHEMA_ID = (
 _REFERENCE_LIGHTCURVE_SCHEMA_VERSION = 2
 _PHOTOMETRY_TABLE_SCHEMA_ID = "et_mainsim.stamp_science_photometry_table.v2"
 _PHOTOMETRY_TABLE_SCHEMA_VERSION = 2
+_FORMAL_NOISE_MODEL_SCHEMA_ID = "et_mainsim.formal_stamp_noise_parameters.v1"
+_FORMAL_NOISE_MODEL_SOURCE = "production_manifest.simulation_spec_base.readout"
+_FORMAL_NOISE_MODEL_QUANTIZATION_FORMULA = (
+    "gain_electrons_per_adu/sqrt(12) when ADC rounding is enabled"
+)
+_NOISE_MODEL_FIELDS = {
+    "schema_id",
+    "source",
+    "read_noise_e_per_raw_pixel",
+    "quantization_noise_e_per_raw_pixel",
+    "quantization_formula",
+}
 _PHOTOMETRY_TABLE_COLUMNS = (
     "cadence_seconds",
     "time_start_seconds",
@@ -2901,6 +2913,22 @@ def _direct_input_identities(
     }
 
 
+def _flux_uncertainty_model_contract_v1() -> dict[str, str]:
+    return {
+        "schema_id": "et_mainsim.science_flux_uncertainty_model.v1",
+        "semantic_role": "analytic_model_standard_deviation_not_empirical_scatter",
+        "authoritative_dataset": "model_flux_uncertainty_e",
+        "compatibility_alias": "flux_uncertainty_e",
+        "rate_dataset": "model_flux_uncertainty_e_per_s",
+        "source_variance": "fitted_source_expectation_e",
+        "background_variance": "streamed_background_expectation_aperture_e",
+        "read_and_quantization_noise_scale": (
+            "aperture_pixel_count_times_raw_coadd_factor"
+        ),
+        "quality_invalid_uncertainty": "NaN_components_retained",
+    }
+
+
 def _build_contract(
     *,
     request: StampScienceAnalysisRequest,
@@ -2962,23 +2990,7 @@ def _build_contract(
                 },
             },
             "source_model": "through_origin_integrated_raw_relative_flux_v1",
-            "flux_uncertainty_model": {
-                "schema_id": "et_mainsim.science_flux_uncertainty_model.v1",
-                "semantic_role": (
-                    "analytic_model_standard_deviation_not_empirical_scatter"
-                ),
-                "authoritative_dataset": "model_flux_uncertainty_e",
-                "compatibility_alias": "flux_uncertainty_e",
-                "rate_dataset": "model_flux_uncertainty_e_per_s",
-                "source_variance": "fitted_source_expectation_e",
-                "background_variance": (
-                    "streamed_background_expectation_aperture_e"
-                ),
-                "read_and_quantization_noise_scale": (
-                    "aperture_pixel_count_times_raw_coadd_factor"
-                ),
-                "quality_invalid_uncertainty": "NaN_components_retained",
-            },
+            "flux_uncertainty_model": _flux_uncertainty_model_contract_v1(),
             "rate_products": {
                 "definition": "integrated_electrons_divided_by_exposure_seconds",
                 "unit": "electron / s",
@@ -4870,6 +4882,19 @@ def _publication_analysis_policy_v1(
         raise StampScienceAnalysisContractError(
             "authoritative analysis semantics policy is not type-strict"
         )
+    context = contract.get("analysis_context")
+    if (
+        isinstance(context, Mapping)
+        and context.get("formal_profile_id") == STAMP_SCIENCE_FORMAL_PROFILE_ID
+        and encoded
+        != _canonical_json_text(
+            _formal_analysis_policy_v1().to_dict(),
+            name="frozen formal analysis policy",
+        )
+    ):
+        raise StampScienceAnalysisContractError(
+            "authoritative formal analysis policy differs from the frozen profile"
+        )
     return policy
 
 
@@ -4880,7 +4905,15 @@ def _analysis_noise_parameters_v1(
     noise_model = (
         context.get("noise_model") if isinstance(context, Mapping) else None
     )
-    if not isinstance(noise_model, Mapping):
+    if (
+        not isinstance(noise_model, Mapping)
+        or set(noise_model) != _NOISE_MODEL_FIELDS
+        or noise_model.get("schema_id") != _FORMAL_NOISE_MODEL_SCHEMA_ID
+        or not isinstance(noise_model.get("source"), str)
+        or not noise_model["source"]
+        or not isinstance(noise_model.get("quantization_formula"), str)
+        or not noise_model["quantization_formula"]
+    ):
         raise StampScienceAnalysisContractError(
             "authoritative analysis semantics noise model is invalid"
         )
@@ -4892,23 +4925,38 @@ def _analysis_noise_parameters_v1(
         )
     )
     if any(
-        type(value) not in {int, float}
-        or not math.isfinite(float(value))
-        or float(value) < 0.0
+        type(value) is not float
+        or not math.isfinite(value)
+        or value < 0.0
         for value in values
     ):
         raise StampScienceAnalysisContractError(
             "authoritative analysis semantics noise model is invalid"
         )
-    return float(values[0]), float(values[1])
+    if (
+        isinstance(context, Mapping)
+        and context.get("formal_profile_id") == STAMP_SCIENCE_FORMAL_PROFILE_ID
+        and (
+            noise_model["source"] != _FORMAL_NOISE_MODEL_SOURCE
+            or noise_model["quantization_formula"]
+            != _FORMAL_NOISE_MODEL_QUANTIZATION_FORMULA
+        )
+    ):
+        raise StampScienceAnalysisContractError(
+            "authoritative formal analysis noise model differs from the frozen profile"
+        )
+    return values[0], values[1]
 
 
 def _arrays_match_exactly(actual: Any, expected: Any) -> bool:
     try:
+        actual_array = np.asarray(actual)
+        expected_array = np.asarray(expected)
         return bool(
-            np.array_equal(
-                np.asarray(actual),
-                np.asarray(expected),
+            actual_array.dtype == expected_array.dtype
+            and np.array_equal(
+                actual_array,
+                expected_array,
                 equal_nan=True,
             )
         )
@@ -5100,7 +5148,13 @@ def _validate_recomputed_cadence_semantics_v1(
             f"authoritative analysis semantics for cadence {cadence_name} "
             "uncertainty metadata is invalid"
         ) from error
-    if uncertainty_metadata != _json_safe(uncertainty.metadata):
+    if _canonical_json_text(
+        uncertainty_metadata,
+        name=f"cadence {cadence_name} uncertainty metadata",
+    ) != _canonical_json_text(
+        _json_safe(uncertainty.metadata),
+        name=f"cadence {cadence_name} recomputed uncertainty metadata",
+    ):
         raise StampScienceAnalysisContractError(
             f"authoritative analysis semantics for cadence {cadence_name} "
             "uncertainty metadata differs"
@@ -5384,6 +5438,21 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     ):
         raise StampScienceAnalysisContractError(
             "analysis contract observation/background semantics are invalid"
+        )
+    recorded_uncertainty_contract = contract.get("flux_uncertainty_model")
+    if (
+        not isinstance(recorded_uncertainty_contract, Mapping)
+        or _canonical_json_text(
+            recorded_uncertainty_contract,
+            name="analysis contract flux uncertainty model",
+        )
+        != _canonical_json_text(
+            _flux_uncertainty_model_contract_v1(),
+            name="frozen flux uncertainty model",
+        )
+    ):
+        raise StampScienceAnalysisContractError(
+            "analysis contract flux uncertainty model is invalid"
         )
     analysis_policy = _publication_analysis_policy_v1(contract)
     raw_cadence_anchor = _raw_cadence_anchor_contract_v1(
@@ -7945,15 +8014,13 @@ def write_stamp_science_analysis_request_v1(
             production.quantization_noise_e_per_raw_pixel
         ),
         "noise_model": {
-            "schema_id": "et_mainsim.formal_stamp_noise_parameters.v1",
-            "source": "production_manifest.simulation_spec_base.readout",
+            "schema_id": _FORMAL_NOISE_MODEL_SCHEMA_ID,
+            "source": _FORMAL_NOISE_MODEL_SOURCE,
             "read_noise_e_per_raw_pixel": production.read_noise_e_per_raw_pixel,
             "quantization_noise_e_per_raw_pixel": (
                 production.quantization_noise_e_per_raw_pixel
             ),
-            "quantization_formula": (
-                "gain_electrons_per_adu/sqrt(12) when ADC rounding is enabled"
-            ),
+            "quantization_formula": _FORMAL_NOISE_MODEL_QUANTIZATION_FORMULA,
         },
         "policy": policy.to_dict(),
         "code_identity": collect_formal_analysis_code_identity_v1(),
@@ -8384,15 +8451,13 @@ def load_stamp_science_analysis_request_v1(
         )
     noise_model = payload["noise_model"]
     expected_noise_model = {
-        "schema_id": "et_mainsim.formal_stamp_noise_parameters.v1",
-        "source": "production_manifest.simulation_spec_base.readout",
+        "schema_id": _FORMAL_NOISE_MODEL_SCHEMA_ID,
+        "source": _FORMAL_NOISE_MODEL_SOURCE,
         "read_noise_e_per_raw_pixel": production.read_noise_e_per_raw_pixel,
         "quantization_noise_e_per_raw_pixel": (
             production.quantization_noise_e_per_raw_pixel
         ),
-        "quantization_formula": (
-            "gain_electrons_per_adu/sqrt(12) when ADC rounding is enabled"
-        ),
+        "quantization_formula": _FORMAL_NOISE_MODEL_QUANTIZATION_FORMULA,
     }
     if (
         noise_model != expected_noise_model

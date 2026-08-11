@@ -3475,6 +3475,175 @@ def test_publication_recomputes_authoritative_analysis_semantics(
         backend.validate_stamp_science_analysis_v1(product_root)
 
 
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
+        "flux_uncertainty_model",
+        "noise_declaration",
+        "noise_numeric_type",
+        "uncertainty_metadata_types",
+        "variance_dtype",
+        "formal_profile_policy",
+    ],
+)
+def test_publication_freezes_uncertainty_declarations_and_formal_policy(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    tamper_mode: str,
+) -> None:
+    from astropy.table import Table
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "frozen-uncertainty-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_names = (
+        "reference_fixed13_v1",
+        "science_optimal_aperture_v1",
+    )
+    science_name = "science_optimal_aperture_v1"
+    science_root = root / science_name
+
+    if tamper_mode in {
+        "flux_uncertainty_model",
+        "noise_declaration",
+        "noise_numeric_type",
+        "formal_profile_policy",
+    }:
+        top_manifest_path = root / "product_set_manifest.json"
+        top_manifest = json.loads(top_manifest_path.read_text(encoding="utf-8"))
+        target_names = (
+            (science_name,)
+            if tamper_mode == "flux_uncertainty_model"
+            else product_names
+        )
+        if tamper_mode == "noise_declaration":
+            top_noise = top_manifest["analysis_context"]["noise_model"]
+            top_noise.update(
+                {
+                    "schema_id": "forged.noise.v1",
+                    "source": "forged-source",
+                    "quantization_formula": "forged-formula",
+                }
+            )
+        elif tamper_mode == "noise_numeric_type":
+            top_noise = top_manifest["analysis_context"]["noise_model"]
+            top_noise["read_noise_e_per_raw_pixel"] = 1
+            top_noise["quantization_noise_e_per_raw_pixel"] = 0
+        elif tamper_mode == "formal_profile_policy":
+            top_manifest["formal_profile_id"] = (
+                backend.STAMP_SCIENCE_FORMAL_PROFILE_ID
+            )
+            top_manifest["analysis_context"]["formal_profile_id"] = (
+                backend.STAMP_SCIENCE_FORMAL_PROFILE_ID
+            )
+        top_manifest_path.write_text(json.dumps(top_manifest), encoding="utf-8")
+
+        for product_name in target_names:
+            child_manifest = json.loads(
+                (root / product_name / "analysis_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            contract = child_manifest["contract"]
+            if tamper_mode == "flux_uncertainty_model":
+                contract["flux_uncertainty_model"] = {
+                    "schema_id": "forged.uncertainty.v1",
+                    "authoritative_dataset": "forged",
+                }
+            elif tamper_mode == "noise_declaration":
+                contract["analysis_context"]["noise_model"].update(
+                    {
+                        "schema_id": "forged.noise.v1",
+                        "source": "forged-source",
+                        "quantization_formula": "forged-formula",
+                    }
+                )
+            elif tamper_mode == "noise_numeric_type":
+                noise = contract["analysis_context"]["noise_model"]
+                noise["read_noise_e_per_raw_pixel"] = 1
+                noise["quantization_noise_e_per_raw_pixel"] = 0
+            else:
+                contract["analysis_context"]["formal_profile_id"] = (
+                    backend.STAMP_SCIENCE_FORMAL_PROFILE_ID
+                )
+            _replace_product_contract(
+                root,
+                product_name=product_name,
+                contract=contract,
+            )
+    elif tamper_mode == "uncertainty_metadata_types":
+        with h5py.File(science_root / "photometry.h5", "r+") as handle:
+            group = handle["cadences/10s"]
+            metadata = json.loads(group.attrs["uncertainty_model_json"])
+            metadata["schema_version"] = 1.0
+            metadata["dark_current_counted_once_via_background_expectation"] = 1
+            group.attrs.modify(
+                "uncertainty_model_json",
+                json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+            )
+        _rehash_product_artifact(
+            root,
+            product_name=science_name,
+            artifact_name="photometry.h5",
+        )
+    else:
+        with h5py.File(science_root / "photometry.h5", "r+") as handle:
+            for group in handle["cadences"].values():
+                values = np.asarray(group["read_variance_e2"], dtype=np.int64)
+                del group["read_variance_e2"]
+                group.create_dataset("read_variance_e2", data=values)
+        table_path = science_root / "photometry.ecsv"
+        table = Table.read(table_path, format="ascii.ecsv")
+        table["read_variance_e2"] = np.asarray(
+            table["read_variance_e2"], dtype=np.int64
+        )
+        table.write(table_path, format="ascii.ecsv", overwrite=True)
+        for artifact_name in ("photometry.h5", "photometry.ecsv"):
+            _rehash_product_artifact(
+                root,
+                product_name=science_name,
+                artifact_name=artifact_name,
+            )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, science_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="uncertainty|noise|formal analysis policy",
+        ):
+            validator(path)
+
+
+@pytest.mark.parametrize("field", ["source", "quantization_formula"])
+def test_formal_noise_declaration_uses_frozen_text(field: str) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    noise_model = {
+        "schema_id": "et_mainsim.formal_stamp_noise_parameters.v1",
+        "source": "production_manifest.simulation_spec_base.readout",
+        "read_noise_e_per_raw_pixel": 1.0,
+        "quantization_noise_e_per_raw_pixel": 0.0,
+        "quantization_formula": (
+            "gain_electrons_per_adu/sqrt(12) when ADC rounding is enabled"
+        ),
+    }
+    noise_model[field] = "forged"
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="noise model",
+    ):
+        backend._analysis_noise_parameters_v1(
+            {
+                "analysis_context": {
+                    "formal_profile_id": backend.STAMP_SCIENCE_FORMAL_PROFILE_ID,
+                    "noise_model": noise_model,
+                }
+            }
+        )
+
+
 @pytest.mark.parametrize("tamper_mode", ["nan", "positive_drift"])
 def test_publication_and_product_set_bind_authoritative_q_content_identity(
     tmp_path: Path,
