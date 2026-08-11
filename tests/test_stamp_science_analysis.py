@@ -1745,7 +1745,7 @@ def test_publication_validator_and_loader_require_positive_maximum_snr(
     ):
         with pytest.raises(
             backend.StampScienceAnalysisContractError,
-            match="aperture definition science-optimal training fields are invalid",
+            match="aperture definition",
         ):
             validator(product.output_dir)
 
@@ -2092,6 +2092,413 @@ def _rehash_product_artifact(
         json.dumps(product_set_manifest),
         encoding="utf-8",
     )
+
+
+def _replace_product_contract(
+    root: Path,
+    *,
+    product_name: str,
+    contract: dict[str, object],
+) -> None:
+    product_root = root / product_name
+    child_manifest_path = product_root / "analysis_manifest.json"
+    child_manifest = json.loads(child_manifest_path.read_text(encoding="utf-8"))
+    child_manifest["contract"] = contract
+    child_manifest_path.write_text(json.dumps(child_manifest), encoding="utf-8")
+    with h5py.File(product_root / "photometry.h5", "r+") as handle:
+        del handle["analysis_contract_json"]
+        handle.create_dataset(
+            "analysis_contract_json",
+            data=np.bytes_(
+                json.dumps(
+                    contract,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ),
+        )
+    _rehash_product_artifact(
+        root,
+        product_name=product_name,
+        artifact_name="photometry.h5",
+    )
+
+
+@pytest.mark.parametrize(
+    ("product_name", "tamper_mode"),
+    [
+        pytest.param(
+            "science_optimal_aperture_v1",
+            "extra_schema_field",
+            id="exact-schema",
+        ),
+        pytest.param(
+            "science_optimal_aperture_v1",
+            "coercible_count_type",
+            id="type-sensitive-contract",
+        ),
+        pytest.param(
+            "science_optimal_aperture_v1",
+            "aperture_count",
+            id="aperture-count",
+        ),
+        pytest.param(
+            "science_optimal_aperture_v1",
+            "background_count",
+            id="background-count",
+        ),
+        pytest.param(
+            "reference_fixed13_v1",
+            "shape",
+            id="reference-shape",
+        ),
+        pytest.param(
+            "science_optimal_aperture_v1",
+            "files",
+            id="product-files",
+        ),
+        pytest.param(
+            "reference_fixed13_v1",
+            "training_indices",
+            id="reference-training-indices",
+        ),
+    ],
+)
+def test_public_readback_binds_exact_aperture_definition_to_contract_and_hdf5(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    product_name: str,
+    tamper_mode: str,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "aperture-definition-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_root = root / product_name
+    definition_path = product_root / "aperture_definition.json"
+    definition = json.loads(definition_path.read_text(encoding="utf-8"))
+    child_manifest = json.loads(
+        (product_root / "analysis_manifest.json").read_text(encoding="utf-8")
+    )
+    contract = child_manifest["contract"]
+    contract_aperture = contract["aperture"]
+    replace_contract = tamper_mode != "coercible_count_type"
+    if tamper_mode == "extra_schema_field":
+        definition["unbound_extension"] = "accepted-by-subset-validation"
+        contract_aperture["unbound_extension"] = "accepted-by-subset-validation"
+    elif tamper_mode == "coercible_count_type":
+        definition["aperture_pixel_count"] = float(
+            definition["aperture_pixel_count"]
+        )
+    elif tamper_mode == "aperture_count":
+        definition["aperture_pixel_count"] += 1
+        contract_aperture["aperture_pixel_count"] += 1
+    elif tamper_mode == "background_count":
+        definition["background_pixel_count"] += 1
+        contract_aperture["background_pixel_count"] += 1
+    elif tamper_mode == "shape":
+        definition["signal_template_shape"] = [1, 1]
+        contract_aperture["signal_template_shape"] = [1, 1]
+    elif tamper_mode == "files":
+        definition["files"] = {
+            "aperture_mask": "aperture_mask.npy",
+            "background_mask": "background_mask.npy",
+        }
+        contract_aperture["files"] = dict(definition["files"])
+    else:
+        definition["training_raw_frame_indices"] = [0]
+        contract_aperture["training_raw_frame_indices"] = [0]
+    definition_path.write_text(json.dumps(definition), encoding="utf-8")
+    if replace_contract:
+        _replace_product_contract(
+            root,
+            product_name=product_name,
+            contract=contract,
+        )
+    _rehash_product_artifact(
+        root,
+        product_name=product_name,
+        artifact_name="aperture_definition.json",
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="aperture definition",
+        ):
+            validator(path)
+
+
+def test_public_readback_preserves_nullable_aperture_target_peak(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "nullable-target-peak-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    definition_path = product_root / "aperture_definition.json"
+    definition = json.loads(definition_path.read_text(encoding="utf-8"))
+    definition["target_peak_yx"] = None
+    definition_path.write_text(json.dumps(definition), encoding="utf-8")
+    child_manifest = json.loads(
+        (product_root / "analysis_manifest.json").read_text(encoding="utf-8")
+    )
+    contract = child_manifest["contract"]
+    contract["aperture"]["target_peak_yx"] = None
+    _replace_product_contract(
+        root,
+        product_name=product_name,
+        contract=contract,
+    )
+    _rehash_product_artifact(
+        root,
+        product_name=product_name,
+        artifact_name="aperture_definition.json",
+    )
+
+    assert backend.validate_stamp_science_analysis_v1(product_root).complete is True
+    assert (
+        backend.validate_stamp_science_analysis_product_set_v1(root).complete is True
+    )
+    aperture, _, _ = backend._load_published_aperture_v1(product_root)
+    assert aperture.target_peak_yx is None
+
+
+def test_public_readback_recomputes_exact_quality_summary_from_hdf5(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "quality-summary-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    quality_path = product_root / "quality_summary.json"
+    quality = json.loads(quality_path.read_text(encoding="utf-8"))
+    quality["cadences"]["10s"]["cadence_count"] += 1
+    quality_path.write_text(json.dumps(quality), encoding="utf-8")
+    _rehash_product_artifact(
+        root,
+        product_name=product_name,
+        artifact_name="quality_summary.json",
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="quality summary",
+        ):
+            validator(path)
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        "time_start_seconds",
+        "exposure_seconds",
+        "raw_relative_flux_mean",
+        "raw_relative_flux_sum",
+        "flux_expectation_bgsub_e",
+        "flux_expectation_bgsub_e_per_s",
+        "fitted_flux_expectation_e",
+        "fitted_flux_expectation_e_per_s",
+        "residual_expectation_e",
+        "residual_expectation_ppm",
+        "captured_flux_fraction",
+        "captured_flux_denominator_e",
+    ],
+)
+def test_reference_lightcurve_requires_native_float_columns(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    column: str,
+) -> None:
+    from astropy.table import Table
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "reference-float-dtype-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    artifact_path = product_root / "reference_lightcurve.ecsv"
+    table = Table.read(artifact_path, format="ascii.ecsv")
+    table[column] = np.asarray(table[column]).astype(str)
+    table.write(artifact_path, format="ascii.ecsv", overwrite=True)
+    _rehash_product_artifact(
+        root,
+        product_name=product_name,
+        artifact_name="reference_lightcurve.ecsv",
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="reference-lightcurve ECSV column dtype differs",
+        ):
+            validator(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        pytest.param("complete", 1, id="complete-native-bool"),
+        pytest.param(
+            "observation_product",
+            "calibrated_e",
+            id="observation-product",
+        ),
+        pytest.param(
+            "calibrated_electron_products_are_derived",
+            1,
+            id="derived-native-bool",
+        ),
+        pytest.param(
+            "background_realization_used",
+            0,
+            id="background-realization-native-bool",
+        ),
+        pytest.param(
+            "background_products",
+            ["local_background_diagnostic"],
+            id="background-products",
+        ),
+        pytest.param(
+            "default_background_product",
+            "local_background_e_per_pixel",
+            id="default-background-product",
+        ),
+    ],
+)
+def test_public_readback_freezes_analysis_contract_semantics(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    field: str,
+    invalid_value: object,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "analysis-contract-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    child_manifest = json.loads(
+        (product_root / "analysis_manifest.json").read_text(encoding="utf-8")
+    )
+    contract = child_manifest["contract"]
+    contract[field] = invalid_value
+    _replace_product_contract(
+        root,
+        product_name=product_name,
+        contract=contract,
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="analysis contract",
+        ):
+            validator(path)
+
+
+@pytest.mark.parametrize("tamper_mode", ["top-level-mismatch", "unsupported-common"])
+def test_product_set_binds_supported_formal_profile_to_children(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    tamper_mode: str,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "formal-profile-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_set_path = root / "product_set_manifest.json"
+    product_set = json.loads(product_set_path.read_text(encoding="utf-8"))
+    product_set["formal_profile_id"] = "unsupported-formal-profile"
+    if tamper_mode == "unsupported-common":
+        product_set["analysis_context"]["formal_profile_id"] = (
+            "unsupported-formal-profile"
+        )
+    product_set_path.write_text(json.dumps(product_set), encoding="utf-8")
+    if tamper_mode == "unsupported-common":
+        for product_name in (
+            "reference_fixed13_v1",
+            "science_optimal_aperture_v1",
+        ):
+            child_manifest = json.loads(
+                (root / product_name / "analysis_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            contract = child_manifest["contract"]
+            contract["analysis_context"]["formal_profile_id"] = (
+                "unsupported-formal-profile"
+            )
+            _replace_product_contract(
+                root,
+                product_name=product_name,
+                contract=contract,
+            )
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="formal profile",
+    ):
+        backend.validate_stamp_science_analysis_product_set_v1(root)
+
+
+def test_public_readback_compares_embedded_contract_type_sensitively(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "embedded-contract-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    child_manifest = json.loads(
+        (product_root / "analysis_manifest.json").read_text(encoding="utf-8")
+    )
+    embedded_contract = child_manifest["contract"]
+    embedded_contract["complete"] = 1
+    with h5py.File(product_root / "photometry.h5", "r+") as handle:
+        del handle["analysis_contract_json"]
+        handle.create_dataset(
+            "analysis_contract_json",
+            data=np.bytes_(json.dumps(embedded_contract).encode("utf-8")),
+        )
+    _rehash_product_artifact(
+        root,
+        product_name=product_name,
+        artifact_name="photometry.h5",
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="HDF5 and publication manifest contracts differ",
+        ):
+            validator(path)
 
 
 @pytest.mark.parametrize(

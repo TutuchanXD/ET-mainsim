@@ -205,8 +205,31 @@ _APERTURE_DEFINITION_SCHEMA_ID = (
     "et_mainsim.science_optimal_aperture_definition.v2"
 )
 _APERTURE_DEFINITION_SCHEMA_VERSION = 2
+_APERTURE_DEFINITION_FIELDS = frozenset(
+    {
+        "schema_id",
+        "schema_version",
+        "algorithm",
+        "maximum_cumulative_snr",
+        "signal_template_shape",
+        "target_peak_yx",
+        "training_raw_frame_indices",
+        "aperture_pixel_count",
+        "background_pixel_count",
+        "files",
+        "metadata",
+    }
+)
 _QUALITY_SUMMARY_SCHEMA_ID = "et_mainsim.stamp_science_quality_summary.v2"
 _QUALITY_SUMMARY_SCHEMA_VERSION = 2
+_QUALITY_FLAG_BITS = {
+    "aperture_invalid": 1 << 0,
+    "aperture_saturated": 1 << 1,
+    "aperture_cosmic": 1 << 2,
+    "insufficient_background": 1 << 3,
+    "centroid_unavailable": 1 << 4,
+}
+_QUALITY_SUMMARY_COORDINATE_SYSTEM = "zero_based_stamp_local_x_column_y_row"
 _REPRESENTATIVE_FRAMES_SCHEMA_ID = (
     "et_mainsim.representative_calibrated_stamp_frames.v2"
 )
@@ -3485,46 +3508,51 @@ def _write_cdpp_ecsv_v1(
     _fsync_file(path)
 
 
+def _quality_cadence_summary_v1(
+    *,
+    quality_bitmask: object,
+    aperture_valid: object,
+    uncertainty_valid: object,
+    captured_flux_qa_pass: object,
+    captured_flux_fraction: object,
+) -> dict[str, Any]:
+    quality = np.asarray(quality_bitmask, dtype=np.uint16)
+    valid = np.asarray(aperture_valid, dtype=bool)
+    uncertainty = np.asarray(uncertainty_valid, dtype=bool)
+    captured_qa = np.asarray(captured_flux_qa_pass, dtype=bool)
+    captured_fraction = np.asarray(captured_flux_fraction, dtype=np.float64)
+    return {
+        "cadence_count": int(quality.size),
+        "aperture_valid_count": int(np.count_nonzero(valid)),
+        "aperture_invalid_count": int(np.count_nonzero(~valid)),
+        "quality_flag_counts": {
+            name: int(np.count_nonzero(quality & bit))
+            for name, bit in _QUALITY_FLAG_BITS.items()
+        },
+        "model_uncertainty_valid_count": int(np.count_nonzero(uncertainty)),
+        "captured_flux_qa_pass_count": int(np.count_nonzero(captured_qa)),
+        "captured_flux_qa_fail_count": int(np.count_nonzero(~captured_qa)),
+        "minimum_captured_flux_fraction": float(np.min(captured_fraction)),
+    }
+
+
 def _quality_summary_v1(
     analyses: Mapping[int, _CadenceAnalysis],
 ) -> dict[str, Any]:
     cadences: dict[str, Any] = {}
-    flag_bits = {
-        "aperture_invalid": 1 << 0,
-        "aperture_saturated": 1 << 1,
-        "aperture_cosmic": 1 << 2,
-        "insufficient_background": 1 << 3,
-        "centroid_unavailable": 1 << 4,
-    }
     for _, analysis in sorted(analyses.items()):
         seconds = int(round(float(analysis.exposure_seconds[0])))
-        quality = np.asarray(analysis.photometry["quality_bitmask"], dtype=np.uint16)
-        valid = np.asarray(analysis.photometry["aperture_valid"], dtype=bool)
-        cadences[f"{seconds}s"] = {
-            "cadence_count": int(quality.size),
-            "aperture_valid_count": int(np.count_nonzero(valid)),
-            "aperture_invalid_count": int(np.count_nonzero(~valid)),
-            "quality_flag_counts": {
-                name: int(np.count_nonzero(quality & bit))
-                for name, bit in flag_bits.items()
-            },
-            "model_uncertainty_valid_count": int(
-                np.count_nonzero(analysis.uncertainty.valid_mask)
-            ),
-            "captured_flux_qa_pass_count": int(
-                np.count_nonzero(analysis.captured_flux_qa_pass)
-            ),
-            "captured_flux_qa_fail_count": int(
-                np.count_nonzero(~analysis.captured_flux_qa_pass)
-            ),
-            "minimum_captured_flux_fraction": float(
-                np.min(analysis.captured_flux_fraction)
-            ),
-        }
+        cadences[f"{seconds}s"] = _quality_cadence_summary_v1(
+            quality_bitmask=analysis.photometry["quality_bitmask"],
+            aperture_valid=analysis.photometry["aperture_valid"],
+            uncertainty_valid=analysis.uncertainty.valid_mask,
+            captured_flux_qa_pass=analysis.captured_flux_qa_pass,
+            captured_flux_fraction=analysis.captured_flux_fraction,
+        )
     return {
         "schema_id": _QUALITY_SUMMARY_SCHEMA_ID,
         "schema_version": _QUALITY_SUMMARY_SCHEMA_VERSION,
-        "centroid_coordinate_system": "zero_based_stamp_local_x_column_y_row",
+        "centroid_coordinate_system": _QUALITY_SUMMARY_COORDINATE_SYSTEM,
         "cadences": cadences,
     }
 
@@ -3996,7 +4024,13 @@ def _validate_reference_lightcurve_ecsv_v1(
                 ),
             }
             for column, expected in float_columns.items():
-                actual = np.asarray(table[column], dtype=np.float64)[selected]
+                actual_values = np.asarray(table[column])
+                if actual_values.dtype.kind != "f":
+                    raise StampScienceAnalysisContractError(
+                        "reference-lightcurve ECSV column dtype differs: "
+                        f"{column}"
+                    )
+                actual = np.asarray(actual_values, dtype=np.float64)[selected]
                 if not np.allclose(
                     actual,
                     expected,
@@ -4965,6 +4999,27 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         expected_cadence_names,
         raw_frame_interval,
     ) = _publication_cadence_contract_v1(contract)
+    expected_background_products = (
+        [
+            "expectation_background_subtracted",
+            "local_background_diagnostic",
+        ]
+        if contract.get("background_strategy")
+        == _LOCAL_DIAGNOSTIC_BACKGROUND_STRATEGY
+        else ["expectation_background_subtracted"]
+    )
+    if (
+        contract.get("complete") is not True
+        or contract.get("observation_product") != "final_dn"
+        or contract.get("calibrated_electron_products_are_derived") is not True
+        or contract.get("background_realization_used") is not False
+        or contract.get("background_products") != expected_background_products
+        or contract.get("default_background_product")
+        != "background_expectation_e"
+    ):
+        raise StampScienceAnalysisContractError(
+            "analysis contract observation/background semantics are invalid"
+        )
     representative_provenance = _representative_frame_provenance_contract_v1(
         contract,
         raw_frame_interval=raw_frame_interval,
@@ -5003,6 +5058,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     authoritative_cdpp: dict[str, Any]
     representative_time_start_seconds: tuple[float, ...] | None = None
     representative_exposure_seconds: tuple[float, ...] | None = None
+    expected_quality_cadences: dict[str, Any] = {}
     with h5py.File(hdf_path, "r") as handle:
         schema_id = handle.attrs.get("schema_id")
         if isinstance(schema_id, bytes):
@@ -5027,7 +5083,13 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             handle["analysis_contract_json"][()],
             name="analysis_contract_json",
         )
-        if hdf_contract != contract:
+        if _canonical_json_text(
+            hdf_contract,
+            name="authoritative HDF5 analysis contract",
+        ) != _canonical_json_text(
+            contract,
+            name="publication manifest analysis contract",
+        ):
             raise StampScienceAnalysisContractError(
                 "HDF5 and publication manifest contracts differ"
             )
@@ -5157,6 +5219,20 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                     f"authoritative HDF5 cadence {name} uncertainty factor differs"
                 )
             uncertainty_valid = np.asarray(uncertainty_valid_raw, dtype=bool)
+            quality_bitmask = np.asarray(group["quality_bitmask"])
+            aperture_valid_raw = np.asarray(group["aperture_valid"])
+            if (
+                quality_bitmask.dtype.kind not in {"i", "u"}
+                or np.any(quality_bitmask < 0)
+                or np.any(quality_bitmask > np.iinfo(np.uint16).max)
+                or aperture_valid_raw.dtype.kind not in {"b", "i", "u"}
+                or not np.all(
+                    (aperture_valid_raw == 0) | (aperture_valid_raw == 1)
+                )
+            ):
+                raise StampScienceAnalysisContractError(
+                    f"authoritative HDF5 cadence {name} quality fields are invalid"
+                )
             captured_fraction = np.asarray(
                 group["captured_flux_fraction"], dtype=np.float64
             )
@@ -5177,6 +5253,13 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                 raise StampScienceAnalysisContractError(
                     f"authoritative HDF5 cadence {name} capture QA did not pass"
                 )
+            expected_quality_cadences[name] = _quality_cadence_summary_v1(
+                quality_bitmask=quality_bitmask,
+                aperture_valid=aperture_valid_raw,
+                uncertainty_valid=uncertainty_valid,
+                captured_flux_qa_pass=captured_qa,
+                captured_flux_fraction=captured_fraction,
+            )
             uncertainty = np.asarray(group["flux_uncertainty_e"], dtype=np.float64)
             variance_components = tuple(
                 np.asarray(group[item], dtype=np.float64)
@@ -5233,7 +5316,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             cadence_seconds.append(seconds)
             if factor == 1:
                 raw_frame_count = count
-                aperture_valid = np.asarray(group["aperture_valid"])
+                aperture_valid = aperture_valid_raw
                 saturated_count = np.asarray(group["saturated_pixel_count"])
                 cosmic_count = np.asarray(group["cosmic_pixel_count"])
                 if (
@@ -5377,8 +5460,21 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     aperture_definition = _read_json_object(
         root / "aperture_definition.json", label="aperture definition"
     )
+    contract_aperture = contract.get("aperture")
     if (
-        aperture_definition.get("schema_id") != _APERTURE_DEFINITION_SCHEMA_ID
+        not isinstance(contract_aperture, Mapping)
+        or set(contract_aperture) != _APERTURE_DEFINITION_FIELDS
+        or set(aperture_definition) != _APERTURE_DEFINITION_FIELDS
+        or _canonical_json_text(
+            aperture_definition,
+            name="portable aperture definition",
+        )
+        != _canonical_json_text(
+            dict(contract_aperture),
+            name="analysis contract aperture definition",
+        )
+        or aperture_definition.get("schema_id")
+        != _APERTURE_DEFINITION_SCHEMA_ID
         or not _is_native_schema_version(
             aperture_definition.get("schema_version"),
             _APERTURE_DEFINITION_SCHEMA_VERSION,
@@ -5387,62 +5483,71 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         raise StampScienceAnalysisContractError(
             "aperture definition schema is invalid"
         )
+    maximum_cumulative_snr = aperture_definition["maximum_cumulative_snr"]
+    algorithm = aperture_definition["algorithm"]
+    signal_template_shape = aperture_definition["signal_template_shape"]
+    recorded_training_indices = aperture_definition["training_raw_frame_indices"]
+    target_peak_yx = aperture_definition["target_peak_yx"]
+    aperture_pixel_count = aperture_definition["aperture_pixel_count"]
+    background_pixel_count = aperture_definition["background_pixel_count"]
+    expected_aperture_files = {
+        "aperture_mask": "aperture_mask.npy",
+        "background_mask": "background_mask.npy",
+    }
     if analysis_product == "science_optimal_aperture_v1":
-        required_definition_fields = {
-            "maximum_cumulative_snr",
-            "algorithm",
-            "signal_template_shape",
-            "training_raw_frame_indices",
-        }
-        if not required_definition_fields.issubset(aperture_definition):
-            raise StampScienceAnalysisContractError(
-                "aperture definition lacks science-optimal training fields"
+        expected_aperture_files.update(
+            {
+                "signal_template_e": "signal_template_e.npy",
+                "noise_template_e": "noise_template_e.npy",
+            }
+        )
+    if (
+        not isinstance(algorithm, str)
+        or not algorithm
+        or not isinstance(signal_template_shape, list)
+        or len(signal_template_shape) != 2
+        or any(type(item) is not int for item in signal_template_shape)
+        or tuple(signal_template_shape) != aperture.shape
+        or (
+            target_peak_yx is not None
+            and (
+                not isinstance(target_peak_yx, list)
+                or len(target_peak_yx) != 2
+                or any(type(item) is not int for item in target_peak_yx)
             )
-        maximum_cumulative_snr = aperture_definition["maximum_cumulative_snr"]
-        algorithm = aperture_definition["algorithm"]
-        signal_template_shape = aperture_definition["signal_template_shape"]
-        recorded_training_indices = aperture_definition["training_raw_frame_indices"]
-        target_peak_yx = aperture_definition.get("target_peak_yx")
+        )
+        or type(aperture_pixel_count) is not int
+        or aperture_pixel_count != int(np.count_nonzero(aperture))
+        or type(background_pixel_count) is not int
+        or background_pixel_count != int(np.count_nonzero(background))
+        or aperture_definition["files"] != expected_aperture_files
+        or not isinstance(aperture_definition["metadata"], Mapping)
+    ):
+        raise StampScienceAnalysisContractError(
+            "aperture definition fields differ from authoritative HDF5"
+        )
+    if analysis_product == "science_optimal_aperture_v1":
         if (
             isinstance(maximum_cumulative_snr, bool)
             or not isinstance(maximum_cumulative_snr, (int, float))
             or not math.isfinite(float(maximum_cumulative_snr))
             or float(maximum_cumulative_snr) <= 0.0
-            or not isinstance(algorithm, str)
-            or not algorithm
-            or not isinstance(signal_template_shape, list)
-            or len(signal_template_shape) != 2
-            or any(
-                isinstance(item, bool) or not isinstance(item, int)
-                for item in signal_template_shape
-            )
-            or tuple(signal_template_shape) != aperture.shape
             or not isinstance(recorded_training_indices, list)
-            or any(
-                type(item) is not int
-                for item in recorded_training_indices
-            )
+            or any(type(item) is not int for item in recorded_training_indices)
             or not _valid_training_raw_frame_indices(recorded_training_indices)
-            or (
-                target_peak_yx is not None
-                and (
-                    not isinstance(target_peak_yx, list)
-                    or len(target_peak_yx) != 2
-                    or any(
-                        isinstance(item, bool) or not isinstance(item, int)
-                        for item in target_peak_yx
-                    )
-                )
-            )
             or science_training_indices is None
             or not np.array_equal(
-                np.asarray(recorded_training_indices),
+                np.asarray(recorded_training_indices, dtype=np.int64),
                 science_training_indices,
             )
         ):
             raise StampScienceAnalysisContractError(
                 "aperture definition science-optimal training fields are invalid"
             )
+    elif maximum_cumulative_snr is not None or recorded_training_indices is not None:
+        raise StampScienceAnalysisContractError(
+            "aperture definition reference training fields are invalid"
+        )
     _validate_cdpp_portable_products_v1(
         root,
         authoritative_payload=authoritative_cdpp,
@@ -5451,24 +5556,22 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     quality_summary = _read_json_object(
         root / "quality_summary.json", label="quality summary"
     )
-    quality_cadences = quality_summary.get("cadences")
-    if (
-        quality_summary.get("schema_id") != _QUALITY_SUMMARY_SCHEMA_ID
-        or not _is_native_schema_version(
-            quality_summary.get("schema_version"),
-            _QUALITY_SUMMARY_SCHEMA_VERSION,
-        )
-        or not isinstance(quality_cadences, Mapping)
-        or not quality_cadences
-        or set(quality_cadences) != expected_cadence_names
-        or any(
-            not isinstance(record, Mapping)
-            or record.get("captured_flux_qa_fail_count") != 0
-            for record in quality_cadences.values()
-        )
+    expected_quality_summary = {
+        "schema_id": _QUALITY_SUMMARY_SCHEMA_ID,
+        "schema_version": _QUALITY_SUMMARY_SCHEMA_VERSION,
+        "centroid_coordinate_system": _QUALITY_SUMMARY_COORDINATE_SYSTEM,
+        "cadences": expected_quality_cadences,
+    }
+    if _canonical_json_text(
+        quality_summary,
+        name="portable quality summary",
+    ) != _canonical_json_text(
+        expected_quality_summary,
+        name="authoritative HDF5 quality summary",
     ):
         raise StampScienceAnalysisContractError(
-            "quality summary schema/cadence or captured-flux gate is invalid"
+            "quality summary schema/values differ from authoritative HDF5 "
+            "cadence products"
         )
     for name in (
         "photometry.ecsv",
@@ -5856,6 +5959,22 @@ def validate_stamp_science_analysis_product_set_v1(
     if dict(manifest.get("analysis_context", {})) != dict(common_context or {}):
         raise StampScienceAnalysisContractError(
             "product-set and child analysis contexts differ"
+        )
+    formal_profile_id = manifest.get("formal_profile_id")
+    child_formal_profile_id = (
+        common_context.get("formal_profile_id")
+        if isinstance(common_context, Mapping)
+        else None
+    )
+    if (
+        child_formal_profile_id != formal_profile_id
+        or (
+            formal_profile_id is not None
+            and formal_profile_id != STAMP_SCIENCE_FORMAL_PROFILE_ID
+        )
+    ):
+        raise StampScienceAnalysisContractError(
+            "product-set formal profile is unsupported or differs from its children"
         )
     return StampScienceAnalysisProductSetValidation(
         output_dir=root,
