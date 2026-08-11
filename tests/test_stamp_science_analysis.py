@@ -458,6 +458,24 @@ def test_frozen_aperture_background_mask_requirement_follows_strategy() -> None:
     )
 
 
+def test_frozen_aperture_rejects_training_indices_outside_int64_range() -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    overflow = replace(
+        _frozen_fixture_aperture(),
+        training_raw_frame_indices=np.asarray(
+            [0, np.iinfo(np.int64).max + 1],
+            dtype=np.uint64,
+        ),
+    )
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="complete mask/template contract",
+    ):
+        backend._validate_frozen_aperture_definition(overflow)
+
+
 def test_static_analysis_reuses_the_frozen_injected_aperture_without_training(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1583,6 +1601,7 @@ def test_published_aperture_loader_rejects_missing_required_oa_content(
         "indices_negative",
         "indices_duplicate",
         "indices_unordered",
+        "indices_uint64_overflow",
     ],
 )
 def test_publication_validator_and_loader_reject_invalid_oa_training_values(
@@ -1635,12 +1654,34 @@ def test_publication_validator_and_loader_reject_invalid_oa_training_values(
                 training[1] = training[0]
             elif invalid_product == "indices_unordered":
                 training = training[::-1]
+            elif invalid_product == "indices_uint64_overflow":
+                training = np.asarray(
+                    [0, np.iinfo(np.int64).max + 1],
+                    dtype=np.uint64,
+                )
             aperture.create_dataset("training_raw_frame_indices", data=training)
+
+    if invalid_product == "indices_uint64_overflow":
+        definition = json.loads(
+            product.aperture_definition_path.read_text(encoding="utf-8")
+        )
+        definition["training_raw_frame_indices"] = [
+            0,
+            int(np.iinfo(np.int64).max) + 1,
+        ]
+        product.aperture_definition_path.write_text(
+            json.dumps(definition),
+            encoding="utf-8",
+        )
 
     manifest = json.loads(product.manifest_path.read_text(encoding="utf-8"))
     manifest["artifacts"]["photometry.h5"] = backend._file_identity(
         product.hdf5_path
     )
+    if invalid_product == "indices_uint64_overflow":
+        manifest["artifacts"]["aperture_definition.json"] = (
+            backend._file_identity(product.aperture_definition_path)
+        )
     product.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     for validator in (
@@ -1652,6 +1693,186 @@ def test_publication_validator_and_loader_reject_invalid_oa_training_values(
             match="authoritative HDF5 aperture training products are invalid",
         ):
             validator(product.output_dir)
+
+
+@pytest.mark.parametrize("maximum_cumulative_snr", [0.0, -1.0])
+def test_publication_validator_and_loader_require_positive_maximum_snr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maximum_cumulative_snr: float,
+) -> None:
+    import photsim7.aperture as legacy_aperture
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    raw_paths, coadd_paths, q = _series_fixture(
+        tmp_path / "inputs",
+        stamp_shape=(21, 23),
+        target_yx=(10, 11),
+    )
+    import et_mainsim.stamp_science_analysis as backend
+
+    publication = backend.analyze_stamp_science_product_set_v1(
+        _request(
+            tmp_path,
+            raw_paths=raw_paths,
+            coadd_paths=coadd_paths,
+            q=q,
+            output_name="analysis-products",
+        )
+    )
+    product = publication.science_optimal_aperture
+    definition = json.loads(
+        product.aperture_definition_path.read_text(encoding="utf-8")
+    )
+    definition["maximum_cumulative_snr"] = maximum_cumulative_snr
+    product.aperture_definition_path.write_text(
+        json.dumps(definition),
+        encoding="utf-8",
+    )
+    manifest = json.loads(product.manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["aperture_definition.json"] = backend._file_identity(
+        product.aperture_definition_path
+    )
+    product.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    for validator in (
+        backend.validate_stamp_science_analysis_v1,
+        backend._load_published_aperture_v1,
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="aperture definition science-optimal training fields are invalid",
+        ):
+            validator(product.output_dir)
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [
+        pytest.param(1.0, id="float"),
+        pytest.param("1", id="string"),
+        pytest.param(True, id="bool"),
+    ],
+)
+def test_production_source_requires_native_integer_schema_version(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    production_manifest = tmp_path / "production_manifest.json"
+    production_manifest.write_text(
+        json.dumps(
+            {
+                "schema_id": "et_mainsim.science_stamp_production.v1",
+                "schema_version": schema_version,
+                "production_track": "aster",
+                "run_id": "schema-type-fixture",
+                "targets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="production manifest schema/version is unsupported",
+    ):
+        backend._resolve_production_source_v1(
+            production_manifest,
+            source_id="42",
+        )
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [
+        pytest.param(1.0, id="float"),
+        pytest.param("1", id="string"),
+        pytest.param(True, id="bool"),
+    ],
+)
+def test_header_production_binding_requires_native_integer_schema_version(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    production_manifest = tmp_path / "production_manifest.json"
+    production_manifest.write_text(
+        json.dumps(
+            {
+                "schema_id": "et_mainsim.science_stamp_production.v1",
+                "schema_version": schema_version,
+                "run_id": "schema-type-fixture",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="production manifest schema/version/run_id is unsupported",
+    ):
+        backend._validate_production_binding_for_headers(
+            production_manifest,
+            source_id="42",
+            case="injected",
+            headers=(),
+        )
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [
+        pytest.param(1.0, id="float"),
+        pytest.param("1", id="string"),
+        pytest.param(True, id="bool"),
+    ],
+)
+def test_bound_analysis_task_list_requires_native_integer_schema_version(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    production_manifest = tmp_path / "production_manifest.json"
+    production_manifest.write_text("{}\n", encoding="utf-8")
+    production_binding = backend._cli_file_binding(production_manifest)
+    production = SimpleNamespace(
+        manifest_path=production_manifest.resolve(),
+        manifest_binding=production_binding,
+    )
+    task_list = tmp_path / "inputs" / "task_lists" / "injected_gate.json"
+    task_list.parent.mkdir(parents=True)
+    task_list.write_text(
+        json.dumps(
+            {
+                "schema_id": "et_mainsim.science_stamp_task_list.v1",
+                "schema_version": schema_version,
+                "case": "injected",
+                "production_manifest_identity": production_binding["identity"],
+                "tasks": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="formal gate task list schema/production identity is invalid",
+    ):
+        backend._load_bound_analysis_task_list_v1(
+            task_list,
+            expected_path=task_list,
+            expected_case="injected",
+            production=production,
+            label="gate",
+        )
 
 
 @pytest.mark.parametrize(

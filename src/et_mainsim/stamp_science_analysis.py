@@ -307,6 +307,24 @@ class StampScienceAnalysisPolicy:
         }
 
 
+def _valid_training_raw_frame_indices(value: object) -> bool:
+    try:
+        training = np.asarray(value)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        training.ndim == 1
+        and training.size > 0
+        and training.dtype.kind in {"i", "u"}
+        and not np.any(training < 0)
+        and not np.any(training > np.iinfo(np.int64).max)
+        and (
+            training.size == 1
+            or not np.any(training[1:] <= training[:-1])
+        )
+    )
+
+
 def _validate_frozen_aperture_definition(
     value: ScienceApertureDefinition,
 ) -> ScienceApertureDefinition:
@@ -361,11 +379,7 @@ def _validate_frozen_aperture_definition(
         or np.any(noise <= 0.0)
         or tuple(value.signal_template_shape) != aperture.shape
         or training is None
-        or training.ndim != 1
-        or training.size == 0
-        or training.dtype.kind not in {"i", "u"}
-        or np.any(training < 0)
-        or (training.size > 1 and np.any(training[1:] <= training[:-1]))
+        or not _valid_training_raw_frame_indices(training)
         or not isinstance(value.algorithm, str)
         or not value.algorithm
         or not math.isfinite(float(value.maximum_cumulative_snr))
@@ -4144,16 +4158,8 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                 or np.any(signal_template < 0.0)
                 or not np.all(np.isfinite(noise_template))
                 or np.any(noise_template <= 0.0)
-                or science_training_indices.ndim != 1
-                or science_training_indices.size == 0
-                or science_training_indices.dtype.kind not in {"i", "u"}
-                or np.any(science_training_indices < 0)
-                or (
-                    science_training_indices.size > 1
-                    and np.any(
-                        science_training_indices[1:]
-                        <= science_training_indices[:-1]
-                    )
+                or not _valid_training_raw_frame_indices(
+                    science_training_indices
                 )
             ):
                 raise StampScienceAnalysisContractError(
@@ -4198,6 +4204,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             isinstance(maximum_cumulative_snr, bool)
             or not isinstance(maximum_cumulative_snr, (int, float))
             or not math.isfinite(float(maximum_cumulative_snr))
+            or float(maximum_cumulative_snr) <= 0.0
             or not isinstance(algorithm, str)
             or not algorithm
             or not isinstance(signal_template_shape, list)
@@ -4209,9 +4216,10 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             or tuple(signal_template_shape) != aperture.shape
             or not isinstance(recorded_training_indices, list)
             or any(
-                isinstance(item, bool) or not isinstance(item, int)
+                type(item) is not int
                 for item in recorded_training_indices
             )
+            or not _valid_training_raw_frame_indices(recorded_training_indices)
             or (
                 target_peak_yx is not None
                 and (
@@ -5020,7 +5028,12 @@ def _resolve_production_source_v1(
         raise StampScienceAnalysisContractError(
             "production manifest changed during byte-bound parsing"
         )
-    schema = (production.get("schema_id"), production.get("schema_version"))
+    schema_version = production.get("schema_version")
+    if type(schema_version) is not int:
+        raise StampScienceAnalysisContractError(
+            "production manifest schema/version is unsupported"
+        )
+    schema = (production.get("schema_id"), schema_version)
     if schema == ("et_mainsim.science_stamp_production.v1", 1):
         track_value = production.get("production_track")
         if track_value not in {"aster", "varlc", "wdlc"}:
@@ -5246,6 +5259,7 @@ def _load_bound_analysis_task_list_v1(
         != binding["identity"]["sha256"]
         or payload.get("schema_id")
         != "et_mainsim.science_stamp_task_list.v1"
+        or type(payload.get("schema_version")) is not int
         or payload.get("schema_version") != 1
         or payload.get("case") != expected_case
         or not isinstance(payload.get("production_manifest_identity"), Mapping)
@@ -6070,14 +6084,20 @@ def _validate_production_binding_for_headers(
         production_manifest,
         label="production manifest",
     )
-    schema = (production.get("schema_id"), production.get("schema_version"))
+    schema_version = production.get("schema_version")
+    schema = (production.get("schema_id"), schema_version)
     supported = {
         ("et_mainsim.science_stamp_production.v1", 1),
         ("et_mainsim.galaxy_stamp_production.v1", 2),
         ("et_mainsim.galaxy_stamp_production.v1", 3),
     }
     run_id = production.get("run_id")
-    if schema not in supported or not isinstance(run_id, str) or not run_id:
+    if (
+        type(schema_version) is not int
+        or schema not in supported
+        or not isinstance(run_id, str)
+        or not run_id
+    ):
         raise StampScienceAnalysisContractError(
             "production manifest schema/version/run_id is unsupported"
         )
