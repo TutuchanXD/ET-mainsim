@@ -982,7 +982,7 @@ def test_analysis_fails_closed_before_publication_when_any_input_capture_qa_fail
     output_dir = tmp_path / f"blocked-{product}"
     with pytest.raises(
         backend.StampScienceAnalysisContractError,
-        match="captured_flux_qa_pass.*false",
+        match="captured_flux_qa_pass must be true",
     ):
         backend.analyze_stamp_science_series_v1(
             _request(
@@ -2030,6 +2030,167 @@ def test_published_analysis_validator_rejects_a_tampered_portable_artifact(
         match="artifact hash/readback mismatch",
     ):
         backend.validate_stamp_science_analysis_v1(publication.output_dir)
+
+
+@pytest.mark.parametrize("tamper_mode", ["nan", "positive_drift"])
+def test_publication_and_product_set_bind_authoritative_q_content_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper_mode: str,
+) -> None:
+    import photsim7.aperture as legacy_aperture
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    raw_paths, coadd_paths, q = _series_fixture(
+        tmp_path / "inputs",
+        stamp_shape=(21, 23),
+        target_yx=(10, 11),
+    )
+    import et_mainsim.stamp_science_analysis as backend
+
+    publication = backend.analyze_stamp_science_product_set_v1(
+        _request(
+            tmp_path,
+            raw_paths=raw_paths,
+            coadd_paths=coadd_paths,
+            q=q,
+            output_name="q-bound-products",
+        )
+    )
+    product = publication.science_optimal_aperture
+    with h5py.File(product.hdf5_path, "r+") as handle:
+        dataset = handle["raw_relative_flux"]
+        if tamper_mode == "nan":
+            dataset[0] = np.nan
+        else:
+            dataset[0] = float(dataset[0]) + 0.125
+
+    child_manifest = json.loads(
+        product.manifest_path.read_text(encoding="utf-8")
+    )
+    child_manifest["artifacts"]["photometry.h5"] = backend._file_identity(
+        product.hdf5_path
+    )
+    product.manifest_path.write_text(
+        json.dumps(child_manifest),
+        encoding="utf-8",
+    )
+    product_set_manifest = json.loads(
+        publication.manifest_path.read_text(encoding="utf-8")
+    )
+    product_set_manifest["products"]["science_optimal_aperture_v1"][
+        "analysis_manifest"
+    ] = backend._file_identity(product.manifest_path)
+    publication.manifest_path.write_text(
+        json.dumps(product_set_manifest),
+        encoding="utf-8",
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product.output_dir),
+        (
+            backend.validate_stamp_science_analysis_product_set_v1,
+            publication.output_dir,
+        ),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="authoritative HDF5 raw_relative_flux",
+        ):
+            validator(path)
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    ["json_arbitrary", "ecsv_schema", "ecsv_dtype", "ecsv_value"],
+)
+def test_publication_and_product_set_bind_portable_cdpp_to_authoritative_hdf5(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper_mode: str,
+) -> None:
+    import photsim7.aperture as legacy_aperture
+    from astropy.table import Table
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    raw_paths, coadd_paths, q = _series_fixture(
+        tmp_path / "inputs",
+        stamp_shape=(21, 23),
+        target_yx=(10, 11),
+    )
+    import et_mainsim.stamp_science_analysis as backend
+
+    publication = backend.analyze_stamp_science_product_set_v1(
+        _request(
+            tmp_path,
+            raw_paths=raw_paths,
+            coadd_paths=coadd_paths,
+            q=q,
+            output_name="cdpp-bound-products",
+        )
+    )
+    product = publication.science_optimal_aperture
+    if tamper_mode == "json_arbitrary":
+        artifact_path = product.cdpp_path
+        artifact_path.write_text(
+            json.dumps({"arbitrary": "nonempty"}),
+            encoding="utf-8",
+        )
+    else:
+        artifact_path = product.output_dir / "cdpp.ecsv"
+        table = Table.read(artifact_path, format="ascii.ecsv")
+        if tamper_mode == "ecsv_schema":
+            table.meta["schema_id"] = "example.invalid_cdpp_table.v1"
+        elif tamper_mode == "ecsv_dtype":
+            table["total_bin_count"] = np.asarray(
+                table["total_bin_count"],
+                dtype=np.float64,
+            )
+        else:
+            table["observed_cdpp_ppm"][0] += 1.0
+        table.write(artifact_path, format="ascii.ecsv", overwrite=True)
+
+    child_manifest = json.loads(
+        product.manifest_path.read_text(encoding="utf-8")
+    )
+    child_manifest["artifacts"][artifact_path.name] = backend._file_identity(
+        artifact_path
+    )
+    product.manifest_path.write_text(
+        json.dumps(child_manifest),
+        encoding="utf-8",
+    )
+    product_set_manifest = json.loads(
+        publication.manifest_path.read_text(encoding="utf-8")
+    )
+    product_set_manifest["products"]["science_optimal_aperture_v1"][
+        "analysis_manifest"
+    ] = backend._file_identity(product.manifest_path)
+    publication.manifest_path.write_text(
+        json.dumps(product_set_manifest),
+        encoding="utf-8",
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product.output_dir),
+        (
+            backend.validate_stamp_science_analysis_product_set_v1,
+            publication.output_dir,
+        ),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="CDPP",
+        ):
+            validator(path)
 
 
 def test_published_analysis_readback_rejects_false_captured_flux_gate(

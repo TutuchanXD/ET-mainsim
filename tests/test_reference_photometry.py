@@ -223,6 +223,38 @@ def test_reduce_stamp_delivery_bundle_reads_the_formal_delivery_schema(tmp_path)
     assert result.product_semantics["observation_product"] == "final_dn"
 
 
+@pytest.mark.parametrize("failed_value", [False, 0], ids=["false", "zero"])
+@pytest.mark.parametrize("reduction_mode", ["bundle", "series"])
+def test_formal_reduction_rejects_failed_captured_flux_qa(
+    tmp_path,
+    failed_value: bool | int,
+    reduction_mode: str,
+) -> None:
+    from et_mainsim.reference_photometry import (
+        ReferencePhotometryContractError,
+        reduce_stamp_delivery_bundle_v1,
+        reduce_stamp_delivery_series_v1,
+    )
+
+    path = _write_formal_raw_bundle(
+        tmp_path,
+        f"failed_capture_qa_{reduction_mode}_{failed_value!r}.h5",
+        n_frames=2,
+        start=0,
+    )
+    with h5py.File(path, "r+") as handle:
+        handle["captured_flux_qa_pass"][1] = failed_value
+
+    with pytest.raises(
+        ReferencePhotometryContractError,
+        match="captured_flux_qa_pass must be true for every frame",
+    ):
+        if reduction_mode == "bundle":
+            reduce_stamp_delivery_bundle_v1(path)
+        else:
+            reduce_stamp_delivery_series_v1((path,), batch_frames=1)
+
+
 def test_reduce_stamp_delivery_series_streams_contiguous_shards(tmp_path) -> None:
     from et_mainsim.reference_photometry import reduce_stamp_delivery_series_v1
     from et_mainsim.stamp_delivery import (

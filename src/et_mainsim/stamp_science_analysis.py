@@ -92,6 +92,24 @@ _REFERENCE_LIGHTCURVE_SCHEMA_ID = (
 _REFERENCE_LIGHTCURVE_SCHEMA_VERSION = 2
 _PHOTOMETRY_TABLE_SCHEMA_ID = "et_mainsim.stamp_science_photometry_table.v2"
 _PHOTOMETRY_TABLE_SCHEMA_VERSION = 2
+_CDPP_SCHEMA_ID = "et_mainsim.stamp_science_cdpp.v1"
+_CDPP_TABLE_SCHEMA_ID = "et_mainsim.stamp_science_cdpp_table.v1"
+_CDPP_ESTIMATOR = (
+    "legacy_median_centered_mean_absolute_deviation_times_1.4826"
+)
+_CDPP_TABLE_COLUMNS = (
+    "cadence_seconds",
+    "background_estimator",
+    "window_minutes",
+    "total_bin_count",
+    "accepted_bin_count",
+    "rejected_bin_count",
+    "accepted_sample_count",
+    "minimum_coverage_fraction",
+    "minimum_accepted_bins",
+    "observed_cdpp_ppm",
+    "residual_cdpp_ppm",
+)
 _APERTURE_DEFINITION_SCHEMA_ID = (
     "et_mainsim.science_optimal_aperture_definition.v2"
 )
@@ -2539,10 +2557,8 @@ def _cdpp_payload(result: Any) -> dict[str, Any]:
 
 def _all_cdpp_payload(analyses: Mapping[int, _CadenceAnalysis]) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "schema_id": "et_mainsim.stamp_science_cdpp.v1",
-        "estimator": (
-            "legacy_median_centered_mean_absolute_deviation_times_1.4826"
-        ),
+        "schema_id": _CDPP_SCHEMA_ID,
+        "estimator": _CDPP_ESTIMATOR,
         "cadences": {},
     }
     cadences = payload["cadences"]
@@ -3221,23 +3237,11 @@ def _write_cdpp_ecsv_v1(
                 )
     table = Table(
         rows=rows,
-        names=(
-            "cadence_seconds",
-            "background_estimator",
-            "window_minutes",
-            "total_bin_count",
-            "accepted_bin_count",
-            "rejected_bin_count",
-            "accepted_sample_count",
-            "minimum_coverage_fraction",
-            "minimum_accepted_bins",
-            "observed_cdpp_ppm",
-            "residual_cdpp_ppm",
-        ),
+        names=_CDPP_TABLE_COLUMNS,
     )
     table.meta = {
-        "schema_id": "et_mainsim.stamp_science_cdpp_table.v1",
-        "estimator": "legacy_median_centered_mean_absolute_deviation_times_1.4826",
+        "schema_id": _CDPP_TABLE_SCHEMA_ID,
+        "estimator": _CDPP_ESTIMATOR,
     }
     table.write(path, format="ascii.ecsv", overwrite=False)
     _fsync_file(path)
@@ -3836,6 +3840,226 @@ def _validate_portable_photometry_ecsv_v2(path: Path) -> None:
         )
 
 
+def _cdpp_table_rows_from_payload_v1(
+    payload: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    if (
+        set(payload) != {"schema_id", "estimator", "cadences"}
+        or payload.get("schema_id") != _CDPP_SCHEMA_ID
+        or payload.get("estimator") != _CDPP_ESTIMATOR
+        or not isinstance(payload.get("cadences"), Mapping)
+        or not payload["cadences"]
+    ):
+        raise StampScienceAnalysisContractError(
+            "authoritative HDF5 CDPP schema is invalid"
+        )
+    cadence_records: list[tuple[int, Mapping[str, Any]]] = []
+    for cadence_name, cadence_payload in payload["cadences"].items():
+        if (
+            not isinstance(cadence_name, str)
+            or not cadence_name.endswith("s")
+            or not cadence_name[:-1].isdigit()
+            or int(cadence_name[:-1]) <= 0
+            or cadence_name != f"{int(cadence_name[:-1])}s"
+            or not isinstance(cadence_payload, Mapping)
+            or set(cadence_payload)
+            != {
+                "coadd_factor",
+                "expectation_background",
+                "local_background",
+            }
+            or type(cadence_payload.get("coadd_factor")) is not int
+            or cadence_payload["coadd_factor"] <= 0
+        ):
+            raise StampScienceAnalysisContractError(
+                "authoritative HDF5 CDPP cadence schema is invalid"
+            )
+        cadence_records.append((int(cadence_name[:-1]), cadence_payload))
+
+    metric_fields = set(_CDPP_TABLE_COLUMNS[2:]) | {
+        "observed_estimator",
+        "residual_estimator",
+        "aggregation",
+    }
+    nonnegative_integer_fields = {
+        "total_bin_count",
+        "accepted_bin_count",
+        "rejected_bin_count",
+        "accepted_sample_count",
+    }
+    expected_rows: list[dict[str, Any]] = []
+    for cadence_seconds, cadence_payload in sorted(cadence_records):
+        for background_name in (
+            "expectation_background",
+            "local_background",
+        ):
+            background_payload = cadence_payload[background_name]
+            if not isinstance(background_payload, Mapping):
+                raise StampScienceAnalysisContractError(
+                    "authoritative HDF5 CDPP background schema is invalid"
+                )
+            if "status" in background_payload:
+                if dict(background_payload) != {
+                    "status": "not_computed",
+                    "reason": "background_strategy_delivered_expectation_only",
+                }:
+                    raise StampScienceAnalysisContractError(
+                        "authoritative HDF5 CDPP background status is invalid"
+                    )
+                continue
+            if (
+                set(background_payload) != {"metrics_by_window_minutes", "binned_rows"}
+                or not isinstance(
+                    background_payload.get("metrics_by_window_minutes"), Mapping
+                )
+                or not isinstance(background_payload.get("binned_rows"), list)
+                or any(
+                    not isinstance(row, Mapping)
+                    for row in background_payload["binned_rows"]
+                )
+            ):
+                raise StampScienceAnalysisContractError(
+                    "authoritative HDF5 CDPP background schema is invalid"
+                )
+            metrics: list[tuple[int, Mapping[str, Any]]] = []
+            for window_name, metric in background_payload[
+                "metrics_by_window_minutes"
+            ].items():
+                if (
+                    not isinstance(window_name, str)
+                    or not window_name.isdigit()
+                    or int(window_name) <= 0
+                    or window_name != str(int(window_name))
+                    or not isinstance(metric, Mapping)
+                    or set(metric) != metric_fields
+                ):
+                    raise StampScienceAnalysisContractError(
+                        "authoritative HDF5 CDPP metric schema is invalid"
+                    )
+                window = int(window_name)
+                if (
+                    type(metric.get("window_minutes")) is not int
+                    or metric["window_minutes"] != window
+                    or any(
+                        type(metric.get(name)) is not int
+                        or metric[name] < 0
+                        for name in nonnegative_integer_fields
+                    )
+                    or type(metric.get("minimum_accepted_bins")) is not int
+                    or metric["minimum_accepted_bins"] <= 0
+                    or metric["total_bin_count"]
+                    != metric["accepted_bin_count"] + metric["rejected_bin_count"]
+                    or isinstance(metric.get("minimum_coverage_fraction"), bool)
+                    or not isinstance(
+                        metric.get("minimum_coverage_fraction"), (int, float)
+                    )
+                    or not math.isfinite(float(metric["minimum_coverage_fraction"]))
+                    or not 0.0 < float(metric["minimum_coverage_fraction"]) <= 1.0
+                    or metric.get("observed_estimator") != _CDPP_ESTIMATOR
+                    or metric.get("residual_estimator") != _CDPP_ESTIMATOR
+                    or metric.get("aggregation")
+                    != "valid_cadence_counts_normalized_by_actual_effective_exposure"
+                ):
+                    raise StampScienceAnalysisContractError(
+                        "authoritative HDF5 CDPP metric values are invalid"
+                    )
+                for name in ("observed_cdpp_ppm", "residual_cdpp_ppm"):
+                    value = metric[name]
+                    if value is not None and (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                    ):
+                        raise StampScienceAnalysisContractError(
+                            "authoritative HDF5 CDPP metric values are invalid"
+                        )
+                metrics.append((window, metric))
+            for _, metric in sorted(metrics):
+                expected_rows.append(
+                    {
+                        "cadence_seconds": cadence_seconds,
+                        "background_estimator": background_name,
+                        **{
+                            name: metric[name]
+                            for name in _CDPP_TABLE_COLUMNS[2:]
+                        },
+                    }
+                )
+    return expected_rows
+
+
+def _validate_cdpp_portable_products_v1(
+    root: Path,
+    *,
+    authoritative_payload: Mapping[str, Any],
+) -> None:
+    from astropy.table import Table
+
+    expected_rows = _cdpp_table_rows_from_payload_v1(authoritative_payload)
+    portable_json = _read_json_object(root / "cdpp.json", label="CDPP product")
+    if portable_json != dict(authoritative_payload):
+        raise StampScienceAnalysisContractError(
+            "portable CDPP JSON differs from authoritative HDF5 CDPP"
+        )
+    try:
+        table = Table.read(root / "cdpp.ecsv", format="ascii.ecsv")
+    except (OSError, UnicodeError, TypeError, ValueError) as error:
+        raise StampScienceAnalysisContractError(
+            "portable CDPP ECSV cannot be read"
+        ) from error
+    if (
+        dict(table.meta)
+        != {
+            "schema_id": _CDPP_TABLE_SCHEMA_ID,
+            "estimator": _CDPP_ESTIMATOR,
+        }
+        or tuple(table.colnames) != _CDPP_TABLE_COLUMNS
+    ):
+        raise StampScienceAnalysisContractError(
+            "portable CDPP ECSV schema is invalid"
+        )
+    integer_columns = {
+        "cadence_seconds",
+        "window_minutes",
+        "total_bin_count",
+        "accepted_bin_count",
+        "rejected_bin_count",
+        "accepted_sample_count",
+        "minimum_accepted_bins",
+    }
+    float_columns = {
+        "minimum_coverage_fraction",
+        "observed_cdpp_ppm",
+        "residual_cdpp_ppm",
+    }
+    if (
+        any(table[name].dtype.kind != "i" for name in integer_columns)
+        or table["background_estimator"].dtype.kind not in {"S", "U"}
+        or any(table[name].dtype.kind != "f" for name in float_columns)
+    ):
+        raise StampScienceAnalysisContractError(
+            "portable CDPP ECSV column types are invalid"
+        )
+
+    def normalized(value: Any) -> Any:
+        if np.ma.is_masked(value):
+            return None
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+
+    actual_rows = [
+        {name: normalized(row[name]) for name in _CDPP_TABLE_COLUMNS}
+        for row in table
+    ]
+    if actual_rows != expected_rows:
+        raise StampScienceAnalysisContractError(
+            "portable CDPP ECSV values differ from authoritative HDF5 CDPP"
+        )
+
+
 def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     import h5py
 
@@ -3929,6 +4153,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             )
     hdf_path = root / "photometry.h5"
     science_training_indices: NDArray[Any] | None = None
+    authoritative_cdpp: dict[str, Any]
     with h5py.File(hdf_path, "r") as handle:
         schema_id = handle.attrs.get("schema_id")
         if isinstance(schema_id, bytes):
@@ -3952,14 +4177,44 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             raise StampScienceAnalysisContractError(
                 "HDF5 and publication manifest contracts differ"
             )
-        if "raw_relative_flux" not in handle or "cadences" not in handle:
+        if (
+            "raw_relative_flux" not in handle
+            or "cadences" not in handle
+            or "cdpp_json" not in handle
+        ):
             raise StampScienceAnalysisContractError(
-                "authoritative HDF5 lacks q/cadence products"
+                "authoritative HDF5 lacks q/cadence/CDPP products"
             )
+        authoritative_cdpp = _decode_hdf_json(
+            handle["cdpp_json"][()],
+            name="authoritative HDF5 cdpp_json",
+        )
         q = np.asarray(handle["raw_relative_flux"], dtype=np.float64)
-        if q.ndim != 1 or q.size == 0 or np.any(q <= 0.0):
+        if (
+            q.ndim != 1
+            or q.size == 0
+            or not np.all(np.isfinite(q))
+            or np.any(q <= 0.0)
+        ):
             raise StampScienceAnalysisContractError(
                 "authoritative HDF5 raw_relative_flux is invalid"
+            )
+        recorded_q_identity = contract.get("raw_relative_flux")
+        source_identity = (
+            recorded_q_identity.get("source_identity")
+            if isinstance(recorded_q_identity, Mapping)
+            else None
+        )
+        expected_q_identity = _q_identity(q)
+        if isinstance(source_identity, Mapping):
+            expected_q_identity["source_identity"] = dict(source_identity)
+        if (
+            not isinstance(recorded_q_identity, Mapping)
+            or not isinstance(source_identity, Mapping)
+            or dict(recorded_q_identity) != expected_q_identity
+        ):
+            raise StampScienceAnalysisContractError(
+                "authoritative HDF5 raw_relative_flux identity differs from contract"
             )
         cadence_seconds: list[int] = []
         raw_frame_count = 0
@@ -4240,7 +4495,10 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             raise StampScienceAnalysisContractError(
                 "aperture definition science-optimal training fields are invalid"
             )
-    _read_json_object(root / "cdpp.json", label="CDPP product")
+    _validate_cdpp_portable_products_v1(
+        root,
+        authoritative_payload=authoritative_cdpp,
+    )
     quality_summary = _read_json_object(
         root / "quality_summary.json", label="quality summary"
     )
@@ -4263,7 +4521,6 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         "photometry.ecsv",
         "reference_lightcurve.ecsv",
         "centroid_quality.ecsv",
-        "cdpp.ecsv",
     ):
         if (root / name).stat().st_size <= 0:
             raise StampScienceAnalysisContractError(f"portable ECSV is empty: {name}")

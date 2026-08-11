@@ -1051,6 +1051,16 @@ def reduce_reference_photometry_bundle_v1(
     )
 
 
+def _require_captured_flux_qa_pass(value: Any) -> None:
+    """Fail closed unless capture QA passes for every delivered frame."""
+
+    qa_pass = np.asarray(value)
+    if qa_pass.dtype.kind not in {"b", "i", "u"} or not np.all(qa_pass == 1):
+        raise ReferencePhotometryContractError(
+            "formal delivery captured_flux_qa_pass must be true for every frame"
+        )
+
+
 def reduce_stamp_delivery_bundle_v1(
     bundle_path: Path | str,
     *,
@@ -1068,6 +1078,7 @@ def reduce_stamp_delivery_bundle_v1(
     from .stamp_delivery import read_stamp_delivery_bundle
 
     bundle = read_stamp_delivery_bundle(bundle_path)
+    _require_captured_flux_qa_pass(bundle.captured_flux_qa_pass)
     delivery = ReferencePhotometryInput.from_arrays(
         **bundle.to_reference_photometry_payload()
     )
@@ -1452,6 +1463,7 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
                 raise ReferencePhotometryContractError(
                     f"formal delivery {name} shape differs from final_dn"
                 )
+        _require_captured_flux_qa_pass(handle["captured_flux_qa_pass"][...])
         if "gain_e_per_dn" in handle and "gain_e_per_dn" in handle.attrs:
             raise ReferencePhotometryContractError(
                 "formal delivery gain_e_per_dn is stored twice"
