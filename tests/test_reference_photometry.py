@@ -255,6 +255,83 @@ def test_formal_reduction_rejects_failed_captured_flux_qa(
             reduce_stamp_delivery_series_v1((path,), batch_frames=1)
 
 
+@pytest.mark.parametrize(
+    ("attribute", "invalid_value", "error_match"),
+    [
+        pytest.param(
+            "schema_version",
+            2.0,
+            "schema_version must be an integer root attribute",
+            id="float-schema-version",
+        ),
+        pytest.param(
+            "schema_version",
+            "2",
+            "schema_version must be an integer root attribute",
+            id="string-schema-version",
+        ),
+        pytest.param(
+            "complete",
+            "false",
+            "complete must be a boolean root attribute",
+            id="string-complete",
+        ),
+        pytest.param(
+            "complete",
+            1,
+            "complete must be a boolean root attribute",
+            id="integer-complete",
+        ),
+        pytest.param(
+            "background_realization_used",
+            0,
+            "background_realization_used must be a boolean root attribute",
+            id="integer-background-realization",
+        ),
+        pytest.param(
+            "coadd_factor",
+            1.0,
+            "coadd_factor must be an integer root attribute",
+            id="float-coadd-factor",
+        ),
+        pytest.param(
+            "coadd_factor",
+            "1",
+            "coadd_factor must be an integer root attribute",
+            id="string-coadd-factor",
+        ),
+        pytest.param(
+            "coadd_factor",
+            True,
+            "coadd_factor must be an integer root attribute",
+            id="boolean-coadd-factor",
+        ),
+    ],
+)
+def test_streaming_formal_header_rejects_coerced_root_attributes(
+    tmp_path,
+    attribute: str,
+    invalid_value: object,
+    error_match: str,
+) -> None:
+    from et_mainsim.reference_photometry import (
+        ReferencePhotometryContractError,
+        reduce_stamp_delivery_series_v1,
+    )
+
+    path = _write_formal_raw_bundle(
+        tmp_path,
+        f"invalid_{attribute}.h5",
+        n_frames=2,
+        start=0,
+    )
+    with h5py.File(path, "r+") as handle:
+        handle.attrs[attribute] = invalid_value
+
+    with pytest.raises(ReferencePhotometryContractError, match=error_match):
+        reduce_stamp_delivery_series_v1((path,), batch_frames=1)
+
+
 def test_reduce_stamp_delivery_series_streams_contiguous_shards(tmp_path) -> None:
     from et_mainsim.reference_photometry import reduce_stamp_delivery_series_v1
     from et_mainsim.stamp_delivery import (

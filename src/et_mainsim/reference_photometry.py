@@ -1185,6 +1185,29 @@ def _h5_scalar_string(value: Any, *, name: str) -> str:
     return value
 
 
+def _h5_integer_attribute(value: Any, *, name: str) -> int:
+    """Read a writer-native integer root attribute without coercion."""
+
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value,
+        (int, np.integer),
+    ):
+        raise ReferencePhotometryContractError(
+            f"{name} must be an integer root attribute"
+        )
+    return int(value)
+
+
+def _h5_boolean_attribute(value: Any, *, name: str) -> bool:
+    """Read a writer-native boolean root attribute without truthiness."""
+
+    if not isinstance(value, (bool, np.bool_)):
+        raise ReferencePhotometryContractError(
+            f"{name} must be a boolean root attribute"
+        )
+    return bool(value)
+
+
 def _formal_json_dataset(handle: Any, name: str) -> dict[str, Any]:
     try:
         value = _h5_scalar_string(handle[name][()], name=name)
@@ -1382,9 +1405,17 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
         schema_id = _h5_scalar_string(handle.attrs.get("schema_id"), name="schema_id")
         if schema_id != STAMP_DELIVERY_SCHEMA_ID:
             raise ReferencePhotometryContractError("unsupported formal delivery schema")
-        if int(handle.attrs.get("schema_version", -1)) != STAMP_DELIVERY_SCHEMA_VERSION:
+        schema_version = _h5_integer_attribute(
+            handle.attrs.get("schema_version"),
+            name="schema_version",
+        )
+        if schema_version != STAMP_DELIVERY_SCHEMA_VERSION:
             raise ReferencePhotometryContractError("unsupported formal delivery schema version")
-        if bool(handle.attrs.get("complete", False)) is not True:
+        complete = _h5_boolean_attribute(
+            handle.attrs.get("complete"),
+            name="complete",
+        )
+        if complete is not True:
             raise ReferencePhotometryContractError("formal delivery bundle is not complete")
         product_kind = _h5_scalar_string(
             handle.attrs.get("product_kind"),
@@ -1392,7 +1423,10 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
         )
         if product_kind not in {"raw", "coadd"}:
             raise ReferencePhotometryContractError("formal delivery product_kind is invalid")
-        coadd_factor = int(handle.attrs.get("coadd_factor", 0))
+        coadd_factor = _h5_integer_attribute(
+            handle.attrs.get("coadd_factor"),
+            name="coadd_factor",
+        )
         if coadd_factor <= 0 or (product_kind == "raw" and coadd_factor != 1):
             raise ReferencePhotometryContractError("formal delivery coadd_factor is invalid")
         if product_kind == "coadd" and coadd_factor <= 1:
@@ -1407,7 +1441,11 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
             raise ReferencePhotometryContractError(
                 "formal delivery observation_product must be final_dn"
             )
-        if bool(handle.attrs.get("background_realization_used", True)):
+        background_realization_used = _h5_boolean_attribute(
+            handle.attrs.get("background_realization_used"),
+            name="background_realization_used",
+        )
+        if background_realization_used:
             raise ReferencePhotometryContractError(
                 "formal delivery must not expose a background realization"
             )
