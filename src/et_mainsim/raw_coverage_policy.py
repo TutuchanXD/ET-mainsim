@@ -21,7 +21,6 @@ from typing import Any, Literal
 
 from .galaxy_stamp_production import (
     GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
-    GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
 )
 from .stamp_inputs import file_identity
 
@@ -37,6 +36,7 @@ RAW_COVERAGE_ACCEPTED_BIN_NORMALIZATION = "actual_effective_exposure_only"
 RAW_COVERAGE_STRICT_QUALITY_POLICY = "invalidate_whole_fixed_aperture_cadence"
 RAW_COVERAGE_PRODUCT_FILENAME = "raw.h5"
 RAW_COVERAGE_SECONDS = 10.0
+_SUPPORTED_GALAXY_STAMP_PRODUCTION_SCHEMA_VERSIONS = frozenset({2, 3})
 
 
 class FrozenRawCoveragePolicyError(ValueError):
@@ -257,7 +257,11 @@ def _load_formal_manifest(manifest_path: Path) -> tuple[dict[str, Any], Path, st
     manifest = _json_object(manifest_path, label="production manifest")
     if manifest.get("schema_id") != GALAXY_STAMP_PRODUCTION_SCHEMA_ID:
         raise FrozenRawCoveragePolicyError("unsupported Galaxy production manifest")
-    if int(manifest.get("schema_version", 0)) != GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION:
+    schema_version = manifest.get("schema_version")
+    if (
+        type(schema_version) is not int
+        or schema_version not in _SUPPORTED_GALAXY_STAMP_PRODUCTION_SCHEMA_VERSIONS
+    ):
         raise FrozenRawCoveragePolicyError("unsupported Galaxy production manifest version")
     if manifest.get("observation_product") != "final_dn":
         raise FrozenRawCoveragePolicyError(

@@ -11,6 +11,7 @@ outputs/
 results/
 cache/
 notebook/galaxy_v3_delivery/
+notebook/stamp_science_delivery/
 *.npy
 *.npz
 *.pkl

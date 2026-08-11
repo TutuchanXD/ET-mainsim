@@ -1,11 +1,31 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import shutil
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
+
+def _write_formal_pixel_phase_profile(data_root, monkeypatch):
+    import et_mainsim.galaxy_stamp_production as production
+
+    profile = data_root / production.FORMAL_PIXEL_PHASE_PROFILE_PATH
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    payload = b"formal pixel-phase profile fixture\n"
+    profile.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setattr(production, "FORMAL_PIXEL_PHASE_PROFILE_SHA256", digest)
+    return profile, {
+        "relative_path": production.FORMAL_PIXEL_PHASE_PROFILE_PATH,
+        "file_identity": {
+            "sha256": digest,
+            "size_bytes": len(payload),
+        },
+    }
 
 
 def _stub_detector_physical_pixel_shape(
@@ -290,8 +310,11 @@ def test_prepare_rejects_invalid_physical_mapping_before_creating_run_root(
     assert not config.run_root.exists()
 
 
-def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch) -> None:
-    """The actual preparation manifest must exercise the v2 relative records."""
+def test_prepare_v3_manifest_records_relocatable_resources_and_assets(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """The v3 manifest must bind relocatable inputs and immutable data assets."""
 
     import et_mainsim.galaxy_stamp_production as production
     import et_mainsim.stamp_inputs as stamp_inputs
@@ -303,6 +326,7 @@ def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch
     registry = tmp_path / "registry"
     data_root.mkdir()
     registry.mkdir()
+    _, profile_record = _write_formal_pixel_phase_profile(data_root, monkeypatch)
     curve = GalaxyLightCurve(
         source_id=42,
         gaia_g_mag=11.5,
@@ -356,7 +380,7 @@ def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch
         production.GalaxyStampProductionConfig(
             input_fits=input_fits,
             output_root=tmp_path / "prepared",
-            run_id="galaxy-v2",
+            run_id="galaxy-v3",
             data_root=data_root,
             focalplane_registry=registry,
             source_ids=(42,),
@@ -368,12 +392,16 @@ def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch
     )
     manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
 
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
+    assert manifest["immutable_assets"]["pixel_phase_profile"] == profile_record
     assert (
         manifest["delivery"]["execution_mode"]
         == production.DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE
     )
     assert manifest["delivery"]["time_plan_relative_path"] == "inputs/time_shards.json"
+    assert manifest["delivery"]["stamp_centering_policy"] == (
+        "nearest_integer_np_rint"
+    )
     assert manifest["targets"][0]["factor_snapshot_relative_path"] == (
         "inputs/galaxy_factor_snapshots/source_42.npz"
     )
@@ -381,7 +409,7 @@ def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch
         "inputs/target_tables/targets_main_lu.ecsv"
     )
 
-    relocated = tmp_path / "h100" / "galaxy-v2"
+    relocated = tmp_path / "h100" / "galaxy-v3"
     shutil.copytree(prepared.run_root, relocated)
     relocated_manifest_path, relocated_manifest = production._load_manifest(
         relocated / "production_manifest.json"
@@ -393,28 +421,220 @@ def test_prepare_v2_manifest_records_relocatable_resources(tmp_path, monkeypatch
     assert recovered_plan.accepted_raw_frame_count == 3
 
 
-def test_delivery_execution_mode_defaults_legacy_manifests_and_rejects_unknown() -> None:
+def test_load_manifest_rejects_legacy_v2_schema_explicitly(tmp_path) -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
+    manifest_path = tmp_path / "legacy-v2.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="legacy.*version 2.*unsupported.*v3"):
+        production._load_manifest(manifest_path)
+
+
+@pytest.mark.parametrize("schema_version", (3.0, "3", True))
+def test_load_manifest_rejects_non_native_integer_v3_schema(
+    tmp_path,
+    schema_version,
+) -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
+    manifest_path = tmp_path / "invalid-v3.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": schema_version,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported Galaxy.*version"):
+        production._load_manifest(manifest_path)
+
+
+def test_formal_pixel_phase_profile_contract_fails_closed_on_manifest_and_asset_drift(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
+    data_root = tmp_path / "data"
+    profile, profile_record = _write_formal_pixel_phase_profile(
+        data_root,
+        monkeypatch,
+    )
+    spec = {
+        "detector_response": {
+            "enable_pixel_phase_response": True,
+            "pixel_phase_profile_path": production.FORMAL_PIXEL_PHASE_PROFILE_PATH,
+        }
+    }
+    manifest = {
+        "simulation_spec_base": spec,
+        "simulation_spec_base_sha256": production._canonical_json_sha256(spec),
+        "immutable_assets": {"pixel_phase_profile": profile_record},
+    }
+
+    assert production._require_formal_pixel_phase_profile_contract(
+        manifest,
+        data_root=data_root,
+    ) == profile_record
+
+    stale_spec_identity = copy.deepcopy(manifest)
+    stale_spec_identity["simulation_spec_base_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="simulation spec identity"):
+        production._require_formal_pixel_phase_profile_contract(
+            stale_spec_identity,
+            data_root=data_root,
+        )
+
+    wrong_profile_path = copy.deepcopy(manifest)
+    wrong_profile_path["simulation_spec_base"]["detector_response"][
+        "pixel_phase_profile_path"
+    ] = "detector/other.npy"
+    wrong_profile_path["simulation_spec_base_sha256"] = (
+        production._canonical_json_sha256(wrong_profile_path["simulation_spec_base"])
+    )
+    with pytest.raises(ValueError, match="pixel-phase profile path"):
+        production._require_formal_pixel_phase_profile_contract(
+            wrong_profile_path,
+            data_root=data_root,
+        )
+
+    stale_manifest_identity = copy.deepcopy(manifest)
+    stale_manifest_identity["immutable_assets"]["pixel_phase_profile"][
+        "file_identity"
+    ]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="manifest.*pixel-phase profile identity"):
+        production._require_formal_pixel_phase_profile_contract(
+            stale_manifest_identity,
+            data_root=data_root,
+        )
+
+    profile.write_bytes(profile.read_bytes() + b"drift")
+    with pytest.raises(ValueError, match="runtime pixel-phase profile identity"):
+        production._require_formal_pixel_phase_profile_contract(
+            manifest,
+            data_root=data_root,
+        )
+
+
+def test_runtime_paths_requires_formal_pixel_phase_profile_contract(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_coord
+    import et_mainsim.galaxy_stamp_production as production
+    import et_mainsim.stamp_inputs as stamp_inputs
+
+    data_root = tmp_path / "data"
+    registry = tmp_path / "registry"
+    data_root.mkdir()
+    registry.mkdir()
+    payload = {
+        "runtime_defaults": {
+            "data_root": str(data_root),
+            "focalplane_registry": str(registry),
+        },
+        "input": {"focalplane_registry": {"owner_attestation": {}}},
+    }
+    monkeypatch.setattr(
+        production,
+        "_require_formal_pixel_phase_profile_contract",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("formal pixel-phase profile contract rejected")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        stamp_inputs,
+        "focalplane_registry_identity",
+        lambda _path: {},
+    )
+    monkeypatch.setattr(
+        et_coord,
+        "verify_semantic_registry_owner_attestation",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(production, "_validate_formal_registry_gate", lambda *_args: None)
+
+    with pytest.raises(ValueError, match="pixel-phase profile contract rejected"):
+        production._runtime_paths(
+            payload,
+            data_root=None,
+            focalplane_registry=None,
+        )
+
+
+def test_delivery_execution_mode_defaults_missing_mode_for_literal_v2_manifest() -> None:
     import et_mainsim.galaxy_stamp_production as production
 
     assert (
-        production.delivery_execution_mode_from_manifest({"delivery": {}})
+        production.delivery_execution_mode_from_manifest(
+            {
+                "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": 2,
+                "delivery": {},
+            }
+        )
         == production.DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE
     )
+
+
+def test_delivery_execution_mode_requires_explicit_mode_for_v3_manifest() -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
+    with pytest.raises(ValueError, match="delivery.execution_mode"):
+        production.delivery_execution_mode_from_manifest(
+            {
+                "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": 3,
+                "delivery": {},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "direct_shared_filesystem",
+        "staged_local_scratch_v1",
+    ],
+)
+def test_delivery_execution_mode_accepts_explicit_supported_v3_modes(mode: str) -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
     assert (
         production.delivery_execution_mode_from_manifest(
             {
-                "delivery": {
-                    "execution_mode": (
-                        production.STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE
-                    )
-                }
+                "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": 3,
+                "delivery": {"execution_mode": mode},
             }
         )
-        == production.STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE
+        == mode
     )
+
+
+def test_delivery_execution_mode_rejects_unknown_v3_mode() -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
     with pytest.raises(ValueError, match="delivery.execution_mode"):
         production.delivery_execution_mode_from_manifest(
-            {"delivery": {"execution_mode": "mixed_writer_mode"}}
+            {
+                "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": 3,
+                "delivery": {"execution_mode": "mixed_writer_mode"},
+            }
         )
 
 
@@ -457,7 +677,7 @@ def test_run_target_rejects_delivery_mode_output_root_mismatch_before_runtime_se
         )
 
 
-def test_formal_galaxy_production_spec_freezes_delivery_and_sd20_policy() -> None:
+def test_formal_galaxy_production_spec_freezes_approved_detector_policy() -> None:
     from et_mainsim.galaxy_stamp_production import (
         build_galaxy_independent_production_spec,
     )
@@ -477,14 +697,52 @@ def test_formal_galaxy_production_spec_freezes_delivery_and_sd20_policy() -> Non
     assert spec.artifacts.background_output_policy.value == "expectation"
     assert spec.sky.subtract_nonstellar_mean is False
     assert spec.detector.pixel_scale.to_value("arcsec / pix") == 4.83
-    assert spec.detector_response.enable_inter_pixel_response is False
-    assert spec.detector_response.enable_intra_pixel_response is False
-    assert spec.detector_response.enable_pixel_phase_response is False
+    assert spec.detector_response.enable_inter_pixel_response is True
+    assert spec.detector_response.inter_prv_rms.to_value("%") == 1.0
+    assert spec.detector_response.inter_prv_nominal.to_value("%") == 100.0
+    assert spec.detector_response.enable_intra_pixel_response is True
+    assert spec.detector_response.intra_prv_rms.to_value("%") == 1.0
+    assert spec.detector_response.enable_pixel_phase_response is True
+    assert spec.detector_response.pixel_response_profile_mod == "flux conserved"
+    assert spec.detector_response.pixel_phase_profile_path == (
+        "detector/pixel_response_profile_teff5500_feh-0.1_logg4.4_"
+        "pfc_v240423.npy"
+    )
     assert spec.detector_response.scripted_sensitivity_enabled is False
     assert spec.detector_response.whole_pixel_gain_normal_enabled is False
     assert spec.detector_response.whole_pixel_gain_sinusoidal_enabled is False
     assert spec.detector_response.enable_flat_field_correction is False
+    assert spec.readout.readout_noise.to_value("electron / pix") == 5.0
+    assert spec.readout.column_noise_sigma_adu.to_value("adu") == 0.0
     assert spec.rng.run_seed == 12345
+
+
+def test_galaxy_production_config_defaults_to_approved_compact_stamp(tmp_path) -> None:
+    from et_mainsim.galaxy_stamp_production import GalaxyStampProductionConfig
+
+    config = GalaxyStampProductionConfig(
+        input_fits=tmp_path / "galaxy.fits",
+        output_root=tmp_path / "results",
+        run_id="galaxy-compact-v1",
+        data_root=tmp_path / "photsim-data",
+        focalplane_registry=tmp_path / "focalplane",
+    )
+
+    assert config.stamp_shape == (27, 27)
+
+
+def test_galaxy_production_config_rejects_noncanonical_stamp_shape(tmp_path) -> None:
+    from et_mainsim.galaxy_stamp_production import GalaxyStampProductionConfig
+
+    with pytest.raises(ValueError, match="freezes stamp_shape at 27x27"):
+        GalaxyStampProductionConfig(
+            input_fits=tmp_path / "galaxy.fits",
+            output_root=tmp_path / "results",
+            run_id="galaxy-noncanonical-v1",
+            data_root=tmp_path / "photsim-data",
+            focalplane_registry=tmp_path / "focalplane",
+            stamp_shape=(21, 21),
+        )
 
 
 def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
@@ -726,6 +984,9 @@ def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
         "injected",
     ]
     assert render_calls[0]["source_variability"] is None
+    assert requests[0].manifest["stamp_centering_policy"] == (
+        "nearest_integer_np_rint"
+    )
     assert render_calls[1]["source_variability"].relative_flux.shape == (1, 3)
     assert render_calls[0]["rng_trace_scope"] == {
         "workflow": "galaxy-independent-stamp-production",
@@ -839,11 +1100,13 @@ def test_galaxy_worker_records_case_invariant_physical_rng_pairing(
     assert requests[3].manifest["physical_rng_pairing"][
         "canonical_context_scope"]["detector_id"] == "main_ld"
     assert requests[3].output_root == scratch_case_root
-    assert requests[3].manifest["galaxy_production_manifest"] == str(
+    assert requests[3].manifest["production_manifest"] == str(
         staged_manifest_path.resolve()
     )
     staged_identity = production.file_identity(staged_manifest_path)
-    assert requests[3].manifest["galaxy_production_manifest_identity"] == {
+    assert requests[3].manifest["production_manifest_identity"] == {
         "sha256": staged_identity["sha256"],
         "size_bytes": staged_identity["size_bytes"],
     }
+    assert "galaxy_production_manifest" not in requests[3].manifest
+    assert "galaxy_production_manifest_identity" not in requests[3].manifest

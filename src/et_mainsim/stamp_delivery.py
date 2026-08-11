@@ -34,9 +34,13 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 
-STAMP_DELIVERY_SCHEMA_ID = "et_mainsim.stamp_delivery_bundle.v1"
-STAMP_DELIVERY_SCHEMA_VERSION = 1
+STAMP_DELIVERY_SCHEMA_ID = "et_mainsim.stamp_delivery_bundle.v2"
+STAMP_DELIVERY_SCHEMA_VERSION = 2
 STAMP_DELIVERY_OBSERVATION_PRODUCT = "final_dn"
+STAMP_DELIVERY_CAPTURE_DENOMINATOR = "source_effective_photon_count_electron"
+STAMP_DELIVERY_CAPTURE_QA_DEFINITION = (
+    "no_detector_edge_or_requested_window_truncation"
+)
 
 DeliveryProductKind = Literal["raw", "coadd"]
 
@@ -49,6 +53,9 @@ _QUALITY_COUNT_NAMES = (
 _REQUIRED_DATASETS = (
     "final_dn",
     "background_expectation_e",
+    "captured_flux_fraction",
+    "captured_flux_denominator_e",
+    "captured_flux_qa_pass",
     "bias_level_sum_dn",
     "column_noise_sum_dn_by_x",
     "valid_mask",
@@ -66,7 +73,7 @@ _MAX_QUALITY_COUNT = int(np.iinfo(np.uint16).max)
 
 
 class StampDeliveryBundleContractError(ValueError):
-    """Raised when a formal stamp delivery bundle violates the v1 contract."""
+    """Raised when a formal stamp delivery bundle violates the v2 contract."""
 
 
 def _as_array(value: ArrayLike, *, name: str) -> NDArray[np.generic]:
@@ -170,6 +177,45 @@ def _as_frame_vector(
     if positive and np.any(array <= 0.0):
         raise StampDeliveryBundleContractError(f"{name} must be positive")
     return array
+
+
+def _as_captured_flux_fraction(
+    value: ArrayLike,
+    *,
+    n_frames: int,
+) -> NDArray[np.float64]:
+    array = _as_frame_vector(
+        value,
+        name="captured_flux_fraction",
+        n_frames=n_frames,
+    )
+    tolerance = 1.0e-6
+    if np.any(array < 0.0) or np.any(array > 1.0 + tolerance):
+        raise StampDeliveryBundleContractError(
+            "captured_flux_fraction must lie in [0, 1] within 1e-6 "
+            "numerical tolerance"
+        )
+    return array
+
+
+def _as_frame_binary_vector(
+    value: ArrayLike,
+    *,
+    name: str,
+    n_frames: int,
+) -> NDArray[np.bool_]:
+    array = _as_array(value, name=name)
+    if array.shape != (n_frames,):
+        raise StampDeliveryBundleContractError(
+            f"{name} must have shape ({n_frames},), got {array.shape}"
+        )
+    if array.dtype.kind not in {"b", "i", "u"} or not np.all(
+        (array == 0) | (array == 1)
+    ):
+        raise StampDeliveryBundleContractError(
+            f"{name} must contain only boolean/0/1 values"
+        )
+    return np.asarray(array, dtype=bool)
 
 
 def _as_frame_index_vector(
@@ -333,6 +379,21 @@ def _as_schema_version(value: Any) -> int:
     return int(value)
 
 
+def _validate_capture_semantics(handle: Any) -> None:
+    if _attr(handle, "captured_flux_fraction_denominator") != (
+        STAMP_DELIVERY_CAPTURE_DENOMINATOR
+    ):
+        raise StampDeliveryBundleContractError(
+            "captured_flux_fraction_denominator has unsupported semantics"
+        )
+    if _attr(handle, "captured_flux_qa_definition") != (
+        STAMP_DELIVERY_CAPTURE_QA_DEFINITION
+    ):
+        raise StampDeliveryBundleContractError(
+            "captured_flux_qa_definition has unsupported semantics"
+        )
+
+
 @dataclass(frozen=True)
 class StampDeliveryBundle:
     """One validated raw or coadd target-time-shard delivery product.
@@ -347,6 +408,9 @@ class StampDeliveryBundle:
     coadd_factor: int
     final_dn: NDArray[np.unsignedinteger]
     background_expectation_e: NDArray[np.float64]
+    captured_flux_fraction: NDArray[np.float64]
+    captured_flux_denominator_e: NDArray[np.float64]
+    captured_flux_qa_pass: NDArray[np.bool_]
     bias_level_sum_dn: NDArray[np.float64]
     column_noise_sum_dn_by_x: NDArray[np.float64]
     valid_mask: NDArray[np.bool_]
@@ -370,6 +434,9 @@ class StampDeliveryBundle:
         coadd_factor: int,
         final_dn: ArrayLike,
         background_expectation_e: ArrayLike,
+        captured_flux_fraction: ArrayLike,
+        captured_flux_denominator_e: ArrayLike,
+        captured_flux_qa_pass: ArrayLike,
         bias_level_sum_dn: ArrayLike,
         column_noise_sum_dn_by_x: ArrayLike,
         valid_mask: ArrayLike,
@@ -480,6 +547,21 @@ class StampDeliveryBundle:
             coadd_factor=factor,
             final_dn=final,
             background_expectation_e=background,
+            captured_flux_fraction=_as_captured_flux_fraction(
+                captured_flux_fraction,
+                n_frames=n_frames,
+            ),
+            captured_flux_denominator_e=_as_frame_vector(
+                captured_flux_denominator_e,
+                name="captured_flux_denominator_e",
+                n_frames=n_frames,
+                positive=True,
+            ),
+            captured_flux_qa_pass=_as_frame_binary_vector(
+                captured_flux_qa_pass,
+                name="captured_flux_qa_pass",
+                n_frames=n_frames,
+            ),
             bias_level_sum_dn=bias,
             column_noise_sum_dn_by_x=column,
             valid_mask=_as_binary_mask(valid_mask, name="valid_mask", shape=shape),
@@ -608,12 +690,33 @@ def _write_bundle_file(path: Path, bundle: StampDeliveryBundle) -> None:
         handle.attrs["coadd_factor"] = bundle.coadd_factor
         handle.attrs["observation_product"] = STAMP_DELIVERY_OBSERVATION_PRODUCT
         handle.attrs["background_realization_used"] = False
+        handle.attrs["captured_flux_fraction_denominator"] = (
+            STAMP_DELIVERY_CAPTURE_DENOMINATOR
+        )
+        handle.attrs["captured_flux_qa_definition"] = (
+            STAMP_DELIVERY_CAPTURE_QA_DEFINITION
+        )
 
         _write_dataset(handle, "final_dn", bundle.final_dn)
         _write_dataset(
             handle,
             "background_expectation_e",
             bundle.background_expectation_e,
+        )
+        _write_dataset(
+            handle,
+            "captured_flux_fraction",
+            bundle.captured_flux_fraction,
+        )
+        _write_dataset(
+            handle,
+            "captured_flux_denominator_e",
+            bundle.captured_flux_denominator_e,
+        )
+        _write_dataset(
+            handle,
+            "captured_flux_qa_pass",
+            bundle.captured_flux_qa_pass.astype(np.uint8, copy=False),
         )
         _write_dataset(handle, "bias_level_sum_dn", bundle.bias_level_sum_dn)
         _write_dataset(
@@ -1005,6 +1108,12 @@ class StampDeliveryBundleAppender:
             self._handle.attrs["coadd_factor"] = self._coadd_factor
             self._handle.attrs["observation_product"] = STAMP_DELIVERY_OBSERVATION_PRODUCT
             self._handle.attrs["background_realization_used"] = False
+            self._handle.attrs["captured_flux_fraction_denominator"] = (
+                STAMP_DELIVERY_CAPTURE_DENOMINATOR
+            )
+            self._handle.attrs["captured_flux_qa_definition"] = (
+                STAMP_DELIVERY_CAPTURE_QA_DEFINITION
+            )
             if self._gain_e_per_dn.shape == ():
                 self._handle.attrs["gain_e_per_dn"] = float(self._gain_e_per_dn)
             else:
@@ -1047,6 +1156,9 @@ class StampDeliveryBundleAppender:
         for name, tail_shape, dtype in (
             ("final_dn", (ny, nx), bundle.final_dn.dtype),
             ("background_expectation_e", (ny, nx), np.dtype(np.float64)),
+            ("captured_flux_fraction", (), np.dtype(np.float64)),
+            ("captured_flux_denominator_e", (), np.dtype(np.float64)),
+            ("captured_flux_qa_pass", (), np.dtype(np.uint8)),
             ("bias_level_sum_dn", (), np.dtype(np.float64)),
             ("column_noise_sum_dn_by_x", (nx,), np.dtype(np.float64)),
             ("valid_mask", (ny, nx), np.dtype(np.uint8)),
@@ -1129,6 +1241,15 @@ class StampDeliveryBundleAppender:
         payloads: tuple[tuple[str, NDArray[np.generic]], ...] = (
             ("final_dn", bundle.final_dn),
             ("background_expectation_e", bundle.background_expectation_e),
+            ("captured_flux_fraction", bundle.captured_flux_fraction),
+            (
+                "captured_flux_denominator_e",
+                bundle.captured_flux_denominator_e,
+            ),
+            (
+                "captured_flux_qa_pass",
+                bundle.captured_flux_qa_pass.astype(np.uint8, copy=False),
+            ),
             ("bias_level_sum_dn", bundle.bias_level_sum_dn),
             ("column_noise_sum_dn_by_x", bundle.column_noise_sum_dn_by_x),
             ("valid_mask", bundle.valid_mask.astype(np.uint8, copy=False)),
@@ -1308,6 +1429,7 @@ def read_stamp_delivery_bundle(path: Path | str) -> StampDeliveryBundle:
             raise StampDeliveryBundleContractError(
                 "delivery root background_realization_used must be false"
             )
+        _validate_capture_semantics(handle)
 
         for name in _REQUIRED_DATASETS:
             if name not in handle:
@@ -1334,6 +1456,18 @@ def read_stamp_delivery_bundle(path: Path | str) -> StampDeliveryBundle:
             background_expectation_e=_required_dataset(
                 handle,
                 "background_expectation_e",
+            ),
+            captured_flux_fraction=_required_dataset(
+                handle,
+                "captured_flux_fraction",
+            ),
+            captured_flux_denominator_e=_required_dataset(
+                handle,
+                "captured_flux_denominator_e",
+            ),
+            captured_flux_qa_pass=_required_dataset(
+                handle,
+                "captured_flux_qa_pass",
             ),
             bias_level_sum_dn=_required_dataset(handle, "bias_level_sum_dn"),
             column_noise_sum_dn_by_x=_required_dataset(
@@ -1464,6 +1598,7 @@ def _stream_validate_stamp_delivery_bundle(
             raise StampDeliveryBundleContractError(
                 "delivery root background_realization_used must be false"
             )
+        _validate_capture_semantics(handle)
 
         for name in _REQUIRED_DATASETS:
             if name not in handle:
@@ -1517,6 +1652,15 @@ def _stream_validate_stamp_delivery_bundle(
                 final_dn=np.asarray(final_dataset[frame_slice]),
                 background_expectation_e=np.asarray(
                     handle["background_expectation_e"][frame_slice]
+                ),
+                captured_flux_fraction=np.asarray(
+                    handle["captured_flux_fraction"][frame_slice]
+                ),
+                captured_flux_denominator_e=np.asarray(
+                    handle["captured_flux_denominator_e"][frame_slice]
+                ),
+                captured_flux_qa_pass=np.asarray(
+                    handle["captured_flux_qa_pass"][frame_slice]
                 ),
                 bias_level_sum_dn=np.asarray(
                     handle["bias_level_sum_dn"][frame_slice]
@@ -1604,6 +1748,8 @@ def validate_stamp_delivery_bundle(path: Path | str) -> StampDeliveryBundleValid
 
 
 __all__ = [
+    "STAMP_DELIVERY_CAPTURE_DENOMINATOR",
+    "STAMP_DELIVERY_CAPTURE_QA_DEFINITION",
     "STAMP_DELIVERY_OBSERVATION_PRODUCT",
     "STAMP_DELIVERY_SCHEMA_ID",
     "STAMP_DELIVERY_SCHEMA_VERSION",

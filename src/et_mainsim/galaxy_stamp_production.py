@@ -47,7 +47,7 @@ from .time_shards import (
 
 
 GALAXY_STAMP_PRODUCTION_SCHEMA_ID = "et_mainsim.galaxy_stamp_production.v1"
-GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION = 2
+GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION = 3
 DEFAULT_GALAXY_PRODUCTION_SOURCE_IDS = (
     2104827888243104128,
     2107035368292387840,
@@ -64,7 +64,19 @@ DEFAULT_RAW_EXPOSURE_SECONDS = 10.0
 DEFAULT_DURATION_DAYS = 90.0
 DEFAULT_CADENCE_SECONDS = (30.0, 60.0, 120.0, 300.0)
 DEFAULT_MAX_RAW_FRAMES_PER_SHARD = 8_640  # one day at 10 s
-DEFAULT_STAMP_SHAPE = (100, 300)
+DEFAULT_STAMP_SHAPE = (27, 27)
+FORMAL_STAMP_CENTERING_POLICY = "nearest_integer_np_rint"
+FORMAL_INTER_PRV_RMS_PERCENT = 1.0
+FORMAL_INTRA_PRV_RMS_PERCENT = 1.0
+FORMAL_READOUT_NOISE_E_PER_PIXEL = 5.0
+FORMAL_COLUMN_NOISE_SIGMA_ADU = 0.0
+FORMAL_PIXEL_PHASE_PROFILE_PATH = (
+    "detector/pixel_response_profile_teff5500_feh-0.1_logg4.4_"
+    "pfc_v240423.npy"
+)
+FORMAL_PIXEL_PHASE_PROFILE_SHA256 = (
+    "6d3339298b9876a1e8e1afd36f606dc4d31fd5eab5054710d4de81c6d3f271bd"
+)
 
 ProductionCase = Literal["static", "injected"]
 DeliveryExecutionMode = Literal[
@@ -98,23 +110,29 @@ def _normalise_delivery_execution_mode(value: object) -> DeliveryExecutionMode:
 def delivery_execution_mode_from_manifest(
     manifest: Mapping[str, Any],
 ) -> DeliveryExecutionMode:
-    """Read the frozen writer mode with v2 direct-mode compatibility.
+    """Read the frozen writer mode with legacy task-list compatibility.
 
     Historical v2 manifests predate writer-mode freezing and were all rendered
-    directly to their formal shared filesystem roots. They therefore retain
-    that exact interpretation, while every newly prepared manifest writes an
-    explicit mode.
+    directly to their formal shared filesystem roots. Read-only task-list
+    publication retains that exact interpretation, while the production worker
+    rejects v2 manifests and every v3 preparation writes an explicit mode.
     """
 
     delivery = manifest.get("delivery")
     if not isinstance(delivery, Mapping):
         raise ValueError("production manifest delivery must be an object")
-    return _normalise_delivery_execution_mode(
-        delivery.get(
-            "execution_mode",
-            DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE,
+    if "execution_mode" not in delivery:
+        schema_version = manifest.get("schema_version")
+        if (
+            manifest.get("schema_id") == GALAXY_STAMP_PRODUCTION_SCHEMA_ID
+            and type(schema_version) is int
+            and schema_version == 2
+        ):
+            return DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE
+        raise ValueError(
+            "delivery.execution_mode is required for non-v2 production manifests"
         )
-    )
+    return _normalise_delivery_execution_mode(delivery["execution_mode"])
 
 
 def _strict_source_id(value: Any, *, name: str) -> int:
@@ -316,6 +334,99 @@ def _file_content_identity(path: Path | str) -> dict[str, Any]:
     }
 
 
+def _formal_pixel_phase_profile_asset_identity(
+    data_root: Path | str,
+) -> dict[str, Any]:
+    """Return the portable identity of the approved pixel-phase profile.
+
+    The profile path is a Photsim7 data-root-relative contract.  Resolving it
+    below the selected data root prevents an absolute path, ``..`` segment, or
+    escaping symlink from silently selecting a different detector asset.
+    """
+
+    root = Path(data_root).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Photsim7 data root does not exist: {root}")
+    relative = Path(FORMAL_PIXEL_PHASE_PROFILE_PATH)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("formal pixel-phase profile path must be data-root-relative")
+    profile_path = (root / relative).resolve()
+    try:
+        profile_path.relative_to(root)
+    except ValueError as error:
+        raise ValueError("formal pixel-phase profile path escapes the data root") from error
+    if not profile_path.is_file():
+        raise FileNotFoundError(
+            f"formal pixel-phase profile does not exist: {profile_path}"
+        )
+    identity = _file_content_identity(profile_path)
+    if identity["sha256"] != FORMAL_PIXEL_PHASE_PROFILE_SHA256:
+        raise ValueError(
+            "formal pixel-phase profile identity differs from the approved SHA-256"
+        )
+    return {
+        "relative_path": FORMAL_PIXEL_PHASE_PROFILE_PATH,
+        "file_identity": identity,
+    }
+
+
+def _require_formal_pixel_phase_profile_contract(
+    manifest: Mapping[str, Any],
+    *,
+    data_root: Path | str,
+) -> dict[str, Any]:
+    """Fail closed unless spec, manifest, and runtime profile identities agree."""
+
+    spec = manifest.get("simulation_spec_base")
+    if (
+        not isinstance(spec, Mapping)
+        or manifest.get("simulation_spec_base_sha256")
+        != _canonical_json_sha256(spec)
+    ):
+        raise ValueError("production simulation spec identity changed")
+    response = spec.get("detector_response")
+    if not isinstance(response, Mapping):
+        raise ValueError("production simulation spec lacks detector_response")
+    if response.get("enable_pixel_phase_response") is not True:
+        raise ValueError("production pixel-phase response must remain enabled")
+    if response.get("pixel_phase_profile_path") != FORMAL_PIXEL_PHASE_PROFILE_PATH:
+        raise ValueError("production pixel-phase profile path changed")
+
+    assets = manifest.get("immutable_assets")
+    if not isinstance(assets, Mapping):
+        raise ValueError("production manifest lacks immutable_assets")
+    profile_record = assets.get("pixel_phase_profile")
+    if not isinstance(profile_record, Mapping):
+        raise ValueError("production manifest lacks pixel-phase profile identity")
+    if profile_record.get("relative_path") != FORMAL_PIXEL_PHASE_PROFILE_PATH:
+        raise ValueError("production manifest pixel-phase profile path changed")
+    expected_identity = profile_record.get("file_identity")
+    if (
+        not isinstance(expected_identity, Mapping)
+        or expected_identity.get("sha256") != FORMAL_PIXEL_PHASE_PROFILE_SHA256
+    ):
+        raise ValueError("production manifest pixel-phase profile identity changed")
+    try:
+        expected_size = int(expected_identity.get("size_bytes", 0))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "production manifest pixel-phase profile identity changed"
+        ) from error
+    if isinstance(expected_identity.get("size_bytes"), bool) or expected_size <= 0:
+        raise ValueError("production manifest pixel-phase profile identity changed")
+
+    try:
+        runtime_record = _formal_pixel_phase_profile_asset_identity(data_root)
+    except (FileNotFoundError, OSError, ValueError) as error:
+        raise ValueError("runtime pixel-phase profile identity changed") from error
+    if not _same_file_content_identity(
+        runtime_record["file_identity"],
+        expected_identity,
+    ):
+        raise ValueError("runtime pixel-phase profile identity changed")
+    return runtime_record
+
+
 def _registry_identity_without_local_locator(
     identity: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -415,7 +526,7 @@ def _resolve_manifest_resource(
 ) -> Path:
     """Resolve a prepared resource relative to the manifest's actual root.
 
-    Formal v2 manifests carry a relative path so a complete run root can move
+    Formal manifests carry a relative path so a complete run root can move
     from a workstation mount to H100 unchanged.  The absolute preparation path
     remains provenance only and is never a runtime fallback.  A relative path
     may never be absolute, contain ``..``, or escape the run root after symlink
@@ -427,7 +538,7 @@ def _resolve_manifest_resource(
     root = Path(run_root).expanduser().resolve()
     relative_path = record.get("relative_path")
     if not isinstance(relative_path, str) or not relative_path.strip():
-        raise ValueError(f"{label} requires relative_path in formal manifest v2")
+        raise ValueError(f"{label} requires relative_path in a formal manifest")
     relative = Path(relative_path)
     if relative.is_absolute():
         raise ValueError(f"{label} relative_path must be relative")
@@ -516,6 +627,8 @@ class GalaxyStampProductionConfig:
             raise ValueError("stamp_shape must contain two positive integers") from error
         if ny <= 0 or nx <= 0:
             raise ValueError("stamp_shape must contain two positive integers")
+        if (ny, nx) != DEFAULT_STAMP_SHAPE:
+            raise ValueError("formal Galaxy production freezes stamp_shape at 27x27")
         device = str(self.device).strip().lower()
         if device not in {"cpu", "cuda"}:
             raise ValueError("device must be 'cpu' or 'cuda'")
@@ -584,8 +697,8 @@ def build_galaxy_independent_production_spec(
     """Create the approved independent-stamp scientific configuration.
 
     The preset supplies the ET physical defaults and temperature-driven legacy
-    breathing.  This function freezes the SD-20 fail-closed detector-response
-    policy, the 10-s global time axis, and the SD-24 expectation companion.
+    breathing.  This function freezes the approved detector-response policy,
+    the 10-s global time axis, and the SD-24 expectation companion.
     """
 
     if isinstance(n_raw_frames, (bool, np.bool_)) or int(n_raw_frames) <= 0:
@@ -605,13 +718,28 @@ def build_galaxy_independent_production_spec(
     base = load_preset("et-stamp-production").simulation_spec
     response = replace(
         base.detector_response,
-        enable_inter_pixel_response=False,
-        enable_intra_pixel_response=False,
-        enable_pixel_phase_response=False,
+        enable_inter_pixel_response=True,
+        inter_prv_rms=FORMAL_INTER_PRV_RMS_PERCENT * u.percent,
+        inter_prv_nominal=100.0 * u.percent,
+        enable_intra_pixel_response=True,
+        intra_prv_rms=FORMAL_INTRA_PRV_RMS_PERCENT * u.percent,
+        enable_pixel_phase_response=True,
+        pixel_response_profile_mod="flux conserved",
+        pixel_phase_profile_path=FORMAL_PIXEL_PHASE_PROFILE_PATH,
         scripted_sensitivity_enabled=False,
         whole_pixel_gain_normal_enabled=False,
         whole_pixel_gain_sinusoidal_enabled=False,
         enable_flat_field_correction=False,
+    )
+    readout = replace(
+        base.readout,
+        readout_noise=(
+            FORMAL_READOUT_NOISE_E_PER_PIXEL * base.readout.readout_noise.unit
+        ),
+        column_noise_sigma_adu=(
+            FORMAL_COLUMN_NOISE_SIGMA_ADU
+            * base.readout.column_noise_sigma_adu.unit
+        ),
     )
     return replace(
         base,
@@ -624,6 +752,7 @@ def build_galaxy_independent_production_spec(
             frame_start_s=None,
         ),
         detector_response=response,
+        readout=readout,
         artifacts=replace(
             base.artifacts,
             background_output_policy=BackgroundOutputPolicy.EXPECTATION,
@@ -704,7 +833,7 @@ def _target_table_filename(detector_id: str) -> str:
 def prepare_galaxy_independent_production(
     config: GalaxyStampProductionConfig,
 ) -> GalaxyStampProductionPreparation:
-    """Freeze 90-day-ready Galaxy inputs and globally aligned shard plan.
+    """Freeze long-duration Galaxy inputs and a globally aligned shard plan.
 
     This performs no image rendering.  It deliberately writes the factor
     snapshots inside the output run root, so the formal worker never needs to
@@ -760,6 +889,9 @@ def prepare_galaxy_independent_production(
         )
         for source_id, curve in curves.items()
     }
+    pixel_phase_profile_identity = _formal_pixel_phase_profile_asset_identity(
+        config.data_root
+    )
 
     inputs_root = run_root / "inputs"
     factors_root = inputs_root / "galaxy_factor_snapshots"
@@ -866,6 +998,7 @@ def prepare_galaxy_independent_production(
         "delivery": {
             "execution_mode": config.delivery_execution_mode,
             "stamp_shape": list(config.stamp_shape),
+            "stamp_centering_policy": FORMAL_STAMP_CENTERING_POLICY,
             "raw_exposure_seconds": config.raw_exposure_seconds,
             "cadence_seconds": list(config.cadence_seconds),
             "coadd_sizes": list(config.coadd_sizes),
@@ -876,6 +1009,9 @@ def prepare_galaxy_independent_production(
         },
         "simulation_spec_base": spec_json,
         "simulation_spec_base_sha256": _canonical_json_sha256(spec_json),
+        "immutable_assets": {
+            "pixel_phase_profile": pixel_phase_profile_identity,
+        },
         "targets": records,
         "target_tables": table_identities,
         "software_provenance_at_prepare": collect_provenance(
@@ -897,7 +1033,16 @@ def _load_manifest(path: Path | str) -> tuple[Path, dict[str, Any]]:
         payload = json.load(handle)
     if payload.get("schema_id") != GALAXY_STAMP_PRODUCTION_SCHEMA_ID:
         raise ValueError("unsupported Galaxy stamp production manifest")
-    if int(payload.get("schema_version", 0)) != GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is int and schema_version == 2:
+        raise ValueError(
+            "legacy Galaxy stamp production manifest version 2 is unsupported; "
+            "prepare a v3 manifest"
+        )
+    if (
+        type(schema_version) is not int
+        or schema_version != GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION
+    ):
         raise ValueError("unsupported Galaxy stamp production manifest version")
     return manifest_path, payload
 
@@ -961,6 +1106,10 @@ def _runtime_paths(
         raise FileNotFoundError(
             f"focalplane registry does not exist: {resolved_registry}"
         )
+    _require_formal_pixel_phase_profile_contract(
+        payload,
+        data_root=resolved_data_root,
+    )
     input_payload = payload.get("input")
     if not isinstance(input_payload, Mapping):
         raise ValueError("production manifest input must be an object")
@@ -1276,12 +1425,11 @@ def run_galaxy_independent_target(
             manifest={
                 "run_id": str(manifest["run_id"]),
                 "case": case,
+                "stamp_centering_policy": FORMAL_STAMP_CENTERING_POLICY,
                 "rng_trace_scope": dict(rng_trace_scope),
                 "physical_rng_pairing": dict(physical_rng_pairing),
-                "galaxy_production_manifest": str(resolved_manifest_path),
-                "galaxy_production_manifest_identity": dict(
-                    production_manifest_identity
-                ),
+                "production_manifest": str(resolved_manifest_path),
+                "production_manifest_identity": dict(production_manifest_identity),
                 "target_input_truth": source_truth,
                 "simulation_spec_sha256": target_spec_sha256,
                 "renderer_options": renderer_options,
@@ -1330,6 +1478,13 @@ __all__ = [
     "DEFAULT_MAX_RAW_FRAMES_PER_SHARD",
     "DEFAULT_RAW_EXPOSURE_SECONDS",
     "DEFAULT_STAMP_SHAPE",
+    "FORMAL_COLUMN_NOISE_SIGMA_ADU",
+    "FORMAL_INTER_PRV_RMS_PERCENT",
+    "FORMAL_INTRA_PRV_RMS_PERCENT",
+    "FORMAL_PIXEL_PHASE_PROFILE_PATH",
+    "FORMAL_PIXEL_PHASE_PROFILE_SHA256",
+    "FORMAL_READOUT_NOISE_E_PER_PIXEL",
+    "FORMAL_STAMP_CENTERING_POLICY",
     "GALAXY_STAMP_PRODUCTION_SCHEMA_ID",
     "GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION",
     "GalaxyStampProductionConfig",

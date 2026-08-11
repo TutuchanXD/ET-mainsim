@@ -52,6 +52,9 @@ def _write_formal_raw_bundle(tmp_path, name: str, *, n_frames: int, start: int):
         coadd_factor=1,
         final_dn=np.full((n_frames, ny, nx), 16, dtype=np.uint16),
         background_expectation_e=np.full((n_frames, ny, nx), 2.0),
+        captured_flux_fraction=np.ones(n_frames),
+        captured_flux_denominator_e=np.full(n_frames, 1_000.0),
+        captured_flux_qa_pass=np.ones(n_frames, dtype=bool),
         bias_level_sum_dn=np.full(n_frames, 10.0),
         column_noise_sum_dn_by_x=np.zeros((n_frames, nx)),
         valid_mask=np.ones((n_frames, ny, nx), dtype=bool),
@@ -189,6 +192,9 @@ def test_reduce_stamp_delivery_bundle_reads_the_formal_delivery_schema(tmp_path)
         coadd_factor=1,
         final_dn=np.full((n_frames, ny, nx), 16, dtype=np.uint16),
         background_expectation_e=np.full((n_frames, ny, nx), 2.0),
+        captured_flux_fraction=np.ones(n_frames),
+        captured_flux_denominator_e=np.full(n_frames, 1_000.0),
+        captured_flux_qa_pass=np.ones(n_frames, dtype=bool),
         bias_level_sum_dn=np.full(n_frames, 10.0),
         column_noise_sum_dn_by_x=np.zeros((n_frames, nx)),
         valid_mask=np.ones((n_frames, ny, nx), dtype=bool),
@@ -217,6 +223,115 @@ def test_reduce_stamp_delivery_bundle_reads_the_formal_delivery_schema(tmp_path)
     assert result.product_semantics["observation_product"] == "final_dn"
 
 
+@pytest.mark.parametrize("failed_value", [False, 0], ids=["false", "zero"])
+@pytest.mark.parametrize("reduction_mode", ["bundle", "series"])
+def test_formal_reduction_rejects_failed_captured_flux_qa(
+    tmp_path,
+    failed_value: bool | int,
+    reduction_mode: str,
+) -> None:
+    from et_mainsim.reference_photometry import (
+        ReferencePhotometryContractError,
+        reduce_stamp_delivery_bundle_v1,
+        reduce_stamp_delivery_series_v1,
+    )
+
+    path = _write_formal_raw_bundle(
+        tmp_path,
+        f"failed_capture_qa_{reduction_mode}_{failed_value!r}.h5",
+        n_frames=2,
+        start=0,
+    )
+    with h5py.File(path, "r+") as handle:
+        handle["captured_flux_qa_pass"][1] = failed_value
+
+    with pytest.raises(
+        ReferencePhotometryContractError,
+        match="captured_flux_qa_pass must be true for every frame",
+    ):
+        if reduction_mode == "bundle":
+            reduce_stamp_delivery_bundle_v1(path)
+        else:
+            reduce_stamp_delivery_series_v1((path,), batch_frames=1)
+
+
+@pytest.mark.parametrize(
+    ("attribute", "invalid_value", "error_match"),
+    [
+        pytest.param(
+            "schema_version",
+            2.0,
+            "schema_version must be an integer root attribute",
+            id="float-schema-version",
+        ),
+        pytest.param(
+            "schema_version",
+            "2",
+            "schema_version must be an integer root attribute",
+            id="string-schema-version",
+        ),
+        pytest.param(
+            "complete",
+            "false",
+            "complete must be a boolean root attribute",
+            id="string-complete",
+        ),
+        pytest.param(
+            "complete",
+            1,
+            "complete must be a boolean root attribute",
+            id="integer-complete",
+        ),
+        pytest.param(
+            "background_realization_used",
+            0,
+            "background_realization_used must be a boolean root attribute",
+            id="integer-background-realization",
+        ),
+        pytest.param(
+            "coadd_factor",
+            1.0,
+            "coadd_factor must be an integer root attribute",
+            id="float-coadd-factor",
+        ),
+        pytest.param(
+            "coadd_factor",
+            "1",
+            "coadd_factor must be an integer root attribute",
+            id="string-coadd-factor",
+        ),
+        pytest.param(
+            "coadd_factor",
+            True,
+            "coadd_factor must be an integer root attribute",
+            id="boolean-coadd-factor",
+        ),
+    ],
+)
+def test_streaming_formal_header_rejects_coerced_root_attributes(
+    tmp_path,
+    attribute: str,
+    invalid_value: object,
+    error_match: str,
+) -> None:
+    from et_mainsim.reference_photometry import (
+        ReferencePhotometryContractError,
+        reduce_stamp_delivery_series_v1,
+    )
+
+    path = _write_formal_raw_bundle(
+        tmp_path,
+        f"invalid_{attribute}.h5",
+        n_frames=2,
+        start=0,
+    )
+    with h5py.File(path, "r+") as handle:
+        handle.attrs[attribute] = invalid_value
+
+    with pytest.raises(ReferencePhotometryContractError, match=error_match):
+        reduce_stamp_delivery_series_v1((path,), batch_frames=1)
+
+
 def test_reduce_stamp_delivery_series_streams_contiguous_shards(tmp_path) -> None:
     from et_mainsim.reference_photometry import reduce_stamp_delivery_series_v1
     from et_mainsim.stamp_delivery import (
@@ -234,6 +349,9 @@ def test_reduce_stamp_delivery_series_streams_contiguous_shards(tmp_path) -> Non
                 [np.full((ny, nx), value, dtype=np.uint16) for value in values]
             ),
             background_expectation_e=np.full((n_frames, ny, nx), 2.0),
+            captured_flux_fraction=np.ones(n_frames),
+            captured_flux_denominator_e=np.full(n_frames, 1_000.0),
+            captured_flux_qa_pass=np.ones(n_frames, dtype=bool),
             bias_level_sum_dn=np.full(n_frames, 10.0),
             column_noise_sum_dn_by_x=np.zeros((n_frames, nx)),
             valid_mask=np.ones((n_frames, ny, nx), dtype=bool),
@@ -598,6 +716,9 @@ def test_reduce_stamp_delivery_series_rejects_a_gap_between_shards(tmp_path) -> 
             coadd_factor=1,
             final_dn=np.full(shape, 16, dtype=np.uint16),
             background_expectation_e=np.full(shape, 2.0),
+            captured_flux_fraction=np.ones(shape[0]),
+            captured_flux_denominator_e=np.full(shape[0], 1_000.0),
+            captured_flux_qa_pass=np.ones(shape[0], dtype=bool),
             bias_level_sum_dn=np.array([10.0]),
             column_noise_sum_dn_by_x=np.zeros((1, 15)),
             valid_mask=np.ones(shape, dtype=bool),
@@ -705,6 +826,9 @@ def test_reduce_stamp_delivery_series_streams_per_frame_gain_maps(tmp_path) -> N
             coadd_factor=1,
             final_dn=final,
             background_expectation_e=np.full((n_frames, ny, nx), 2.0),
+            captured_flux_fraction=np.ones(n_frames),
+            captured_flux_denominator_e=np.full(n_frames, 1_000.0),
+            captured_flux_qa_pass=np.ones(n_frames, dtype=bool),
             bias_level_sum_dn=np.full(n_frames, 10.0),
             column_noise_sum_dn_by_x=np.zeros((n_frames, nx)),
             valid_mask=np.ones((n_frames, ny, nx), dtype=bool),

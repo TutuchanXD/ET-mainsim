@@ -32,7 +32,7 @@ NOTEBOOK_REPORT_ASSETS_SCHEMA_ID = "et_mainsim.executed_notebook_report_assets.v
 NOTEBOOK_REPORT_ASSETS_SCHEMA_VERSION = 1
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _GALAXY_MANIFEST_SCHEMA_ID = "et_mainsim.galaxy_stamp_production.v1"
-_GALAXY_MANIFEST_SCHEMA_VERSION = 2
+_FORMAL_GALAXY_MANIFEST_SCHEMA_VERSIONS = frozenset({2, 3})
 _GALAXY_CAMPAIGN_QC_SCHEMA_ID = "et_mainsim.galaxy_campaign_delivery_qc.v1"
 _GALAXY_CAMPAIGN_QC_SCHEMA_VERSION = 1
 _GALAXY_PROVENANCE_AUDIT_SCHEMA_ID = (
@@ -363,11 +363,12 @@ def _manifest_contract(manifest_path: Path) -> tuple[Mapping[str, Any], str]:
 
 
 def _is_formal_galaxy_manifest(manifest: Mapping[str, Any]) -> bool:
-    """Return whether the manifest is the v2 formal Galaxy delivery contract."""
+    """Return whether the manifest is a supported formal Galaxy delivery."""
 
     return (
         manifest.get("schema_id") == _GALAXY_MANIFEST_SCHEMA_ID
-        and manifest.get("schema_version") == _GALAXY_MANIFEST_SCHEMA_VERSION
+        and manifest.get("schema_version")
+        in _FORMAL_GALAXY_MANIFEST_SCHEMA_VERSIONS
         and manifest.get("observation_product") == "final_dn"
     )
 
@@ -840,7 +841,8 @@ def validate_galaxy_notebook_readiness_v1(
     QC, and all-HDF5 provenance/PSF audit by their content identities.  An
     optional campaign summary is independently bound to its frozen coverage
     policy.  It accepts only the formal ten-source injected ``final_dn``
-    delivery, never a partial, raw-electron, or legacy-PCA/SG substitute.
+    delivery under the retained v2 or current v3 production contract, never a
+    partial, raw-electron, or legacy-PCA/SG substitute.
     """
 
     if not isinstance(request, GalaxyNotebookReadinessRequest):
@@ -863,7 +865,7 @@ def validate_galaxy_notebook_readiness_v1(
         raise NotebookReportAssetError("production manifest has an unsupported schema")
     if _integer(
         manifest.get("schema_version"), label="production manifest schema_version", minimum=1
-    ) != _GALAXY_MANIFEST_SCHEMA_VERSION:
+    ) not in _FORMAL_GALAXY_MANIFEST_SCHEMA_VERSIONS:
         raise NotebookReportAssetError("production manifest has an unsupported schema version")
     if manifest.get("observation_product") != "final_dn":
         raise NotebookReportAssetError("production manifest observation_product must be final_dn")
@@ -1183,7 +1185,7 @@ def export_executed_notebook_png_assets_v1(
     """Publish a non-Galaxy executed-notebook report asset bundle.
 
     The generic exporter intentionally remains available to existing report
-    workflows.  A formal Galaxy v2 delivery is different: its final figures
+    workflows.  A formal Galaxy v2 or v3 delivery is different: its final figures
     must be bound to the campaign QC and provenance receipts, so callers must
     use :func:`export_galaxy_pr_assets_v1` instead.
     """

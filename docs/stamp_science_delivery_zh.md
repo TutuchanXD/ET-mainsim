@@ -1,10 +1,13 @@
-# 独立 Stamp 科学交付包（v1）
+# 独立 Stamp 科学交付包（formal bundle schema v2）
 
-`et_mainsim.stamp_delivery_bundle.v1` 是独立目标、单一时间 shard 的正式
+`et_mainsim.stamp_delivery_bundle.v2` 是独立目标、单一时间 shard 的当前正式
 Stamp 科学交付基础格式。它解决的是“什么才是观测、如何保留可校准信息、
-如何避免半成品被误用”三个问题；它不改变 Photsim7 的物理渲染或随机数定义。
+如何避免半成品被误用”三个问题；它还保留每 cadence 的目标源
+PSF 截获比例及其 QA，使 `27×27` stamp 是否漏光可定量审计。它不改变
+Photsim7 的物理渲染或随机数定义。当前 writer、reader 和流式分析都对
+schema ID/version 失败关闭；新的正式生产不得写或假冒 v1 bundle。
 
-实现位于 `et_mainsim.stamp_delivery`，依赖 `h5py>=3.10`。当前 writer/read
+实现位于 `et_mainsim.stamp_delivery`，依赖 `h5py>=3.15,<4`。当前 writer/read
 API 为：
 
 ```python
@@ -58,7 +61,8 @@ with StampDeliveryBundleAppender(
 1. 在电子域校准 `final_dn`；
 2. 标记不能用于测光的像素/曝光；
 3. 保留绝对时间和原始帧范围；
-4. 追溯该文件来自哪个 run、目标、输入和科学配置。
+4. 保留目标源在请求窗口内的 PSF 截获比例与截断 QA；
+5. 追溯该文件来自哪个 run、目标、输入和科学配置。
 
 对每个输出平面，推荐的电子域校准为：
 
@@ -69,9 +73,46 @@ E_bgsub = E_cal - background_expectation_e
 ```
 
 其中 `background_expectation_e` 是背景的**期望值**，不是本次随机实现的背景
-realization。不得从 `final_dn` 中扣除任何 background-realization image；那会把
-真实观测中应保留的泊松涨落错误删除。v1 bundle 不写出这种 realization 平面，
-且 `provenance.background_realization_used` 必须为 `false`。
+realization。它是正式公共测光后端的默认本底，也是科学团队从交付包自行重做
+电子域图像与孔径测光时的标准输入。不得从 `final_dn` 中扣除任何
+background-realization image；那会把真实观测中应保留的泊松涨落错误删除。
+v2 bundle 不写出这种 realization 平面；HDF5 根属性
+`background_realization_used` 与 `provenance.background_realization_used`
+必须同时为 `false`。
+
+`27×27` 交付不需要额外凑出 1024 个 stamp-local 背景像素。局部背景是
+`delivered_expectation_plus_local_diagnostic` 模式下的**可选诊断量**，不是默认减本底
+通道，也不是第二幅观测。正式默认
+`delivered_expectation_only` 不构建局部背景 mask，因此不受
+`minimum_background_pixels=1024` 的历史诊断参数限制。
+
+## PSF 截获比例与发布 gate
+
+v2 对每个输出 cadence 必须保留三个量：
+
+- `captured_flux_fraction`：目标源在 `requested_window_valid_detector` 中的 PSF
+  截获比例，取值范围为 `[0,1]`（允许 `1e-6` 数值容差）；
+- `captured_flux_denominator_e`：该比例的电子数分母，根属性
+  `captured_flux_fraction_denominator` 固定为
+  `source_effective_photon_count_electron`；
+- `captured_flux_qa_pass`：根属性 `captured_flux_qa_definition` 固定为
+  `no_detector_edge_or_requested_window_truncation`。只有 detector edge 和 requested
+  window 都未截断时才为真。
+
+raw cadence 直接记录 Photsim7 `psf_support_truth` 中的目标源真值。对由多个
+raw cadence 组成的 coadd，严格按分母加权：
+
+```text
+D_coadd = sum_i(D_i)
+f_coadd = sum_i(f_i * D_i) / D_coadd
+qa_coadd = all_i(qa_i)
+```
+
+其中 `D_i = source_effective_photon_count_electron`。该比例不对 crop 内 PSF 重归一，
+不为了让光通量看起来完整而修改 `final_dn`，也不默认对测光结果做
+`1 / captured_flux_fraction` 孔径修正。正式生产 worker 只要在任一 raw cadence 发现
+`captured_flux_qa_pass=false`，就终止该 target-time shard；不发布该 shard 的 raw/coadd
+产品集。
 
 ## 文件原子性与完成状态
 
@@ -95,13 +136,15 @@ mask 或不符合物理语义的 provenance 都会失败。正式生产不从 pa
 
 | 属性 | 类型 | 含义 |
 | --- | --- | --- |
-| `schema_id` | string | 固定为 `et_mainsim.stamp_delivery_bundle.v1` |
-| `schema_version` | int | 当前为 `1` |
+| `schema_id` | string | 固定为 `et_mainsim.stamp_delivery_bundle.v2` |
+| `schema_version` | int | 当前为 `2` |
 | `complete` | bool | 只有 `true` 才可交付 |
 | `product_kind` | string | `raw` 或 `coadd` |
 | `coadd_factor` | int | raw 为 `1`；coadd 为连续相加的原始 10 s 帧数，且大于 `1` |
 | `observation_product` | string | 固定为 `final_dn` |
 | `background_realization_used` | bool | 固定为 `false` |
+| `captured_flux_fraction_denominator` | string | 固定为 `source_effective_photon_count_electron` |
+| `captured_flux_qa_definition` | string | 固定为 `no_detector_edge_or_requested_window_truncation` |
 | `gain_e_per_dn` | float，可选 | 标量 gain；非标量 gain 改以同名 dataset 写入 |
 
 所有 image plane 的形状均为 `(n_frames, ny, nx)`；第 0 维是该 target-time
@@ -111,6 +154,9 @@ shard 内按时间递增的输出帧。`n_frames` 不得为 0。
 | --- | --- | --- | --- |
 | `final_dn` | 无符号 integer DN；coadd 强制 `uint64` | `(n, ny, nx)` | 唯一 detector observation。raw 保留 producer 的无符号 DN dtype；coadd 以 `uint64` 防溢出。 |
 | `background_expectation_e` | `float64`, e- | `(n, ny, nx)` | 该输出帧累积背景的期望电子数，非负。 |
+| `captured_flux_fraction` | `float64` | `(n,)` | 目标源在 requested window 与有效 detector 交集中的 PSF 截获比例；不做 post-crop renormalization。 |
+| `captured_flux_denominator_e` | `float64`, e- | `(n,)` | 比例的正分母；raw 为目标源 effective photon count，coadd 为所属 raw 分母之和。 |
+| `captured_flux_qa_pass` | `uint8`（0/1） | `(n,)` | raw 无 detector-edge/requested-window 截断时为 1；coadd 为所属 raw 的逻辑 AND。正式生产要求全为 1。 |
 | `bias_level_sum_dn` | `float64`, DN | `(n,)` | 该输出帧累积 bias level。 |
 | `column_noise_sum_dn_by_x` | `float64`, DN | `(n, nx)` | 每个输出帧、每一 stamp 列的累计有符号列噪声。按 x 广播至 y。 |
 | `gain_e_per_dn` | `float64`, e-/DN | scalar、`(ny,nx)` 或 `(n,ny,nx)` | 电子域校准所需 gain。标量写根属性，其他形状写 dataset。 |
@@ -143,6 +189,8 @@ time-shard planner 决定；本格式保留绝对 index，因此不同 shard 可
 `final_dn` coadd 只能是 raw `final_dn` 的 detector-domain 求和，故写入类型固定
 为 `uint64`。不能先把 read noise/cosmic/noise 过程折算成一张长曝光图再相加。
 同样，背景期望、bias、列噪声和各 quality count 都是对应 raw 过程的逐帧累积量。
+`captured_flux_denominator_e` 做和，`captured_flux_fraction` 按该分母加权，
+`captured_flux_qa_pass` 做逻辑 AND；不得对比例做简单算术平均。
 
 ## 与标准测光/CDPP 的衔接
 
@@ -168,21 +216,55 @@ adapter 会将 quality count 转为保守的 `saturated_mask` 与 `cosmic_mask`�
 `time_start_seconds` 作为 `time_index_unit="seconds"`。它不会暴露背景
 realization。后续 reference photometry 的固定口径、完整窗口 CDPP、以及任何
 科学团队自定义口径都应从 `final_dn` 和本合同中明确的校准/质量字段开始。
+adapter 不会用 `captured_flux_fraction` 对 crop 做后验重归一；该字段是漏光
+审计真值，而不是默认的孔径修正命令。
 
 对 Galaxy raw 10 s formal campaign，HDF5 delivery bundle 本身不等于已经放行的
 science light curve：还必须经 campaign QC、每源 `raw_10s_strict`、冻结 policy 的
 `raw_10s_coverage_v2` 与十源 summary。完整的用户交付和 CDPP 解释见
 [galaxy_raw_coverage_science_delivery_zh.md](galaxy_raw_coverage_science_delivery_zh.md)。
 
+## 公共最优孔径与分析交付产品
+
+`et_mainsim.stamp_science_analysis` 是 Galaxy、Aster、varlc 和 wdlc 的公共流式
+分析后端。它首先验证完整 v2 raw/coadd bundle 序列，从 raw 帧训练一个
+`science_optimal_aperture_v1`，并同时生成 `reference_fixed13_v1` 对照产品。
+最优孔径调用经过 legacy 验证的
+`photsim7.aperture.maximize_cumulative_snr`，训练会排除无效、饱和与 cosmic-ray
+像素，并要求 mask 包含目标信号峰值。注入与 static 配对的正式比较中，
+static 产品必须复用已发布的 injected 孔径，不得另行优化。
+
+每个孔径的原子发布目录包含：
+
+| 产品 | 作用 |
+| --- | --- |
+| `analysis_manifest.json` | 完成/ready 状态、输入哈希、分析合同与所有产品 identity |
+| `photometry.h5` | 权威测光产品；按 10/30/60/120/300 s 保留光变、质量、质心、不确定度、残差和 capture 真值 |
+| `photometry.ecsv` | 便携的多 cadence 测光表 |
+| `reference_lightcurve.ecsv` | 默认 expectation-background 光变、拟合源模型与残差 |
+| `centroid_quality.ecsv` | 质心、像素质量计数与 cadence quality bitmask |
+| `cdpp.json` / `cdpp.ecsv` | 完整物理时间窗口上的 CDPP 结果及可用 bin 计数 |
+| `aperture_definition.json` / `aperture_mask.npy` | 可审计、可直接复用的孔径定义与 mask |
+| `background_mask.npy` | 局部背景诊断 mask；默认 expectation-only 时为全零便携占位，不影响测光 |
+| `quality_summary.json` | 孔径、capture QA 和不确定度有效性汇总 |
+| `representative_calibrated_frames.h5` | 从 `final_dn` 派生的代表性电子域/减期望背景图像；不是第二个观测 |
+| `figures/*.png` | 光变、CDPP 和代表帧快看图 |
+
+顶层 `product_set_manifest.json` 将上述两个孔径产品作为一个原子发布集合绑定。
+科学团队可直接使用公布的最优孔径和光变曲线，也可从 v2 bundle 的
+`final_dn`、gain、bias/column companion、`background_expectation_e` 与质量 mask
+重做任意自定义孔径测光。
+
 ## 已接入的正式 production 层
 
 当前 `et_mainsim.independent_stamp_production` 已把 Photsim7 的单帧 stamp 输出
-映射到本合同，并由
-`et_mainsim.galaxy_stamp_production` 提供 Galaxy 独立目标的 prepare/worker 入口。
+映射到本合同，并由 `et_mainsim.galaxy_stamp_production` 提供 Galaxy、
+`et_mainsim.science_stamp_production` 提供 Aster/varlc/wdlc 独立目标的
+prepare/worker 入口。
 该 worker 的固定约束是：
 
 1. `final_dn` 来自已完成 legacy-aligned detector electronics 的同一 raw frame；
-2. 质量 count、bias、column noise 和背景期望来自完全相同的一组 raw frames；
+2. 质量 count、bias、column noise、背景期望和 PSF capture 真值来自完全相同的一组 raw frames；
 3. `manifest_json` 绑定 run ID、target ID、全局 raw-frame shard、输入 `q(t)`
    snapshot、科学配置、PSF/坐标解析与软件 provenance；
 4. 生产 manifest 使用相对资源路径和内容 SHA-256，使共享盘在工作站/H100 的
@@ -190,7 +272,9 @@ science light curve：还必须经 campaign QC、每源 `raw_10s_strict`、冻�
 5. target-time shard 不支持 resume。一个 shard 的 raw 与全部 coadd 成员必须完成
    合同验证后才可作为交付集合出现；partial 或成员不全的目录不可交付；
 6. 不会把 optional diagnostic 或 background image 标作第二个观测产品，或用它做
-   默认背景扣除。
+   默认背景扣除；
+7. 任一 raw 帧的 detector-edge/requested-window capture QA 失败时整个 shard
+   失败关闭，不发布 raw 或 coadd 半成品。
 
 Galaxy 的 paired `static`/`injected` control 必须审计真实物理 RNG，而不是
 `rng_trace_scope`。后者只是 `execution_context.labels`；它可包含 `case`，但不会进入
@@ -211,10 +295,19 @@ field。同 detector、同一绝对 frame 的目标使用共同的按绝对像�
 非重叠位置有不同坐标地址，重叠位置应相同。不同 detector 的 `detector_id` 属于物理
 scope，因而使用不同随机场；所有目标仍共享同一 campaign dynamics 和全局时间轴。
 
-历史 v1/v2 预检 bundle 未写入上述直接审计记录，但同源 static/injected 仍可依据
+历史 production-manifest v1/v2 预检产品未写入上述直接审计记录，但同源
+static/injected 仍可依据
 相同的真实 context scope、run seed、detector 与绝对 frame interval 确认物理配对；不能
 仅因旧 execution label 含 `case` 而将它们判为 unpaired noise。它们是否可用于科学交付
 仍由其它 production gate 决定。
 
-生产 writer 对格式、时间范围、质量 mask、完成状态与已声明语义失败关闭；它不会
-替科学团队猜测未冻结的波段转换、物理相位、最优 aperture 或场景邻星。
+历史 `et_mainsim.stamp_delivery_bundle.v1` 只保留为旧产品的审计/迁移语义。它没有
+`captured_flux_fraction`、`captured_flux_denominator_e` 和 `captured_flux_qa_pass`，
+因此不得重标为 v2，也不得作为本轮正式生产输入。当前 reader 会拒绝 v1
+schema；如确有历史结果需要处理，应使用与其当时 schema 配套的冻结读取环境，
+并生成明确的迁移产品；不得就地修改旧 HDF5。`reference_photometry_v1` 中的 `_v1`
+是**测光算法/API 版本**，不表示它仍接受 delivery bundle schema v1。
+
+生产 writer 对格式、时间范围、质量 mask、capture QA、完成状态与已声明语义
+失败关闭。它不会替科学团队猜测未冻结的波段转换、物理相位或场景邻星；
+但会按已冻结的公共后端交付参考 `13×13` 和 science-optimal 两套孔径产品。

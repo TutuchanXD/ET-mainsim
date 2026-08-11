@@ -21,6 +21,7 @@ def _write_formal_galaxy_run(
     *,
     case: str,
     write_delivery: bool = True,
+    schema_version: object = 3,
 ) -> Path:
     """Build a compact, two-shard Galaxy formal-delivery fixture.
 
@@ -35,7 +36,6 @@ def _write_formal_galaxy_run(
     )
     from et_mainsim.galaxy_stamp_production import (
         GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
-        GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
     )
     from et_mainsim.stamp_delivery import (
         StampDeliveryBundle,
@@ -78,7 +78,7 @@ def _write_formal_galaxy_run(
     manifest_path = run_root / "production_manifest.json"
     manifest = {
         "schema_id": GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
-        "schema_version": GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "run_id": RUN_ID,
         "run_root": str(run_root),
         "observation_product": "final_dn",
@@ -134,6 +134,9 @@ def _write_formal_galaxy_run(
             coadd_factor=3,
             final_dn=final_dn,
             background_expectation_e=np.zeros((n_cadence, 15, 15)),
+            captured_flux_fraction=np.ones(n_cadence),
+            captured_flux_denominator_e=np.full(n_cadence, 1_000.0),
+            captured_flux_qa_pass=np.ones(n_cadence, dtype=bool),
             bias_level_sum_dn=np.zeros(n_cadence),
             column_noise_sum_dn_by_x=np.zeros((n_cadence, 15)),
             valid_mask=valid_mask,
@@ -192,6 +195,67 @@ def _write_formal_galaxy_run(
         )
         write_stamp_delivery_bundle(destination, bundle)
     return manifest_path
+
+
+@pytest.mark.parametrize("schema_version", (2, 3))
+def test_standard_analysis_reader_accepts_supported_galaxy_manifest_versions(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    import et_mainsim.standard_stamp_analysis as analysis
+
+    manifest_path = _write_formal_galaxy_run(
+        tmp_path,
+        case="injected",
+        write_delivery=False,
+        schema_version=schema_version,
+    )
+
+    _, manifest = analysis._load_galaxy_manifest(manifest_path)
+
+    assert manifest["schema_version"] == schema_version
+
+
+@pytest.mark.parametrize("schema_version", (1, 4))
+def test_standard_analysis_reader_rejects_unsupported_galaxy_manifest_versions(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    import et_mainsim.standard_stamp_analysis as analysis
+
+    manifest_path = _write_formal_galaxy_run(
+        tmp_path,
+        case="injected",
+        write_delivery=False,
+        schema_version=schema_version,
+    )
+
+    with pytest.raises(
+        analysis.StandardStampAnalysisError,
+        match="unsupported Galaxy production manifest version",
+    ):
+        analysis._load_galaxy_manifest(manifest_path)
+
+
+@pytest.mark.parametrize("schema_version", (3.5, "3", True))
+def test_standard_analysis_reader_rejects_non_native_integer_manifest_versions(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    import et_mainsim.standard_stamp_analysis as analysis
+
+    manifest_path = _write_formal_galaxy_run(
+        tmp_path,
+        case="injected",
+        write_delivery=False,
+        schema_version=schema_version,
+    )
+
+    with pytest.raises(
+        analysis.StandardStampAnalysisError,
+        match="unsupported Galaxy production manifest version",
+    ):
+        analysis._load_galaxy_manifest(manifest_path)
 
 
 def test_standard_analysis_writes_formal_lightcurve_quality_and_residual(

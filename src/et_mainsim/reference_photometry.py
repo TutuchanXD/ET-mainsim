@@ -1051,6 +1051,16 @@ def reduce_reference_photometry_bundle_v1(
     )
 
 
+def _require_captured_flux_qa_pass(value: Any) -> None:
+    """Fail closed unless capture QA passes for every delivered frame."""
+
+    qa_pass = np.asarray(value)
+    if qa_pass.dtype.kind not in {"b", "i", "u"} or not np.all(qa_pass == 1):
+        raise ReferencePhotometryContractError(
+            "formal delivery captured_flux_qa_pass must be true for every frame"
+        )
+
+
 def reduce_stamp_delivery_bundle_v1(
     bundle_path: Path | str,
     *,
@@ -1068,6 +1078,7 @@ def reduce_stamp_delivery_bundle_v1(
     from .stamp_delivery import read_stamp_delivery_bundle
 
     bundle = read_stamp_delivery_bundle(bundle_path)
+    _require_captured_flux_qa_pass(bundle.captured_flux_qa_pass)
     delivery = ReferencePhotometryInput.from_arrays(
         **bundle.to_reference_photometry_payload()
     )
@@ -1141,6 +1152,9 @@ def _as_positive_formal_gain(
 _FORMAL_REQUIRED_DATASETS = (
     "final_dn",
     "background_expectation_e",
+    "captured_flux_fraction",
+    "captured_flux_denominator_e",
+    "captured_flux_qa_pass",
     "bias_level_sum_dn",
     "column_noise_sum_dn_by_x",
     "valid_mask",
@@ -1169,6 +1183,29 @@ def _h5_scalar_string(value: Any, *, name: str) -> str:
     if not isinstance(value, str):
         raise ReferencePhotometryContractError(f"{name} must be a UTF-8 string")
     return value
+
+
+def _h5_integer_attribute(value: Any, *, name: str) -> int:
+    """Read a writer-native integer root attribute without coercion."""
+
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value,
+        (int, np.integer),
+    ):
+        raise ReferencePhotometryContractError(
+            f"{name} must be an integer root attribute"
+        )
+    return int(value)
+
+
+def _h5_boolean_attribute(value: Any, *, name: str) -> bool:
+    """Read a writer-native boolean root attribute without truthiness."""
+
+    if not isinstance(value, (bool, np.bool_)):
+        raise ReferencePhotometryContractError(
+            f"{name} must be a boolean root attribute"
+        )
+    return bool(value)
 
 
 def _formal_json_dataset(handle: Any, name: str) -> dict[str, Any]:
@@ -1354,6 +1391,8 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
         raise RuntimeError("h5py is required to read formal stamp delivery bundles") from error
 
     from .stamp_delivery import (
+        STAMP_DELIVERY_CAPTURE_DENOMINATOR,
+        STAMP_DELIVERY_CAPTURE_QA_DEFINITION,
         STAMP_DELIVERY_OBSERVATION_PRODUCT,
         STAMP_DELIVERY_SCHEMA_ID,
         STAMP_DELIVERY_SCHEMA_VERSION,
@@ -1366,9 +1405,17 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
         schema_id = _h5_scalar_string(handle.attrs.get("schema_id"), name="schema_id")
         if schema_id != STAMP_DELIVERY_SCHEMA_ID:
             raise ReferencePhotometryContractError("unsupported formal delivery schema")
-        if int(handle.attrs.get("schema_version", -1)) != STAMP_DELIVERY_SCHEMA_VERSION:
+        schema_version = _h5_integer_attribute(
+            handle.attrs.get("schema_version"),
+            name="schema_version",
+        )
+        if schema_version != STAMP_DELIVERY_SCHEMA_VERSION:
             raise ReferencePhotometryContractError("unsupported formal delivery schema version")
-        if bool(handle.attrs.get("complete", False)) is not True:
+        complete = _h5_boolean_attribute(
+            handle.attrs.get("complete"),
+            name="complete",
+        )
+        if complete is not True:
             raise ReferencePhotometryContractError("formal delivery bundle is not complete")
         product_kind = _h5_scalar_string(
             handle.attrs.get("product_kind"),
@@ -1376,7 +1423,10 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
         )
         if product_kind not in {"raw", "coadd"}:
             raise ReferencePhotometryContractError("formal delivery product_kind is invalid")
-        coadd_factor = int(handle.attrs.get("coadd_factor", 0))
+        coadd_factor = _h5_integer_attribute(
+            handle.attrs.get("coadd_factor"),
+            name="coadd_factor",
+        )
         if coadd_factor <= 0 or (product_kind == "raw" and coadd_factor != 1):
             raise ReferencePhotometryContractError("formal delivery coadd_factor is invalid")
         if product_kind == "coadd" and coadd_factor <= 1:
@@ -1391,9 +1441,28 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
             raise ReferencePhotometryContractError(
                 "formal delivery observation_product must be final_dn"
             )
-        if bool(handle.attrs.get("background_realization_used", True)):
+        background_realization_used = _h5_boolean_attribute(
+            handle.attrs.get("background_realization_used"),
+            name="background_realization_used",
+        )
+        if background_realization_used:
             raise ReferencePhotometryContractError(
                 "formal delivery must not expose a background realization"
+            )
+        if (
+            _h5_scalar_string(
+                handle.attrs.get("captured_flux_fraction_denominator"),
+                name="captured_flux_fraction_denominator",
+            )
+            != STAMP_DELIVERY_CAPTURE_DENOMINATOR
+            or _h5_scalar_string(
+                handle.attrs.get("captured_flux_qa_definition"),
+                name="captured_flux_qa_definition",
+            )
+            != STAMP_DELIVERY_CAPTURE_QA_DEFINITION
+        ):
+            raise ReferencePhotometryContractError(
+                "formal delivery captured-flux semantics are unsupported"
             )
         missing = [name for name in _FORMAL_REQUIRED_DATASETS if name not in handle]
         if missing:
@@ -1410,6 +1479,9 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
         n_frames, ny, nx = (int(size) for size in final.shape)
         expected_shapes = {
             "background_expectation_e": (n_frames, ny, nx),
+            "captured_flux_fraction": (n_frames,),
+            "captured_flux_denominator_e": (n_frames,),
+            "captured_flux_qa_pass": (n_frames,),
             "valid_mask": (n_frames, ny, nx),
             "fullwell_count": (n_frames, ny, nx),
             "adc_low_count": (n_frames, ny, nx),
@@ -1429,6 +1501,7 @@ def _read_formal_delivery_header(path: Path | str) -> _FormalDeliveryHeader:
                 raise ReferencePhotometryContractError(
                     f"formal delivery {name} shape differs from final_dn"
                 )
+        _require_captured_flux_qa_pass(handle["captured_flux_qa_pass"][...])
         if "gain_e_per_dn" in handle and "gain_e_per_dn" in handle.attrs:
             raise ReferencePhotometryContractError(
                 "formal delivery gain_e_per_dn is stored twice"
@@ -1533,8 +1606,8 @@ def _formal_gain_crop(
 
     Scalar and static stamp-map gains were fully bounded and validated while
     parsing the header.  A formal per-frame gain cube is intentionally read
-    only for the current 13x13 crop, so a 90-day production reduction never
-    loads the full calibration cube into memory.
+    only for the current stamp crop, so a long-duration production reduction
+    never loads the full calibration cube into memory.
     """
 
     if header.gain_mode == "scalar":

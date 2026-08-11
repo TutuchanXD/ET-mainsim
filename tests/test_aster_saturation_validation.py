@@ -1,11 +1,35 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from astropy.table import Table
+
+
+def _write_formal_pixel_phase_profile(data_root, monkeypatch):
+    import et_mainsim.galaxy_stamp_production as common_production
+
+    profile = data_root / common_production.FORMAL_PIXEL_PHASE_PROFILE_PATH
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    payload = b"formal pixel-phase profile fixture\n"
+    profile.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setattr(
+        common_production,
+        "FORMAL_PIXEL_PHASE_PROFILE_SHA256",
+        digest,
+    )
+    return profile, {
+        "relative_path": common_production.FORMAL_PIXEL_PHASE_PROFILE_PATH,
+        "file_identity": {
+            "sha256": digest,
+            "size_bytes": len(payload),
+        },
+    }
 
 
 def _write_aster_inputs(tmp_path, *, n_frames: int = 60):
@@ -32,7 +56,10 @@ def _write_aster_inputs(tmp_path, *, n_frames: int = 60):
     return source_dat, source_log, variability
 
 
-def test_prepare_aster_g6_freezes_explicit_psf_inputs_and_time_plan(tmp_path) -> None:
+def test_prepare_aster_g6_freezes_explicit_psf_inputs_and_time_plan(
+    tmp_path,
+    monkeypatch,
+) -> None:
     from et_mainsim.aster_saturation_validation import (
         AsterG6SaturationValidationConfig,
         prepare_aster_g6_saturation_validation,
@@ -41,6 +68,7 @@ def test_prepare_aster_g6_freezes_explicit_psf_inputs_and_time_plan(tmp_path) ->
     source_dat, source_log, variability = _write_aster_inputs(tmp_path)
     data_root = tmp_path / "data"
     data_root.mkdir()
+    _, profile_record = _write_formal_pixel_phase_profile(data_root, monkeypatch)
     prepared = prepare_aster_g6_saturation_validation(
         AsterG6SaturationValidationConfig(
             source_dat=source_dat,
@@ -57,6 +85,8 @@ def test_prepare_aster_g6_freezes_explicit_psf_inputs_and_time_plan(tmp_path) ->
 
     manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
     assert manifest["schema_id"] == "et_mainsim.aster_g6_saturation_validation.v1"
+    assert manifest["schema_version"] == 2
+    assert manifest["immutable_assets"]["pixel_phase_profile"] == profile_record
     assert manifest["observation_product"] == "final_dn"
     assert manifest["scientific_scope"]["purpose"] == "saturation_response_validation"
     assert manifest["scientific_scope"]["not_precision_photometry"] is True
@@ -64,8 +94,29 @@ def test_prepare_aster_g6_freezes_explicit_psf_inputs_and_time_plan(tmp_path) ->
     assert manifest["target"]["psf_id"] == 6
     assert manifest["target"]["psf_node_angle_deg"] == 12.0
     assert manifest["target"]["coordinate_mode"] == "explicit_psf_no_sky_coordinate"
+    assert manifest["simulation_spec_base"]["dynamic_effects"]["dva"][
+        "enabled"
+    ] is False
     assert manifest["delivery"]["coadd_sizes"] == [3, 6, 12, 30]
+    assert manifest["delivery"]["stamp_shape"] == [27, 27]
+    assert manifest["delivery"]["stamp_centering_policy"] == (
+        "nearest_integer_np_rint"
+    )
     assert manifest["delivery"]["time_plan_relative_path"] == "inputs/time_shards.json"
+    detector_response = manifest["simulation_spec_base"]["detector_response"]
+    assert detector_response["enable_inter_pixel_response"] is True
+    assert detector_response["inter_prv_rms"] == {"value": 1.0, "unit": "%"}
+    assert detector_response["enable_intra_pixel_response"] is True
+    assert detector_response["intra_prv_rms"] == {"value": 1.0, "unit": "%"}
+    assert detector_response["enable_pixel_phase_response"] is True
+    assert detector_response["pixel_response_profile_mod"] == "flux conserved"
+    assert manifest["simulation_spec_base"]["readout"]["readout_noise"] == {
+        "value": 5.0,
+        "unit": "electron / pix",
+    }
+    assert manifest["simulation_spec_base"]["readout"][
+        "column_noise_sigma_adu"
+    ] == {"value": 0.0, "unit": "adu"}
     assert prepared.time_plan.accepted_raw_frame_count == 60
     assert len(prepared.time_plan.shards) == 1
 
@@ -135,6 +186,7 @@ def test_aster_g6_worker_uses_paired_rng_and_formal_delivery_contract(
     source_dat, source_log, variability = _write_aster_inputs(tmp_path)
     data_root = tmp_path / "data"
     data_root.mkdir()
+    _write_formal_pixel_phase_profile(data_root, monkeypatch)
     prepared = validation.prepare_aster_g6_saturation_validation(
         validation.AsterG6SaturationValidationConfig(
             source_dat=source_dat,
@@ -207,7 +259,11 @@ def test_aster_g6_worker_uses_paired_rng_and_formal_delivery_contract(
         9000000000000000622,
         9000000000000000622,
     ]
-    assert [request.stamp_shape for request in requests] == [(100, 300), (100, 300)]
+    assert [request.stamp_shape for request in requests] == [(27, 27), (27, 27)]
+    assert [request.manifest["stamp_centering_policy"] for request in requests] == [
+        "nearest_integer_np_rint",
+        "nearest_integer_np_rint",
+    ]
     assert [request.batch_size for request in requests] == [7, 7]
     assert requests[0].manifest["target_input_truth"]["variability"]["enabled"] is False
     assert requests[1].manifest["target_input_truth"]["variability"]["enabled"] is True
@@ -219,3 +275,105 @@ def test_aster_g6_worker_uses_paired_rng_and_formal_delivery_contract(
     assert render_calls[0]["rng_trace_scope"]["science_realization_id"] == (
         "aster-g6-psf6-paired-v1"
     )
+
+
+def test_aster_g6_runtime_contract_rejects_manifest_or_profile_drift(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.aster_saturation_validation as validation
+
+    source_dat, source_log, variability = _write_aster_inputs(tmp_path)
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    profile, _ = _write_formal_pixel_phase_profile(data_root, monkeypatch)
+    prepared = validation.prepare_aster_g6_saturation_validation(
+        validation.AsterG6SaturationValidationConfig(
+            source_dat=source_dat,
+            source_log=source_log,
+            variability_ecsv=variability,
+            output_root=tmp_path / "output",
+            run_id="aster-g6-runtime-contract",
+            data_root=data_root,
+            n_raw_frames=60,
+            max_raw_frames_per_shard=60,
+            device="cpu",
+        )
+    )
+    manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
+    validation._require_aster_g6_runtime_contract(manifest, data_root=data_root)
+
+    stale_centering = copy.deepcopy(manifest)
+    stale_centering["delivery"]["stamp_centering_policy"] = "floor"
+    with pytest.raises(ValueError, match="stamp centering"):
+        validation._require_aster_g6_runtime_contract(
+            stale_centering,
+            data_root=data_root,
+        )
+
+    prv_off = copy.deepcopy(manifest)
+    prv_off["simulation_spec_base"]["detector_response"][
+        "enable_inter_pixel_response"
+    ] = False
+    prv_off["simulation_spec_base_sha256"] = validation._canonical_json_sha256(
+        prv_off["simulation_spec_base"]
+    )
+    with pytest.raises(ValueError, match="detector response"):
+        validation._require_aster_g6_runtime_contract(prv_off, data_root=data_root)
+
+    dva_on = copy.deepcopy(manifest)
+    dva_on["simulation_spec_base"]["dynamic_effects"]["dva"]["enabled"] = True
+    dva_on["simulation_spec_base_sha256"] = validation._canonical_json_sha256(
+        dva_on["simulation_spec_base"]
+    )
+    with pytest.raises(ValueError, match="DVA"):
+        validation._require_aster_g6_runtime_contract(dva_on, data_root=data_root)
+
+    bad_hash = copy.deepcopy(manifest)
+    bad_hash["simulation_spec_base_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="simulation spec identity"):
+        validation._require_aster_g6_runtime_contract(bad_hash, data_root=data_root)
+
+    profile.write_bytes(profile.read_bytes() + b"drift")
+    with pytest.raises(ValueError, match="pixel-phase profile identity"):
+        validation._require_aster_g6_runtime_contract(manifest, data_root=data_root)
+
+
+def test_aster_manifest_loader_rejects_legacy_v1_schema_explicitly(tmp_path) -> None:
+    import et_mainsim.aster_saturation_validation as validation
+
+    manifest_path = tmp_path / "legacy-v1.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_id": validation.ASTER_G6_SATURATION_SCHEMA_ID,
+                "schema_version": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="legacy.*version 1.*unsupported.*v2"):
+        validation._load_manifest(manifest_path)
+
+
+@pytest.mark.parametrize("schema_version", (2.0, "2", True))
+def test_aster_manifest_loader_rejects_non_native_integer_v2_schema(
+    tmp_path,
+    schema_version,
+) -> None:
+    import et_mainsim.aster_saturation_validation as validation
+
+    manifest_path = tmp_path / "invalid-v2.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_id": validation.ASTER_G6_SATURATION_SCHEMA_ID,
+                "schema_version": schema_version,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported Aster.*version"):
+        validation._load_manifest(manifest_path)

@@ -22,6 +22,7 @@ def _write_fixture_run(tmp_path: Path) -> Path:
     """Create a compact, complete delivery with immutable header provenance."""
 
     from et_mainsim.galaxy_stamp_production import (
+        DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE,
         GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
         GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
     )
@@ -75,6 +76,7 @@ def _write_fixture_run(tmp_path: Path) -> Path:
         "observation_product": "final_dn",
         "background_realization_delivered": False,
         "delivery": {
+            "execution_mode": DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE,
             "stamp_shape": [3, 4],
             "raw_exposure_seconds": RAW_EXPOSURE_SECONDS,
             "cadence_seconds": [30.0],
@@ -155,6 +157,9 @@ def _write_fixture_run(tmp_path: Path) -> Path:
                         dtype=np.uint16 if factor == 1 else np.uint64,
                     ),
                     background_expectation_e=np.zeros((frame_count, 3, 4)),
+                    captured_flux_fraction=np.ones(frame_count),
+                    captured_flux_denominator_e=np.full(frame_count, 1_000.0),
+                    captured_flux_qa_pass=np.ones(frame_count, dtype=bool),
                     bias_level_sum_dn=np.zeros(frame_count),
                     column_noise_sum_dn_by_x=np.zeros((frame_count, 4)),
                     valid_mask=np.ones((frame_count, 3, 4), dtype=bool),

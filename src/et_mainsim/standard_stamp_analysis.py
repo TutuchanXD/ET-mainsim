@@ -1,7 +1,7 @@
 """Formal standard light-curve analysis for independent Galaxy stamp delivery.
 
 This module is deliberately a *post-processing* layer over
-``et_mainsim.stamp_delivery_bundle.v1``.  It never reads historical pickle
+``et_mainsim.stamp_delivery_bundle.v2``.  It never reads historical pickle
 products, calls legacy PCA/SG filtering, or manufactures a new observation:
 ``final_dn`` remains the only detector observation.  The derived light curve
 uses :mod:`et_mainsim.reference_photometry`, which streams the formal HDF5
@@ -34,7 +34,6 @@ import numpy as np
 from .galaxy_lightcurves import read_galaxy_factor_snapshot
 from .galaxy_stamp_production import (
     GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
-    GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
 )
 from .reference_photometry import (
     STANDARD_CDPP_WINDOWS_MINUTES,
@@ -56,6 +55,7 @@ STANDARD_STAMP_ANALYSIS_LIGHTCURVE_SCHEMA_ID = (
 _INCOMPLETE_ARCHIVE_SCHEMA_ID = (
     "et_mainsim.standard_stamp_analysis_incomplete_archive.v1"
 )
+_SUPPORTED_GALAXY_STAMP_PRODUCTION_SCHEMA_VERSIONS = frozenset({2, 3})
 
 AnalysisCase = Literal["static", "injected"]
 
@@ -265,7 +265,11 @@ def _load_galaxy_manifest(path: Path) -> tuple[Path, dict[str, Any]]:
             "standard_stamp_analysis_v1 currently requires a formal Galaxy "
             "production manifest"
         )
-    if int(manifest.get("schema_version", 0)) != GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION:
+    schema_version = manifest.get("schema_version")
+    if (
+        type(schema_version) is not int
+        or schema_version not in _SUPPORTED_GALAXY_STAMP_PRODUCTION_SCHEMA_VERSIONS
+    ):
         raise StandardStampAnalysisError(
             "unsupported Galaxy production manifest version"
         )

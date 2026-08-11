@@ -29,13 +29,13 @@
   "readout": {
     "enable_adc_digitization": true,
     "full_well_electrons": {"value": 90680.0, "unit": "electron"},
-    "readout_noise": {"value": 6.0, "unit": "electron / pix"},
+    "readout_noise": {"value": 5.0, "unit": "electron / pix"},
     "gain_electrons_per_adu": {"value": 1.4, "unit": "electron / adu"},
     "adc_bit_depth": 16,
     "adc_min_value": 0.0,
     "adc_round_values": true,
     "bias_level_adu": {"value": 3500.0, "unit": "adu"},
-    "column_noise_sigma_adu": {"value": 5.0, "unit": "adu"},
+    "column_noise_sigma_adu": {"value": 0.0, "unit": "adu"},
     "save_bias_metadata": true
   },
   "sky": {

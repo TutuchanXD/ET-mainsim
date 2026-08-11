@@ -62,13 +62,39 @@ assert 'ray' not in sys.modules
 def test_project_requires_shared_exposure_photsim7_release() -> None:
     payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "photsim7>=0.2.3,<0.3" in payload["project"]["dependencies"]
+    assert "photsim7>=0.2.5,<0.3" in payload["project"]["dependencies"]
+
+
+def test_photsim7_stamp_centering_matches_formal_nearest_integer_policy() -> None:
+    from photsim7.stamp_products import StampWindow
+
+    window = StampWindow.centered_on(
+        target_x_detector_pix=100.75,
+        target_y_detector_pix=200.60,
+        shape=(27, 27),
+        detector_shape=(9120, 8900),
+    )
+
+    assert window.x_start_detector_pix + 13 == 101
+    assert window.y_start_detector_pix + 13 == 201
 
 
 def test_project_requires_semantic_registry_identity_release() -> None:
     payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert "et-coord>=0.1.1,<0.2" in payload["project"]["dependencies"]
+
+
+def test_project_declares_matplotlib_for_formal_analysis_figures() -> None:
+    payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "matplotlib>=3.10,<4" in payload["project"]["dependencies"]
+
+
+def test_project_declares_torch_for_formal_analysis_apertures() -> None:
+    payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "torch>=2.7,<3" in payload["project"]["dependencies"]
 
 
 def test_required_photsim7_runtime_capabilities_are_importable() -> None:
@@ -117,6 +143,14 @@ def test_shipped_full_frame_presets_are_typed_and_complete() -> None:
 
     smoke = load_preset("et-full-frame-smoke")
     production = load_preset("et-full-frame-production")
+
+    for loaded in (smoke, production):
+        assert loaded.simulation_spec.readout.readout_noise.to_value(
+            "electron / pix"
+        ) == pytest.approx(5.0)
+        assert loaded.simulation_spec.readout.column_noise_sigma_adu.to_value(
+            "adu"
+        ) == pytest.approx(0.0)
 
     assert smoke.simulation_spec.detector.shape == (64, 64)
     assert smoke.simulation_spec.observation.resolved_n_frames == 1
