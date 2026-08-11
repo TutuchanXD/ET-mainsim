@@ -2289,6 +2289,349 @@ def test_public_readback_requires_native_hdf_boolean_analysis_attributes(
             validator(path)
 
 
+@pytest.mark.parametrize(
+    ("product_name", "tamper_mode"),
+    [
+        pytest.param(
+            "science_optimal_aperture_v1",
+            "missing_base_artifact",
+            id="science-missing-base",
+        ),
+        pytest.param(
+            "science_optimal_aperture_v1",
+            "extra_artifact",
+            id="science-extra",
+        ),
+        pytest.param(
+            "reference_fixed13_v1",
+            "forbidden_template",
+            id="reference-template",
+        ),
+        pytest.param(
+            "science_optimal_aperture_v1",
+            "signal_value",
+            id="signal-value",
+        ),
+        pytest.param(
+            "science_optimal_aperture_v1",
+            "noise_shape",
+            id="noise-shape",
+        ),
+    ],
+)
+def test_publication_requires_exact_product_artifacts_and_bound_templates(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    product_name: str,
+    tamper_mode: str,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "artifact-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_root = root / product_name
+    manifest_path = product_root / "analysis_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if tamper_mode == "missing_base_artifact":
+        manifest["artifacts"].pop("cdpp.ecsv")
+    elif tamper_mode == "extra_artifact":
+        artifact_path = product_root / "unexpected.txt"
+        artifact_path.write_text("unexpected\n", encoding="utf-8")
+        manifest["artifacts"][artifact_path.name] = backend._file_identity(
+            artifact_path
+        )
+    elif tamper_mode == "forbidden_template":
+        artifact_path = product_root / "signal_template_e.npy"
+        np.save(artifact_path, np.ones((21, 23)), allow_pickle=False)
+        manifest["artifacts"][artifact_path.name] = backend._file_identity(
+            artifact_path
+        )
+    else:
+        artifact_name = (
+            "signal_template_e.npy"
+            if tamper_mode == "signal_value"
+            else "noise_template_e.npy"
+        )
+        artifact_path = product_root / artifact_name
+        template = np.load(artifact_path, allow_pickle=False)
+        if tamper_mode == "signal_value":
+            template = np.array(template, copy=True)
+            template[0, 0] += 1.0
+        else:
+            template = template[:-1]
+        np.save(artifact_path, template, allow_pickle=False)
+        manifest["artifacts"][artifact_name] = backend._file_identity(artifact_path)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="artifact|template",
+    ):
+        backend.validate_stamp_science_analysis_v1(product_root)
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
+        "missing_bias",
+        "extra_dataset",
+        "cube_axis",
+        "vector_axis",
+        "column_axis",
+        "gain_axis",
+        "schema_float",
+        "complete_integer",
+        "background_integer",
+        "qa_nonbinary",
+        "valid_nonbinary",
+        "saturated_nonbinary",
+        "cosmic_nonbinary",
+    ],
+)
+def test_publication_requires_exact_representative_frame_contract(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    tamper_mode: str,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "representative-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_root = root / "science_optimal_aperture_v1"
+    representative_path = product_root / "representative_calibrated_frames.h5"
+    with h5py.File(representative_path, "r+") as handle:
+        if tamper_mode == "missing_bias":
+            del handle["bias_level_sum_dn"]
+        elif tamper_mode == "extra_dataset":
+            handle.create_dataset("unexpected", data=np.asarray([1]))
+        elif tamper_mode in {
+            "cube_axis",
+            "vector_axis",
+            "column_axis",
+            "gain_axis",
+        }:
+            dataset_name = {
+                "cube_axis": "final_dn",
+                "vector_axis": "captured_flux_fraction",
+                "column_axis": "column_noise_sum_dn_by_x",
+                "gain_axis": "gain_e_per_dn",
+            }[tamper_mode]
+            value = np.asarray(handle[dataset_name])
+            del handle[dataset_name]
+            if tamper_mode == "cube_axis":
+                value = value[..., None]
+            elif tamper_mode == "vector_axis":
+                value = value[:, None]
+            elif tamper_mode == "column_axis":
+                value = value[:, :1]
+            else:
+                ny, nx = handle["final_dn"].shape[1:]
+                value = np.ones((3, ny, nx), dtype=np.float64)
+            handle.create_dataset(dataset_name, data=value)
+        elif tamper_mode == "schema_float":
+            handle.attrs["schema_version"] = 2.0
+        elif tamper_mode == "complete_integer":
+            handle.attrs["complete"] = 1
+        elif tamper_mode == "background_integer":
+            handle.attrs["background_realization_used"] = 0
+        else:
+            dataset_name = {
+                "qa_nonbinary": "captured_flux_qa_pass",
+                "valid_nonbinary": "valid_mask",
+                "saturated_nonbinary": "saturated_mask",
+                "cosmic_nonbinary": "cosmic_mask",
+            }[tamper_mode]
+            value = np.asarray(handle[dataset_name], dtype=np.uint8)
+            value.flat[0] = 2
+            del handle[dataset_name]
+            handle.create_dataset(dataset_name, data=value)
+
+    manifest_path = product_root / "analysis_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"][representative_path.name] = backend._file_identity(
+        representative_path
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="representative calibrated-frame product",
+    ):
+        backend.validate_stamp_science_analysis_v1(product_root)
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
+        "contract_cadences",
+        "policy_factors",
+        "policy_raw_exposure",
+        "policy_background_strategy",
+        "captured_cadences",
+        "cadence_extra_dataset",
+        "cdpp_cadences",
+        "quality_cadences",
+        "coadd_factor_float",
+        "exposure_mismatch",
+        "raw_span",
+        "uncertainty_factor",
+    ],
+)
+def test_publication_cross_binds_every_cadence_contract_surface(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    tamper_mode: str,
+) -> None:
+    from astropy.table import Table
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "cadence-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_root = root / "science_optimal_aperture_v1"
+    manifest_path = product_root / "analysis_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    contract = manifest["contract"]
+    changed_artifacts: set[str] = set()
+    hdf_path = product_root / "photometry.h5"
+    reference_path = product_root / "reference_lightcurve.ecsv"
+
+    if tamper_mode == "contract_cadences":
+        contract["cadence_seconds"] = [10]
+    elif tamper_mode == "policy_factors":
+        contract["policy"]["coadd_factors"] = [1]
+    elif tamper_mode == "policy_raw_exposure":
+        contract["policy"]["raw_exposure_seconds"] = 5.0
+    elif tamper_mode == "policy_background_strategy":
+        contract["policy"]["photometry"]["background_strategy"] = (
+            "delivered_expectation_only"
+        )
+    elif tamper_mode == "captured_cadences":
+        captured = contract["captured_flux_qa"]["cadences"]
+        captured["31s"] = captured.pop("30s")
+    elif tamper_mode == "quality_cadences":
+        quality_path = product_root / "quality_summary.json"
+        quality = json.loads(quality_path.read_text(encoding="utf-8"))
+        quality["cadences"].pop("30s")
+        quality_path.write_text(json.dumps(quality), encoding="utf-8")
+        changed_artifacts.add(quality_path.name)
+    elif tamper_mode == "cdpp_cadences":
+        cdpp_path = product_root / "cdpp.json"
+        cdpp = json.loads(cdpp_path.read_text(encoding="utf-8"))
+        cdpp["cadences"].pop("30s")
+        cdpp_path.write_text(json.dumps(cdpp), encoding="utf-8")
+        cdpp_table_path = product_root / "cdpp.ecsv"
+        table = Table.read(cdpp_table_path, format="ascii.ecsv")
+        table = table[np.asarray(table["cadence_seconds"]) != 30]
+        table.write(cdpp_table_path, format="ascii.ecsv", overwrite=True)
+        with h5py.File(hdf_path, "r+") as handle:
+            del handle["cdpp_json"]
+            handle.create_dataset(
+                "cdpp_json",
+                data=np.bytes_(
+                    json.dumps(
+                        cdpp,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ),
+            )
+        changed_artifacts.update({"photometry.h5", "cdpp.json", "cdpp.ecsv"})
+    else:
+        with h5py.File(hdf_path, "r+") as handle:
+            group = handle["cadences/30s"]
+            if tamper_mode == "cadence_extra_dataset":
+                group.create_dataset(
+                    "unexpected",
+                    data=np.zeros(group["time_start_seconds"].shape),
+                )
+            elif tamper_mode == "coadd_factor_float":
+                group.attrs["coadd_factor"] = 3.0
+            elif tamper_mode == "uncertainty_factor":
+                group["uncertainty_coadd_factor"][:] = 1
+            elif tamper_mode == "raw_span":
+                count = group["raw_frame_start_index"].shape[0]
+                starts = np.arange(count, dtype=np.int64)
+                stops = starts + 1
+                group["raw_frame_start_index"][:] = starts
+                group["raw_frame_stop_index_exclusive"][:] = stops
+                table = Table.read(reference_path, format="ascii.ecsv")
+                selected = np.asarray(table["cadence_seconds"]) == 30
+                table["raw_frame_start_index"][selected] = starts
+                table["raw_frame_stop_index_exclusive"][selected] = stops
+                table.write(reference_path, format="ascii.ecsv", overwrite=True)
+                changed_artifacts.add(reference_path.name)
+            else:
+                count = group["exposure_seconds"].shape[0]
+                exposure = np.full(count, 20.0)
+                time = np.arange(count, dtype=np.float64) * 20.0
+                group["time_start_seconds"][:] = time
+                group["exposure_seconds"][:] = exposure
+                for integrated_name, rate_name in (
+                    (
+                        "flux_expectation_bgsub_e",
+                        "flux_expectation_bgsub_e_per_s",
+                    ),
+                    ("flux_local_bgsub_e", "flux_local_bgsub_e_per_s"),
+                    (
+                        "fitted_flux_expectation_e",
+                        "fitted_flux_expectation_e_per_s",
+                    ),
+                    ("fitted_flux_local_e", "fitted_flux_local_e_per_s"),
+                    ("model_flux_uncertainty_e", "model_flux_uncertainty_e_per_s"),
+                ):
+                    group[rate_name][:] = (
+                        np.asarray(group[integrated_name]) / exposure
+                    )
+                table = Table.read(reference_path, format="ascii.ecsv")
+                selected = np.asarray(table["cadence_seconds"]) == 30
+                table["time_start_seconds"][selected] = time
+                table["exposure_seconds"][selected] = exposure
+                table["flux_expectation_bgsub_e_per_s"][selected] = np.asarray(
+                    group["flux_expectation_bgsub_e_per_s"]
+                )
+                table["fitted_flux_expectation_e_per_s"][selected] = np.asarray(
+                    group["fitted_flux_expectation_e_per_s"]
+                )
+                table.write(reference_path, format="ascii.ecsv", overwrite=True)
+                changed_artifacts.add(reference_path.name)
+        changed_artifacts.add("photometry.h5")
+
+    if tamper_mode in {
+        "contract_cadences",
+        "policy_factors",
+        "policy_raw_exposure",
+        "policy_background_strategy",
+        "captured_cadences",
+    }:
+        with h5py.File(hdf_path, "r+") as handle:
+            del handle["analysis_contract_json"]
+            handle.create_dataset(
+                "analysis_contract_json",
+                data=np.bytes_(
+                    json.dumps(
+                        contract,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ),
+            )
+        changed_artifacts.add("photometry.h5")
+
+    for artifact_name in changed_artifacts:
+        manifest["artifacts"][artifact_name] = backend._file_identity(
+            product_root / artifact_name
+        )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="cadence|policy|background strategy",
+    ):
+        backend.validate_stamp_science_analysis_v1(product_root)
+
+
 @pytest.mark.parametrize("tamper_mode", ["nan", "positive_drift"])
 def test_publication_and_product_set_bind_authoritative_q_content_identity(
     tmp_path: Path,

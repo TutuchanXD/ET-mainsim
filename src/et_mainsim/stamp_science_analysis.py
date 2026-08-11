@@ -210,6 +210,48 @@ _REPRESENTATIVE_FRAMES_SCHEMA_ID = (
     "et_mainsim.representative_calibrated_stamp_frames.v2"
 )
 _REPRESENTATIVE_FRAMES_SCHEMA_VERSION = 2
+_BASE_ANALYSIS_ARTIFACT_NAMES = (
+    "photometry.h5",
+    "photometry.ecsv",
+    "reference_lightcurve.ecsv",
+    "centroid_quality.ecsv",
+    "aperture_definition.json",
+    "cdpp.json",
+    "cdpp.ecsv",
+    "quality_summary.json",
+    "aperture_mask.npy",
+    "background_mask.npy",
+    "representative_calibrated_frames.h5",
+    "figures/lightcurve_overview.png",
+    "figures/cdpp_summary.png",
+    "figures/representative_frames.png",
+)
+_SCIENCE_TEMPLATE_ARTIFACT_NAMES = (
+    "signal_template_e.npy",
+    "noise_template_e.npy",
+)
+_REPRESENTATIVE_FRAME_DATASET_NAMES = {
+    "final_dn",
+    "calibrated_e",
+    "calibrated_bgsub_e",
+    "background_expectation_e",
+    "captured_flux_fraction",
+    "captured_flux_denominator_e",
+    "captured_flux_qa_pass",
+    "valid_mask",
+    "saturated_mask",
+    "cosmic_mask",
+    "bias_level_sum_dn",
+    "column_noise_sum_dn_by_x",
+    "gain_e_per_dn",
+    "time_start_seconds",
+    "exposure_seconds",
+    "raw_frame_start_index",
+    "raw_frame_stop_index_exclusive",
+    "selection_role",
+    "input_shard_path",
+    "input_shard_semantic_sha256",
+}
 _EXPECTATION_ONLY_BACKGROUND_STRATEGY = "delivered_expectation_only"
 _LOCAL_DIAGNOSTIC_BACKGROUND_STRATEGY = (
     "delivered_expectation_plus_local_diagnostic"
@@ -359,6 +401,19 @@ def _canonical_json_text(value: object, *, name: str) -> str:
         raise StampScienceAnalysisContractError(
             f"{name} must be canonical finite JSON"
         ) from error
+
+
+def _analysis_artifact_names_v1(analysis_product: object) -> tuple[str, ...]:
+    if analysis_product == "reference_fixed13_v1":
+        return _BASE_ANALYSIS_ARTIFACT_NAMES
+    if analysis_product == "science_optimal_aperture_v1":
+        return (
+            *_BASE_ANALYSIS_ARTIFACT_NAMES,
+            *_SCIENCE_TEMPLATE_ARTIFACT_NAMES,
+        )
+    raise StampScienceAnalysisContractError(
+        "analysis contract analysis_product is invalid"
+    )
 
 
 def _positive_factor_vector(value: ArrayLike) -> NDArray[np.float64]:
@@ -1756,6 +1811,38 @@ _PHOTOMETRY_ARRAY_FIELDS = (
     "background_usable_pixel_count",
     "quality_bitmask",
 )
+_CADENCE_DATASET_NAMES = {
+    "time_start_seconds",
+    "exposure_seconds",
+    "raw_frame_start_index",
+    "raw_frame_stop_index_exclusive",
+    *_PHOTOMETRY_ARRAY_FIELDS,
+    "raw_factor_sum",
+    "fitted_flux_expectation_e",
+    "residual_expectation_e",
+    "residual_expectation_ppm",
+    "fitted_flux_local_e",
+    "residual_local_e",
+    "residual_local_ppm",
+    "local_model_valid",
+    "background_expectation_aperture_e",
+    "captured_flux_fraction",
+    "captured_flux_denominator_e",
+    "captured_flux_qa_pass",
+    "flux_uncertainty_e",
+    "source_variance_e2",
+    "background_variance_e2",
+    "read_variance_e2",
+    "quantization_variance_e2",
+    "uncertainty_valid",
+    "uncertainty_coadd_factor",
+    "flux_expectation_bgsub_e_per_s",
+    "flux_local_bgsub_e_per_s",
+    "fitted_flux_expectation_e_per_s",
+    "fitted_flux_local_e_per_s",
+    "model_flux_uncertainty_e",
+    "model_flux_uncertainty_e_per_s",
+}
 
 
 def _unavailable_local_variability_model(
@@ -3096,6 +3183,10 @@ def _write_authoritative_hdf5(
                     analysis.uncertainty.uncertainty_e / exposure
                 ),
             }
+            if set(values) != _CADENCE_DATASET_NAMES:  # pragma: no cover
+                raise StampScienceAnalysisContractError(
+                    "writer cadence dataset set differs from the frozen contract"
+                )
             for name, value in values.items():
                 _create_vector_dataset(group, name, value)
             group.attrs["fit_scale_expectation_e_per_raw_factor"] = (
@@ -3657,6 +3748,20 @@ def _write_analysis_artifacts(
     representative_frames: tuple[_RepresentativeFrame, ...],
     raw_identities: Sequence[Mapping[str, Any]],
 ) -> None:
+    analysis_product = contract.get("analysis_product")
+    artifact_names = _analysis_artifact_names_v1(analysis_product)
+    if analysis_product == "science_optimal_aperture_v1" and (
+        aperture.signal_template_e is None or aperture.noise_template_e is None
+    ):
+        raise StampScienceAnalysisContractError(
+            "science-optimal analysis requires signal/noise template artifacts"
+        )
+    if analysis_product == "reference_fixed13_v1" and (
+        aperture.signal_template_e is not None or aperture.noise_template_e is not None
+    ):
+        raise StampScienceAnalysisContractError(
+            "reference analysis forbids signal/noise template artifacts"
+        )
     cdpp = _all_cdpp_payload(analyses)
     _write_authoritative_hdf5(
         staging / "photometry.h5",
@@ -3703,44 +3808,29 @@ def _write_analysis_artifacts(
         ),
         allow_pickle=False,
     )
-    optional_template_names: list[str] = []
-    if aperture.signal_template_e is not None:
+    if analysis_product == "science_optimal_aperture_v1":
+        assert aperture.signal_template_e is not None
+        assert aperture.noise_template_e is not None
         np.save(
             staging / "signal_template_e.npy",
             aperture.signal_template_e,
             allow_pickle=False,
         )
-        optional_template_names.append("signal_template_e.npy")
-    if aperture.noise_template_e is not None:
         np.save(
             staging / "noise_template_e.npy",
             aperture.noise_template_e,
             allow_pickle=False,
         )
-        optional_template_names.append("noise_template_e.npy")
     for name in (
         "aperture_mask.npy",
         "background_mask.npy",
-        *optional_template_names,
+        *(
+            _SCIENCE_TEMPLATE_ARTIFACT_NAMES
+            if analysis_product == "science_optimal_aperture_v1"
+            else ()
+        ),
     ):
         _fsync_file(staging / name)
-    artifact_names = (
-        "photometry.h5",
-        "photometry.ecsv",
-        "reference_lightcurve.ecsv",
-        "centroid_quality.ecsv",
-        "aperture_definition.json",
-        "cdpp.json",
-        "cdpp.ecsv",
-        "quality_summary.json",
-        "aperture_mask.npy",
-        "background_mask.npy",
-        *optional_template_names,
-        "representative_calibrated_frames.h5",
-        "figures/lightcurve_overview.png",
-        "figures/cdpp_summary.png",
-        "figures/representative_frames.png",
-    )
     publication_manifest = {
         "schema_id": STAMP_SCIENCE_ANALYSIS_PUBLICATION_SCHEMA_ID,
         "schema_version": STAMP_SCIENCE_ANALYSIS_PUBLICATION_SCHEMA_VERSION,
@@ -4523,6 +4613,110 @@ def _validate_cdpp_portable_products_v1(
         )
 
 
+def _publication_cadence_contract_v1(
+    contract: Mapping[str, Any],
+) -> tuple[
+    tuple[int, ...],
+    tuple[int, ...],
+    float,
+    frozenset[str],
+    dict[str, int],
+]:
+    policy = contract.get("policy")
+    photometry_policy = (
+        policy.get("photometry") if isinstance(policy, Mapping) else None
+    )
+    factors_value = policy.get("coadd_factors") if isinstance(policy, Mapping) else None
+    raw_exposure_value = (
+        policy.get("raw_exposure_seconds") if isinstance(policy, Mapping) else None
+    )
+    factors = (
+        tuple(factors_value) if isinstance(factors_value, list) else ()
+    )
+    if (
+        not factors
+        or any(type(value) is not int or value <= 0 for value in factors)
+        or factors[0] != 1
+        or tuple(sorted(set(factors))) != factors
+        or isinstance(raw_exposure_value, bool)
+        or not isinstance(raw_exposure_value, (int, float))
+        or not math.isfinite(float(raw_exposure_value))
+        or float(raw_exposure_value) <= 0.0
+        or not isinstance(photometry_policy, Mapping)
+    ):
+        raise StampScienceAnalysisContractError(
+            "analysis cadence policy is invalid"
+        )
+    raw_exposure = float(raw_exposure_value)
+    expected_seconds = tuple(
+        int(round(raw_exposure * factor)) for factor in factors
+    )
+    cadence_value = contract.get("cadence_seconds")
+    cadence_seconds = (
+        tuple(cadence_value) if isinstance(cadence_value, list) else ()
+    )
+    expected_names = frozenset(f"{seconds}s" for seconds in expected_seconds)
+    captured = contract.get("captured_flux_qa")
+    captured_cadences = (
+        captured.get("cadences") if isinstance(captured, Mapping) else None
+    )
+    background_strategy = contract.get("background_strategy")
+    if (
+        any(seconds <= 0 for seconds in expected_seconds)
+        or len(expected_names) != len(expected_seconds)
+        or any(type(value) is not int for value in cadence_seconds)
+        or cadence_seconds != expected_seconds
+        or not isinstance(captured_cadences, Mapping)
+        or set(captured_cadences) != expected_names
+        or background_strategy
+        not in (
+            _EXPECTATION_ONLY_BACKGROUND_STRATEGY,
+            _LOCAL_DIAGNOSTIC_BACKGROUND_STRATEGY,
+        )
+        or photometry_policy.get("background_strategy") != background_strategy
+    ):
+        raise StampScienceAnalysisContractError(
+            "analysis cadence/background strategy contract is inconsistent"
+        )
+    raw_interval_value = contract.get("raw_frame_interval")
+    if not isinstance(raw_interval_value, Mapping) or set(raw_interval_value) != {
+        "start_index",
+        "stop_index_exclusive",
+        "count",
+    }:
+        raise StampScienceAnalysisContractError(
+            "analysis cadence raw-frame interval is invalid"
+        )
+    if any(
+        type(raw_interval_value.get(name)) is not int
+        for name in ("start_index", "stop_index_exclusive", "count")
+    ):
+        raise StampScienceAnalysisContractError(
+            "analysis cadence raw-frame interval is invalid"
+        )
+    raw_interval = {
+        name: raw_interval_value[name]
+        for name in ("start_index", "stop_index_exclusive", "count")
+    }
+    if (
+        raw_interval["start_index"] < 0
+        or raw_interval["stop_index_exclusive"] <= raw_interval["start_index"]
+        or raw_interval["count"]
+        != raw_interval["stop_index_exclusive"] - raw_interval["start_index"]
+        or any(raw_interval["count"] % factor != 0 for factor in factors)
+    ):
+        raise StampScienceAnalysisContractError(
+            "analysis cadence raw-frame interval is invalid"
+        )
+    return (
+        factors,
+        expected_seconds,
+        raw_exposure,
+        expected_names,
+        raw_interval,
+    )
+
+
 def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     import h5py
 
@@ -4566,6 +4760,11 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         raise StampScienceAnalysisContractError(
             "analysis contract analysis_product is invalid"
         )
+    expected_artifact_names = set(_analysis_artifact_names_v1(analysis_product))
+    if set(artifacts) != expected_artifact_names:
+        raise StampScienceAnalysisContractError(
+            "analysis artifact set differs from the product contract"
+        )
     captured_contract = contract.get("captured_flux_qa")
     captured_cadences = (
         captured_contract.get("cadences")
@@ -4594,6 +4793,13 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         raise StampScienceAnalysisContractError(
             "analysis contract schema or captured-flux gate is invalid"
         )
+    (
+        expected_factors,
+        expected_cadence_seconds,
+        raw_exposure_seconds,
+        expected_cadence_names,
+        raw_frame_interval,
+    ) = _publication_cadence_contract_v1(contract)
     for name, expected in artifacts.items():
         relative = Path(name) if isinstance(name, str) else Path()
         if (
@@ -4623,6 +4829,8 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             )
     hdf_path = root / "photometry.h5"
     science_training_indices: NDArray[Any] | None = None
+    signal_template: NDArray[np.float64] | None = None
+    noise_template: NDArray[np.float64] | None = None
     authoritative_cdpp: dict[str, Any]
     with h5py.File(hdf_path, "r") as handle:
         schema_id = handle.attrs.get("schema_id")
@@ -4664,6 +4872,14 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             handle["cdpp_json"][()],
             name="authoritative HDF5 cdpp_json",
         )
+        cdpp_cadences = authoritative_cdpp.get("cadences")
+        if (
+            not isinstance(cdpp_cadences, Mapping)
+            or set(cdpp_cadences) != expected_cadence_names
+        ):
+            raise StampScienceAnalysisContractError(
+                "authoritative HDF5 CDPP cadence set differs from contract"
+            )
         q = np.asarray(handle["raw_relative_flux"], dtype=np.float64)
         if (
             q.ndim != 1
@@ -4693,77 +4909,83 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             )
         cadence_seconds: list[int] = []
         raw_frame_count = 0
-        for name in sorted(
-            handle["cadences"], key=lambda item: int(item.removesuffix("s"))
+        cadence_group = handle.get("cadences")
+        if (
+            not isinstance(cadence_group, h5py.Group)
+            or set(cadence_group) != expected_cadence_names
         ):
-            if not name.endswith("s") or not name[:-1].isdigit():
+            raise StampScienceAnalysisContractError(
+                "authoritative HDF5 cadence group set differs from contract"
+            )
+        for factor, seconds in zip(
+            expected_factors,
+            expected_cadence_seconds,
+            strict=True,
+        ):
+            name = f"{seconds}s"
+            group = cadence_group[name]
+            factor_attribute = group.attrs.get("coadd_factor")
+            if (
+                not isinstance(group, h5py.Group)
+                or set(group) != _CADENCE_DATASET_NAMES
+                or isinstance(factor_attribute, (bool, np.bool_))
+                or not isinstance(factor_attribute, (int, np.integer))
+                or int(factor_attribute) != factor
+            ):
                 raise StampScienceAnalysisContractError(
-                    "authoritative HDF5 cadence group name is invalid"
-                )
-            seconds = int(name[:-1])
-            group = handle[f"cadences/{name}"]
-            required = {
-                "time_start_seconds",
-                "exposure_seconds",
-                "raw_frame_start_index",
-                "raw_frame_stop_index_exclusive",
-                "flux_expectation_bgsub_e",
-                "flux_local_bgsub_e",
-                "aperture_valid",
-                "quality_bitmask",
-                "raw_factor_sum",
-                "fitted_flux_expectation_e",
-                "residual_expectation_e",
-                "residual_expectation_ppm",
-                "background_expectation_aperture_e",
-                "captured_flux_fraction",
-                "captured_flux_denominator_e",
-                "captured_flux_qa_pass",
-                "flux_uncertainty_e",
-                "source_variance_e2",
-                "background_variance_e2",
-                "read_variance_e2",
-                "quantization_variance_e2",
-                "uncertainty_valid",
-                "uncertainty_coadd_factor",
-                "flux_expectation_bgsub_e_per_s",
-                "flux_local_bgsub_e_per_s",
-                "fitted_flux_expectation_e_per_s",
-                "fitted_flux_local_e_per_s",
-                "model_flux_uncertainty_e",
-                "model_flux_uncertainty_e_per_s",
-            }
-            required.update(_PHOTOMETRY_TABLE_HDF_DATASETS.values())
-            required.update(_CENTROID_QUALITY_HDF_DATASETS.values())
-            if not required.issubset(group):
-                raise StampScienceAnalysisContractError(
-                    f"authoritative HDF5 cadence {name} is incomplete"
+                    f"authoritative HDF5 cadence {name} contract is invalid"
                 )
             count = int(group["time_start_seconds"].shape[0])
-            if count <= 0 or any(int(group[item].shape[0]) != count for item in required):
+            if count <= 0 or any(
+                tuple(group[item].shape) != (count,)
+                for item in _CADENCE_DATASET_NAMES
+            ):
                 raise StampScienceAnalysisContractError(
                     f"authoritative HDF5 cadence {name} axes differ"
                 )
             time = np.asarray(group["time_start_seconds"], dtype=np.float64)
             exposure = np.asarray(group["exposure_seconds"], dtype=np.float64)
-            starts = np.asarray(group["raw_frame_start_index"], dtype=np.int64)
-            stops = np.asarray(
-                group["raw_frame_stop_index_exclusive"], dtype=np.int64
-            )
+            start_dataset = group["raw_frame_start_index"]
+            stop_dataset = group["raw_frame_stop_index_exclusive"]
+            starts = np.asarray(start_dataset, dtype=np.int64)
+            stops = np.asarray(stop_dataset, dtype=np.int64)
+            expected_exposure = raw_exposure_seconds * factor
             if (
                 not np.all(np.isfinite(time))
                 or not np.all(np.isfinite(exposure))
-                or np.any(exposure <= 0.0)
+                or not np.allclose(
+                    exposure,
+                    expected_exposure,
+                    rtol=0.0,
+                    atol=_TIME_ATOL_SECONDS,
+                )
+                or start_dataset.dtype.kind not in {"i", "u"}
+                or stop_dataset.dtype.kind not in {"i", "u"}
                 or (count > 1 and not _formal_time_intervals_are_contiguous(time, exposure))
-                or np.any(stops <= starts)
+                or np.any(stops - starts != factor)
                 or (count > 1 and not np.all(starts[1:] == stops[:-1]))
+                or int(starts[0]) != raw_frame_interval["start_index"]
+                or int(stops[-1])
+                != raw_frame_interval["stop_index_exclusive"]
+                or count * factor != raw_frame_interval["count"]
             ):
                 raise StampScienceAnalysisContractError(
                     f"authoritative HDF5 cadence {name} intervals are invalid"
                 )
-            uncertainty_valid = np.asarray(
-                group["uncertainty_valid"], dtype=bool
-            )
+            uncertainty_valid_raw = np.asarray(group["uncertainty_valid"])
+            uncertainty_factor = np.asarray(group["uncertainty_coadd_factor"])
+            if (
+                uncertainty_valid_raw.dtype.kind not in {"b", "i", "u"}
+                or not np.all(
+                    (uncertainty_valid_raw == 0) | (uncertainty_valid_raw == 1)
+                )
+                or uncertainty_factor.dtype.kind not in {"i", "u"}
+                or not np.all(uncertainty_factor == factor)
+            ):
+                raise StampScienceAnalysisContractError(
+                    f"authoritative HDF5 cadence {name} uncertainty factor differs"
+                )
+            uncertainty_valid = np.asarray(uncertainty_valid_raw, dtype=bool)
             captured_fraction = np.asarray(
                 group["captured_flux_fraction"], dtype=np.float64
             )
@@ -4838,9 +5060,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                     f"authoritative HDF5 cadence {name} rate/model uncertainty differs"
                 )
             cadence_seconds.append(seconds)
-            if seconds == min(
-                int(item.removesuffix("s")) for item in handle["cadences"]
-            ):
+            if factor == 1:
                 raw_frame_count = count
         aperture_group = handle.get("aperture")
         required_aperture_datasets = {
@@ -4857,7 +5077,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             )
         if (
             not isinstance(aperture_group, h5py.Group)
-            or not required_aperture_datasets.issubset(aperture_group)
+            or set(aperture_group) != required_aperture_datasets
         ):
             raise StampScienceAnalysisContractError(
                 "authoritative HDF5 aperture product is incomplete"
@@ -4905,6 +5125,26 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         raise StampScienceAnalysisContractError(
             "portable and authoritative aperture masks differ"
         )
+    if analysis_product == "science_optimal_aperture_v1":
+        portable_signal = np.load(
+            root / "signal_template_e.npy",
+            allow_pickle=False,
+        )
+        portable_noise = np.load(
+            root / "noise_template_e.npy",
+            allow_pickle=False,
+        )
+        if (
+            signal_template is None
+            or noise_template is None
+            or portable_signal.shape != aperture.shape
+            or portable_noise.shape != aperture.shape
+            or not np.array_equal(portable_signal, signal_template)
+            or not np.array_equal(portable_noise, noise_template)
+        ):
+            raise StampScienceAnalysisContractError(
+                "portable and authoritative signal/noise templates differ"
+            )
     aperture_definition = _read_json_object(
         root / "aperture_definition.json", label="aperture definition"
     )
@@ -4991,6 +5231,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         )
         or not isinstance(quality_cadences, Mapping)
         or not quality_cadences
+        or set(quality_cadences) != expected_cadence_names
         or any(
             not isinstance(record, Mapping)
             or record.get("captured_flux_qa_fail_count") != 0
@@ -4998,7 +5239,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         )
     ):
         raise StampScienceAnalysisContractError(
-            "quality summary schema or captured-flux gate is invalid"
+            "quality summary schema/cadence or captured-flux gate is invalid"
         )
     for name in (
         "photometry.ecsv",
@@ -5031,18 +5272,41 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         rep_schema = handle.attrs.get("schema_id")
         if isinstance(rep_schema, bytes):
             rep_schema = rep_schema.decode("utf-8")
-        required_rep = {
+        if (
+            rep_schema != _REPRESENTATIVE_FRAMES_SCHEMA_ID
+            or not _is_hdf_integer_schema_version(
+                handle.attrs.get("schema_version"),
+                _REPRESENTATIVE_FRAMES_SCHEMA_VERSION,
+            )
+            or not _is_hdf_boolean(handle.attrs.get("complete"), True)
+            or handle.attrs.get("observation_product") != "final_dn"
+            or not _is_hdf_boolean(
+                handle.attrs.get("background_realization_used"),
+                False,
+            )
+            or set(handle) != _REPRESENTATIVE_FRAME_DATASET_NAMES
+        ):
+            raise StampScienceAnalysisContractError(
+                "representative calibrated-frame product is invalid"
+            )
+
+        frame_shape = (3, *aperture.shape)
+        vector_shape = (3,)
+        column_shape = (3, aperture.shape[1])
+        cube_names = {
             "final_dn",
             "calibrated_e",
             "calibrated_bgsub_e",
             "background_expectation_e",
-            "captured_flux_fraction",
-            "captured_flux_denominator_e",
-            "captured_flux_qa_pass",
             "valid_mask",
             "saturated_mask",
             "cosmic_mask",
-            "gain_e_per_dn",
+        }
+        vector_names = {
+            "captured_flux_fraction",
+            "captured_flux_denominator_e",
+            "captured_flux_qa_pass",
+            "bias_level_sum_dn",
             "time_start_seconds",
             "exposure_seconds",
             "raw_frame_start_index",
@@ -5051,35 +5315,110 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             "input_shard_path",
             "input_shard_semantic_sha256",
         }
+        gain = np.asarray(handle["gain_e_per_dn"])
         if (
-            rep_schema != _REPRESENTATIVE_FRAMES_SCHEMA_ID
-            or int(handle.attrs.get("schema_version", -1))
-            != _REPRESENTATIVE_FRAMES_SCHEMA_VERSION
-            or bool(handle.attrs.get("complete", False)) is not True
-            or not required_rep.issubset(handle)
-            or handle["final_dn"].shape[0] != 3
-            or handle["final_dn"].dtype.kind != "u"
-            or not np.all(
-                np.asarray(handle["captured_flux_qa_pass"], dtype=bool)
+            any(tuple(handle[name].shape) != frame_shape for name in cube_names)
+            or any(
+                tuple(handle[name].shape) != vector_shape for name in vector_names
             )
+            or tuple(handle["column_noise_sum_dn_by_x"].shape) != column_shape
+            or gain.shape not in {(), aperture.shape}
+            or gain.dtype.kind not in {"f", "i", "u"}
+            or not np.all(np.isfinite(gain))
+            or np.any(gain <= 0.0)
+            or handle["final_dn"].dtype.kind != "u"
         ):
             raise StampScienceAnalysisContractError(
                 "representative calibrated-frame product is invalid"
             )
-        if not np.allclose(
-            np.asarray(handle["calibrated_bgsub_e"], dtype=np.float64),
-            np.asarray(handle["calibrated_e"], dtype=np.float64)
-            - np.asarray(handle["background_expectation_e"], dtype=np.float64),
-            rtol=0.0,
-            atol=1e-8,
+
+        def binary_dataset(name: str, shape: tuple[int, ...]) -> NDArray[Any]:
+            value = np.asarray(handle[name])
+            if (
+                value.shape != shape
+                or value.dtype.kind not in {"b", "i", "u"}
+                or not np.all((value == 0) | (value == 1))
+            ):
+                raise StampScienceAnalysisContractError(
+                    "representative calibrated-frame product is invalid"
+                )
+            return value
+
+        captured_qa = binary_dataset("captured_flux_qa_pass", vector_shape)
+        valid = binary_dataset("valid_mask", frame_shape).astype(bool)
+        saturated = binary_dataset("saturated_mask", frame_shape).astype(bool)
+        cosmic = binary_dataset("cosmic_mask", frame_shape).astype(bool)
+        final = np.asarray(handle["final_dn"])
+        calibrated = np.asarray(handle["calibrated_e"], dtype=np.float64)
+        calibrated_bgsub = np.asarray(
+            handle["calibrated_bgsub_e"],
+            dtype=np.float64,
+        )
+        background_expectation = np.asarray(
+            handle["background_expectation_e"],
+            dtype=np.float64,
+        )
+        captured_fraction = np.asarray(
+            handle["captured_flux_fraction"],
+            dtype=np.float64,
+        )
+        captured_denominator = np.asarray(
+            handle["captured_flux_denominator_e"],
+            dtype=np.float64,
+        )
+        bias = np.asarray(handle["bias_level_sum_dn"], dtype=np.float64)
+        column = np.asarray(
+            handle["column_noise_sum_dn_by_x"],
+            dtype=np.float64,
+        )
+        time = np.asarray(handle["time_start_seconds"], dtype=np.float64)
+        exposure = np.asarray(handle["exposure_seconds"], dtype=np.float64)
+        raw_start_dataset = handle["raw_frame_start_index"]
+        raw_stop_dataset = handle["raw_frame_stop_index_exclusive"]
+        raw_start = np.asarray(raw_start_dataset)
+        raw_stop = np.asarray(raw_stop_dataset)
+        expected_calibrated = (
+            final.astype(np.float64) - bias[:, None, None] - column[:, None, :]
+        ) * gain
+        if (
+            not np.all(np.isfinite(calibrated))
+            or not np.all(np.isfinite(calibrated_bgsub))
+            or not np.all(np.isfinite(background_expectation))
+            or np.any(background_expectation < 0.0)
+            or not np.all(np.isfinite(captured_fraction))
+            or np.any(captured_fraction < 0.0)
+            or np.any(captured_fraction > 1.0 + 1.0e-6)
+            or not np.all(np.isfinite(captured_denominator))
+            or np.any(captured_denominator <= 0.0)
+            or not np.all(captured_qa == 1)
+            or not np.all(np.isfinite(bias))
+            or not np.all(np.isfinite(column))
+            or not np.all(np.isfinite(time))
+            or not np.all(np.isfinite(exposure))
+            or np.any(exposure <= 0.0)
+            or raw_start_dataset.dtype.kind not in {"i", "u"}
+            or raw_stop_dataset.dtype.kind not in {"i", "u"}
+            or np.any(raw_stop <= raw_start)
+            or not np.allclose(
+                calibrated,
+                expected_calibrated,
+                rtol=0.0,
+                atol=1e-8,
+            )
+            or not np.allclose(
+                calibrated_bgsub,
+                calibrated - background_expectation,
+                rtol=0.0,
+                atol=1e-8,
+            )
         ):
             raise StampScienceAnalysisContractError(
                 "representative calibrated-frame electron semantics differ"
             )
         if (
-            np.any(np.asarray(handle["saturated_mask"], dtype=bool)[:, aperture])
-            or np.any(np.asarray(handle["cosmic_mask"], dtype=bool)[:, aperture])
-            or not np.all(np.asarray(handle["valid_mask"], dtype=bool)[:, aperture])
+            np.any(saturated[:, aperture])
+            or np.any(cosmic[:, aperture])
+            or not np.all(valid[:, aperture])
         ):
             raise StampScienceAnalysisContractError(
                 "representative frames are not clean for their product aperture"
