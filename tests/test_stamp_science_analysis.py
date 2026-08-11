@@ -2479,6 +2479,11 @@ def test_publication_requires_exact_representative_frame_contract(
         "contract_input_path",
         "contract_input_sha",
         "contract_frame_extra_field",
+        "index_time_mismatch",
+        "uint64_overflow",
+        "whitespace_path",
+        "noncanonical_path",
+        "duplicate_shard_path",
     ],
 )
 def test_publication_binds_representative_frame_provenance_to_contract(
@@ -2509,6 +2514,24 @@ def test_publication_binds_representative_frame_provenance_to_contract(
         "contract_input_path",
         "contract_input_sha",
         "contract_frame_extra_field",
+        "index_time_mismatch",
+        "uint64_overflow",
+        "whitespace_path",
+        "noncanonical_path",
+        "duplicate_shard_path",
+    }
+    representative_changed = tamper_mode in {
+        "selection_role",
+        "raw_start",
+        "raw_stop",
+        "input_path",
+        "input_sha",
+        "string_dtype",
+        "index_time_mismatch",
+        "uint64_overflow",
+        "whitespace_path",
+        "noncanonical_path",
+        "duplicate_shard_path",
     }
     if tamper_mode == "selection_policy":
         representative_contract["selection_policy"] = "forged_selection_policy"
@@ -2536,6 +2559,69 @@ def test_publication_binds_representative_frame_provenance_to_contract(
         )
     elif tamper_mode == "contract_frame_extra_field":
         representative_contract["frames"][0]["unexpected"] = "unbound"
+    elif tamper_mode == "index_time_mismatch":
+        frame = representative_contract["frames"][0]
+        forged_start = contract["input_raw_shards"][0][
+            "first_raw_frame_start"
+        ] + 1
+        frame["raw_frame_start_index"] = forged_start
+        with h5py.File(representative_path, "r+") as handle:
+            handle["raw_frame_start_index"][0] = forged_start
+            handle["raw_frame_stop_index_exclusive"][0] = forged_start + 1
+    elif tamper_mode == "uint64_overflow":
+        overflow_start = int(np.iinfo(np.int64).max) + 1
+        raw_shard = contract["input_raw_shards"][0]
+        raw_shard["first_raw_frame_start"] = overflow_start
+        raw_shard["last_raw_frame_stop"] = overflow_start + 6
+        representative_contract["frames"][0][
+            "raw_frame_start_index"
+        ] = overflow_start
+        with h5py.File(representative_path, "r+") as handle:
+            starts = np.asarray(handle["raw_frame_start_index"], dtype=np.uint64)
+            stops = np.asarray(
+                handle["raw_frame_stop_index_exclusive"],
+                dtype=np.uint64,
+            )
+            starts[0] = overflow_start
+            stops[0] = overflow_start + 1
+            del handle["raw_frame_start_index"]
+            del handle["raw_frame_stop_index_exclusive"]
+            handle.create_dataset("raw_frame_start_index", data=starts)
+            handle.create_dataset("raw_frame_stop_index_exclusive", data=stops)
+    elif tamper_mode in {"whitespace_path", "noncanonical_path"}:
+        forged_path = (
+            " "
+            if tamper_mode == "whitespace_path"
+            else "/tmp/../tmp/forged-input.h5"
+        )
+        contract["input_raw_shards"][0]["path"] = forged_path
+        selected = [
+            index
+            for index, frame in enumerate(representative_contract["frames"])
+            if frame["input_shard_index"] == 0
+        ]
+        for index in selected:
+            representative_contract["frames"][index][
+                "input_shard_path"
+            ] = forged_path
+        with h5py.File(representative_path, "r+") as handle:
+            for index in selected:
+                handle["input_shard_path"][index] = forged_path
+    elif tamper_mode == "duplicate_shard_path":
+        duplicate_path = contract["input_raw_shards"][0]["path"]
+        contract["input_raw_shards"][1]["path"] = duplicate_path
+        selected = [
+            index
+            for index, frame in enumerate(representative_contract["frames"])
+            if frame["input_shard_index"] == 1
+        ]
+        for index in selected:
+            representative_contract["frames"][index][
+                "input_shard_path"
+            ] = duplicate_path
+        with h5py.File(representative_path, "r+") as handle:
+            for index in selected:
+                handle["input_shard_path"][index] = duplicate_path
     else:
         with h5py.File(representative_path, "r+") as handle:
             if tamper_mode == "selection_role":
@@ -2576,7 +2662,7 @@ def test_publication_binds_representative_frame_provenance_to_contract(
             product_name=product_name,
             artifact_name="photometry.h5",
         )
-    else:
+    if representative_changed:
         _rehash_product_artifact(
             root,
             product_name=product_name,

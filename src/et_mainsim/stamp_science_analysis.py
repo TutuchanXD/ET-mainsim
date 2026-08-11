@@ -85,6 +85,7 @@ STAMP_SCIENCE_ANALYSIS_PRODUCT_SET_SCHEMA_ID = (
 )
 STAMP_SCIENCE_ANALYSIS_PRODUCT_SET_SCHEMA_VERSION = 2
 _TIME_ATOL_SECONDS = 1e-8
+_INT64_MAX = int(np.iinfo(np.int64).max)
 _REQUIRED_COADD_FACTORS = (1, 3, 6, 12, 30)
 _REFERENCE_LIGHTCURVE_SCHEMA_ID = (
     "et_mainsim.stamp_science_reference_lightcurve.v2"
@@ -4713,7 +4714,10 @@ def _publication_cadence_contract_v1(
         for name in ("start_index", "stop_index_exclusive", "count")
     }
     if (
-        raw_interval["start_index"] < 0
+        not all(
+            _is_native_int64_index(raw_interval[name])
+            for name in ("start_index", "stop_index_exclusive", "count")
+        )
         or raw_interval["stop_index_exclusive"] <= raw_interval["start_index"]
         or raw_interval["count"]
         != raw_interval["stop_index_exclusive"] - raw_interval["start_index"]
@@ -4747,8 +4751,27 @@ def _is_lowercase_sha256(value: Any) -> bool:
     )
 
 
+def _is_canonical_absolute_path_text(value: Any) -> bool:
+    if type(value) is not str or not value or value.strip() != value:
+        return False
+    path = Path(value)
+    return bool(
+        path.is_absolute()
+        and path.name
+        and os.path.normpath(value) == value
+        and "." not in path.parts
+        and ".." not in path.parts
+    )
+
+
+def _is_native_int64_index(value: Any) -> bool:
+    return type(value) is int and 0 <= value <= _INT64_MAX
+
+
 def _representative_frame_provenance_contract_v1(
     contract: Mapping[str, Any],
+    *,
+    raw_frame_interval: Mapping[str, int],
 ) -> _RepresentativeFrameProvenance:
     representative = contract.get("representative_calibrated_frames")
     raw_shards = contract.get("input_raw_shards")
@@ -4770,6 +4793,39 @@ def _representative_frame_provenance_contract_v1(
     ):
         raise StampScienceAnalysisContractError(
             "representative calibrated-frame provenance contract is invalid"
+        )
+
+    raw_interval_start = raw_frame_interval["start_index"]
+    raw_interval_stop = raw_frame_interval["stop_index_exclusive"]
+    raw_shard_bindings: list[tuple[str, str, int, int]] = []
+    raw_shard_paths: set[str] = set()
+    for shard in raw_shards:
+        if not isinstance(shard, Mapping):
+            raise StampScienceAnalysisContractError(
+                "representative calibrated-frame provenance differs from bound "
+                "raw semantic identities/policy"
+            )
+        shard_path = shard.get("path")
+        shard_semantic_hash = shard.get("semantic_sha256")
+        shard_start = shard.get("first_raw_frame_start")
+        shard_stop = shard.get("last_raw_frame_stop")
+        if (
+            not _is_canonical_absolute_path_text(shard_path)
+            or shard_path in raw_shard_paths
+            or not _is_lowercase_sha256(shard_semantic_hash)
+            or not _is_native_int64_index(shard_start)
+            or not _is_native_int64_index(shard_stop)
+            or shard_stop <= shard_start
+            or not raw_interval_start <= shard_start
+            or shard_stop > raw_interval_stop
+        ):
+            raise StampScienceAnalysisContractError(
+                "representative calibrated-frame provenance differs from bound "
+                "raw semantic identities/policy"
+            )
+        raw_shard_paths.add(shard_path)
+        raw_shard_bindings.append(
+            (shard_path, shard_semantic_hash, shard_start, shard_stop)
         )
 
     starts: list[int] = []
@@ -4794,36 +4850,20 @@ def _representative_frame_provenance_contract_v1(
         if (
             type(role) is not str
             or role != expected_role
-            or type(raw_start) is not int
-            or raw_start < 0
-            or type(shard_index) is not int
-            or not 0 <= shard_index < len(raw_shards)
-            or type(path) is not str
-            or not path
+            or not _is_native_int64_index(raw_start)
+            or not _is_native_int64_index(shard_index)
+            or shard_index >= len(raw_shards)
+            or not _is_canonical_absolute_path_text(path)
             or not _is_lowercase_sha256(semantic_hash)
         ):
             raise StampScienceAnalysisContractError(
                 "representative calibrated-frame provenance contract is invalid"
             )
-        shard = raw_shards[shard_index]
-        if not isinstance(shard, Mapping):
-            raise StampScienceAnalysisContractError(
-                "representative calibrated-frame provenance differs from bound "
-                "raw semantic identities/policy"
-            )
-        shard_path = shard.get("path")
-        shard_semantic_hash = shard.get("semantic_sha256")
-        shard_start = shard.get("first_raw_frame_start")
-        shard_stop = shard.get("last_raw_frame_stop")
+        shard_path, shard_semantic_hash, shard_start, shard_stop = (
+            raw_shard_bindings[shard_index]
+        )
         if (
-            type(shard_path) is not str
-            or not shard_path
-            or not _is_lowercase_sha256(shard_semantic_hash)
-            or type(shard_start) is not int
-            or type(shard_stop) is not int
-            or shard_start < 0
-            or shard_stop <= shard_start
-            or not shard_start <= raw_start < shard_stop
+            not shard_start <= raw_start < shard_stop
             or path != shard_path
             or semantic_hash != shard_semantic_hash
         ):
@@ -4926,7 +4966,8 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         raw_frame_interval,
     ) = _publication_cadence_contract_v1(contract)
     representative_provenance = _representative_frame_provenance_contract_v1(
-        contract
+        contract,
+        raw_frame_interval=raw_frame_interval,
     )
     for name, expected in artifacts.items():
         relative = Path(name) if isinstance(name, str) else Path()
@@ -4960,6 +5001,8 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     signal_template: NDArray[np.float64] | None = None
     noise_template: NDArray[np.float64] | None = None
     authoritative_cdpp: dict[str, Any]
+    representative_time_start_seconds: tuple[float, ...] | None = None
+    representative_exposure_seconds: tuple[float, ...] | None = None
     with h5py.File(hdf_path, "r") as handle:
         schema_id = handle.attrs.get("schema_id")
         if isinstance(schema_id, bytes):
@@ -5190,6 +5233,64 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             cadence_seconds.append(seconds)
             if factor == 1:
                 raw_frame_count = count
+                aperture_valid = np.asarray(group["aperture_valid"])
+                saturated_count = np.asarray(group["saturated_pixel_count"])
+                cosmic_count = np.asarray(group["cosmic_pixel_count"])
+                if (
+                    aperture_valid.dtype.kind not in {"b", "i", "u"}
+                    or not np.all((aperture_valid == 0) | (aperture_valid == 1))
+                    or saturated_count.dtype.kind not in {"i", "u"}
+                    or cosmic_count.dtype.kind not in {"i", "u"}
+                    or np.any(saturated_count < 0)
+                    or np.any(cosmic_count < 0)
+                ):
+                    raise StampScienceAnalysisContractError(
+                        "representative calibrated-frame provenance cadence "
+                        "quality is invalid"
+                    )
+                clean = (
+                    (aperture_valid == 1)
+                    & (saturated_count == 0)
+                    & (cosmic_count == 0)
+                )
+                clean_positions = np.flatnonzero(clean)
+                midpoint = (
+                    raw_frame_interval["start_index"]
+                    + raw_frame_interval["count"] // 2
+                )
+                middle_positions = clean_positions[
+                    starts[clean_positions] >= midpoint
+                ]
+                if clean_positions.size == 0 or middle_positions.size == 0:
+                    raise StampScienceAnalysisContractError(
+                        "representative calibrated-frame provenance selection "
+                        "is unavailable"
+                    )
+                selected_positions = np.asarray(
+                    [
+                        int(clean_positions[0]),
+                        int(middle_positions[0]),
+                        int(clean_positions[-1]),
+                    ],
+                    dtype=np.int64,
+                )
+                selected_starts = tuple(
+                    int(value) for value in starts[selected_positions]
+                )
+                if (
+                    selected_starts
+                    != representative_provenance.raw_frame_start_indices
+                ):
+                    raise StampScienceAnalysisContractError(
+                        "representative calibrated-frame provenance selection "
+                        "differs from authoritative factor-1 cadence"
+                    )
+                representative_time_start_seconds = tuple(
+                    float(value) for value in time[selected_positions]
+                )
+                representative_exposure_seconds = tuple(
+                    float(value) for value in exposure[selected_positions]
+                )
         aperture_group = handle.get("aperture")
         required_aperture_datasets = {
             "aperture_mask",
@@ -5396,6 +5497,14 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     ):
         if (root / name).stat().st_size <= 0:
             raise StampScienceAnalysisContractError(f"science figure is empty: {name}")
+    if (
+        representative_time_start_seconds is None
+        or representative_exposure_seconds is None
+    ):
+        raise StampScienceAnalysisContractError(
+            "representative calibrated-frame provenance lacks an authoritative "
+            "factor-1 cadence binding"
+        )
     with h5py.File(root / "representative_calibrated_frames.h5", "r") as handle:
         rep_schema = handle.attrs.get("schema_id")
         if isinstance(rep_schema, bytes):
@@ -5533,8 +5642,10 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             "input_shard_semantic_sha256"
         )
         if (
-            raw_start_dataset.dtype.kind not in {"i", "u"}
-            or raw_stop_dataset.dtype.kind not in {"i", "u"}
+            raw_start_dataset.dtype.kind != "i"
+            or raw_start_dataset.dtype.itemsize != np.dtype(np.int64).itemsize
+            or raw_stop_dataset.dtype.kind != "i"
+            or raw_stop_dataset.dtype.itemsize != np.dtype(np.int64).itemsize
             or tuple(raw_start.tolist())
             != representative_provenance.raw_frame_start_indices
             or tuple(raw_stop.tolist())
@@ -5546,6 +5657,18 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             or input_shard_paths != representative_provenance.input_shard_paths
             or input_shard_semantic_sha256
             != representative_provenance.input_shard_semantic_sha256
+            or not np.allclose(
+                time,
+                representative_time_start_seconds,
+                rtol=0.0,
+                atol=_TIME_ATOL_SECONDS,
+            )
+            or not np.allclose(
+                exposure,
+                representative_exposure_seconds,
+                rtol=0.0,
+                atol=_TIME_ATOL_SECONDS,
+            )
         ):
             raise StampScienceAnalysisContractError(
                 "representative calibrated-frame provenance differs from contract"
