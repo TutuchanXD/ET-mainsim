@@ -366,8 +366,6 @@ def _request(
 
 
 def _select_target_pixels(signal, noise, plot=False):
-    import torch
-
     del noise
     assert plot is False
     return signal > 10.0, 20.0
@@ -1575,6 +1573,88 @@ def test_published_aperture_loader_rejects_missing_required_oa_content(
 
 
 @pytest.mark.parametrize(
+    "invalid_product",
+    [
+        "signal_nan",
+        "signal_negative",
+        "noise_nan",
+        "noise_zero",
+        "indices_float",
+        "indices_negative",
+        "indices_duplicate",
+        "indices_unordered",
+    ],
+)
+def test_publication_validator_and_loader_reject_invalid_oa_training_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_product: str,
+) -> None:
+    import photsim7.aperture as legacy_aperture
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    raw_paths, coadd_paths, q = _series_fixture(
+        tmp_path / "inputs",
+        stamp_shape=(21, 23),
+        target_yx=(10, 11),
+    )
+    import et_mainsim.stamp_science_analysis as backend
+
+    publication = backend.analyze_stamp_science_product_set_v1(
+        _request(
+            tmp_path,
+            raw_paths=raw_paths,
+            coadd_paths=coadd_paths,
+            q=q,
+            output_name="analysis-products",
+        )
+    )
+    product = publication.science_optimal_aperture
+    with h5py.File(product.hdf5_path, "r+") as handle:
+        aperture = handle["aperture"]
+        if invalid_product == "signal_nan":
+            aperture["signal_template_e"][0, 0] = np.nan
+        elif invalid_product == "signal_negative":
+            aperture["signal_template_e"][0, 0] = -1.0
+        elif invalid_product == "noise_nan":
+            aperture["noise_template_e"][0, 0] = np.nan
+        elif invalid_product == "noise_zero":
+            aperture["noise_template_e"][0, 0] = 0.0
+        else:
+            training = np.asarray(aperture["training_raw_frame_indices"])
+            del aperture["training_raw_frame_indices"]
+            if invalid_product == "indices_float":
+                training = training.astype(np.float64)
+            elif invalid_product == "indices_negative":
+                training[0] = -1
+            elif invalid_product == "indices_duplicate":
+                training[1] = training[0]
+            elif invalid_product == "indices_unordered":
+                training = training[::-1]
+            aperture.create_dataset("training_raw_frame_indices", data=training)
+
+    manifest = json.loads(product.manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["photometry.h5"] = backend._file_identity(
+        product.hdf5_path
+    )
+    product.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    for validator in (
+        backend.validate_stamp_science_analysis_v1,
+        backend._load_published_aperture_v1,
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="authoritative HDF5 aperture training products are invalid",
+        ):
+            validator(product.output_dir)
+
+
+@pytest.mark.parametrize(
     ("fixture_kwargs", "message"),
     [
         ({"second_identity": "different-series"}, "incompatible shard identities"),
@@ -1770,6 +1850,52 @@ def test_published_analysis_readback_rejects_false_captured_flux_gate(
     with pytest.raises(
         backend.StampScienceAnalysisContractError,
         match="authoritative HDF5 cadence 10s capture QA did not pass",
+    ):
+        backend.validate_stamp_science_analysis_v1(publication.output_dir)
+
+
+def test_published_analysis_readback_rejects_negative_variance_component_even_when_total_matches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import photsim7.aperture as legacy_aperture
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    raw_paths, coadd_paths, q = _series_fixture(tmp_path)
+    import et_mainsim.stamp_science_analysis as backend
+
+    publication = backend.analyze_stamp_science_series_v1(
+        _request(
+            tmp_path,
+            raw_paths=raw_paths,
+            coadd_paths=coadd_paths,
+            q=q,
+        )
+    )
+    with h5py.File(publication.hdf5_path, "r+") as handle:
+        cadence = handle["cadences/10s"]
+        source = cadence["source_variance_e2"]
+        background = cadence["background_variance_e2"]
+        original_source = float(source[0])
+        source[0] = -1.0
+        background[0] = float(background[0]) + original_source + 1.0
+
+    manifest = json.loads(publication.manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["photometry.h5"] = backend._file_identity(
+        publication.hdf5_path
+    )
+    publication.manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="variance components are invalid",
     ):
         backend.validate_stamp_science_analysis_v1(publication.output_dir)
 
@@ -2499,7 +2625,7 @@ def test_injected_gate_discovery_only_admits_bound_contiguous_shards_zero_to_fiv
     )
     plan = plan_continuous_time_shards(
         raw_start_index=0,
-        raw_stop_index=10_800,
+        raw_stop_index=5_400,
         coadd_sizes=(3, 6, 12, 30),
         raw_exposure_seconds=10.0,
         max_raw_frames_per_shard=60,
@@ -2569,7 +2695,7 @@ def test_injected_gate_discovery_only_admits_bound_contiguous_shards_zero_to_fiv
             encoding="utf-8",
         )
 
-    write_gate([*range(6), 179])
+    write_gate([*range(6), 89])
     with pytest.raises(
         backend.StampScienceAnalysisContractError,
         match="explicit shards 0..5",
@@ -2588,7 +2714,7 @@ def test_injected_gate_discovery_only_admits_bound_contiguous_shards_zero_to_fiv
         gate_task_list=gate_task_list,
     )
     assert discovery.shard_ids == tuple(range(6))
-    assert all("shard_00179" not in str(path) for path in discovery.raw_bundle_paths)
+    assert all("shard_00089" not in str(path) for path in discovery.raw_bundle_paths)
     assert discovery.gate_task_list_binding == backend._cli_file_binding(
         gate_task_list
     )
@@ -2623,11 +2749,11 @@ def test_injected_gate_discovery_only_admits_bound_contiguous_shards_zero_to_fiv
         backend._cli_file_binding(gate_task_list)
     )
 
-    for invalid in ([*range(6)], [*range(6), 178]):
+    for invalid in ([*range(6)], [*range(6), 88]):
         write_gate(invalid)
         with pytest.raises(
             backend.StampScienceAnalysisContractError,
-            match="0..5 and 179",
+            match="0..5 and tail shard 89",
         ):
             backend.discover_stamp_science_analysis_bundles_v1(
                 production_manifest,

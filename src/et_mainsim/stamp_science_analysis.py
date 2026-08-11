@@ -365,7 +365,7 @@ def _validate_frozen_aperture_definition(
         or training.size == 0
         or training.dtype.kind not in {"i", "u"}
         or np.any(training < 0)
-        or (training.size > 1 and not np.all(np.diff(training) > 0))
+        or (training.size > 1 and np.any(training[1:] <= training[:-1]))
         or not isinstance(value.algorithm, str)
         or not value.algorithm
         or not math.isfinite(float(value.maximum_cumulative_snr))
@@ -3914,7 +3914,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                 f"analysis artifact hash/readback mismatch: {name}"
             )
     hdf_path = root / "photometry.h5"
-    science_training_indices: NDArray[np.int64] | None = None
+    science_training_indices: NDArray[Any] | None = None
     with h5py.File(hdf_path, "r") as handle:
         schema_id = handle.attrs.get("schema_id")
         if isinstance(schema_id, bytes):
@@ -4039,7 +4039,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                     f"authoritative HDF5 cadence {name} capture QA did not pass"
                 )
             uncertainty = np.asarray(group["flux_uncertainty_e"], dtype=np.float64)
-            component_total = sum(
+            variance_components = tuple(
                 np.asarray(group[item], dtype=np.float64)
                 for item in (
                     "source_variance_e2",
@@ -4048,6 +4048,14 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                     "quantization_variance_e2",
                 )
             )
+            if any(
+                not np.all(np.isfinite(component)) or np.any(component < 0.0)
+                for component in variance_components
+            ):
+                raise StampScienceAnalysisContractError(
+                    f"authoritative HDF5 cadence {name} variance components are invalid"
+                )
+            component_total = sum(variance_components)
             if (
                 np.any(component_total < 0.0)
                 or not np.all(np.isfinite(component_total))
@@ -4127,13 +4135,26 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                 aperture_group["noise_template_e"], dtype=np.float64
             )
             science_training_indices = np.asarray(
-                aperture_group["training_raw_frame_indices"], dtype=np.int64
+                aperture_group["training_raw_frame_indices"]
             )
             if (
                 signal_template.shape != aperture.shape
                 or noise_template.shape != aperture.shape
+                or not np.all(np.isfinite(signal_template))
+                or np.any(signal_template < 0.0)
+                or not np.all(np.isfinite(noise_template))
+                or np.any(noise_template <= 0.0)
                 or science_training_indices.ndim != 1
                 or science_training_indices.size == 0
+                or science_training_indices.dtype.kind not in {"i", "u"}
+                or np.any(science_training_indices < 0)
+                or (
+                    science_training_indices.size > 1
+                    and np.any(
+                        science_training_indices[1:]
+                        <= science_training_indices[:-1]
+                    )
+                )
             ):
                 raise StampScienceAnalysisContractError(
                     "authoritative HDF5 aperture training products are invalid"
@@ -4187,6 +4208,10 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             )
             or tuple(signal_template_shape) != aperture.shape
             or not isinstance(recorded_training_indices, list)
+            or any(
+                isinstance(item, bool) or not isinstance(item, int)
+                for item in recorded_training_indices
+            )
             or (
                 target_peak_yx is not None
                 and (
@@ -5324,17 +5349,20 @@ def discover_stamp_science_analysis_bundles_v1(
                 production=production,
                 label="injected gate",
             )
+            tail_shard_id = max(by_id)
+            representative_shard_ids = (*range(6), tail_shard_id)
             expected_tasks = {
-                (source_text, shard_id) for shard_id in (*range(6), 179)
+                (source_text, shard_id) for shard_id in representative_shard_ids
             }
             if (
                 len(tasks) != len(expected_tasks)
                 or set(tasks) != expected_tasks
-                or any(value not in by_id for value in (*range(6), 179))
+                or any(value not in by_id for value in representative_shard_ids)
             ):
                 raise StampScienceAnalysisContractError(
                     "formal injected gate task list must declare exactly "
-                    "shards 0..5 and 179 for only the requested representative source"
+                    f"shards 0..5 and tail shard {tail_shard_id} for only the "
+                    "requested representative source"
                 )
             selected_ids = tuple(range(6))
     else:
