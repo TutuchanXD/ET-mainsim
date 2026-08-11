@@ -242,6 +242,36 @@ def test_write_science_task_list_rejects_boolean_manifest_version(
         )
 
 
+@pytest.mark.parametrize("schema_version", (True, 1.0, "1"))
+def test_load_science_manifest_rejects_noninteger_schema_version(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    import et_mainsim.science_stamp_production as production
+
+    manifest_path = _write_minimal_task_manifest(tmp_path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = schema_version
+    manifest_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported science stamp production"):
+        production._load_science_manifest(manifest_path)
+
+
+def test_load_science_manifest_accepts_native_integer_schema_version(
+    tmp_path: Path,
+) -> None:
+    import et_mainsim.science_stamp_production as production
+
+    manifest_path = _write_minimal_task_manifest(tmp_path)
+
+    resolved_path, payload = production._load_science_manifest(manifest_path)
+
+    assert resolved_path == manifest_path.resolve()
+    assert payload["schema_version"] == 1
+    assert type(payload["schema_version"]) is int
+
+
 @pytest.mark.parametrize(
     ("tasks", "error"),
     [

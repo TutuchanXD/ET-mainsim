@@ -756,9 +756,12 @@ def _load_science_manifest(path: Path | str) -> tuple[Path, dict[str, Any]]:
         raise ValueError("science production manifest is not valid JSON") from error
     if not isinstance(payload, dict):
         raise ValueError("science production manifest must be an object")
-    if payload.get("schema_id") != SCIENCE_STAMP_PRODUCTION_SCHEMA_ID or int(
-        payload.get("schema_version", 0)
-    ) != SCIENCE_STAMP_PRODUCTION_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if (
+        payload.get("schema_id") != SCIENCE_STAMP_PRODUCTION_SCHEMA_ID
+        or type(schema_version) is not int
+        or schema_version != SCIENCE_STAMP_PRODUCTION_SCHEMA_VERSION
+    ):
         raise ValueError("unsupported science stamp production manifest")
     return manifest_path, payload
 
