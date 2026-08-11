@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 
 import h5py
@@ -1336,6 +1337,179 @@ def test_product_set_publishes_reference_fixed13_and_science_oa_from_one_raw_pas
         assert manifest["contract"]["analysis_product"] == product_name
         with h5py.File(product.hdf5_path, "r") as handle:
             assert "flux_uncertainty_e" in handle["cadences/10s"]
+
+
+@pytest.mark.parametrize("tamper_mode", ["swap", "copy_reference"])
+def test_product_set_validation_rejects_swapped_or_copied_child_roles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper_mode: str,
+) -> None:
+    import photsim7.aperture as legacy_aperture
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    raw_paths, coadd_paths, q = _series_fixture(
+        tmp_path / "inputs",
+        stamp_shape=(21, 23),
+        target_yx=(10, 11),
+    )
+    import et_mainsim.stamp_science_analysis as backend
+
+    publication = backend.analyze_stamp_science_product_set_v1(
+        _request(
+            tmp_path,
+            raw_paths=raw_paths,
+            coadd_paths=coadd_paths,
+            q=q,
+            output_name="role-bound-products",
+        )
+    )
+    root = publication.output_dir
+    reference = root / "reference_fixed13_v1"
+    science = root / "science_optimal_aperture_v1"
+    if tamper_mode == "swap":
+        temporary = root / "temporary-child"
+        reference.rename(temporary)
+        science.rename(reference)
+        temporary.rename(science)
+    else:
+        shutil.rmtree(science)
+        shutil.copytree(reference, science)
+
+    product_set = json.loads(
+        publication.manifest_path.read_text(encoding="utf-8")
+    )
+    for name in product_set["products"]:
+        product_set["products"][name]["analysis_manifest"] = (
+            backend._file_identity(root / name / "analysis_manifest.json")
+        )
+    publication.manifest_path.write_text(
+        json.dumps(product_set),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="analysis product.*directory role",
+    ):
+        backend.validate_stamp_science_analysis_product_set_v1(root)
+
+
+@pytest.mark.parametrize("binding_name", ["raw_semantic_identity", "policy"])
+def test_product_set_validation_binds_common_raw_semantics_and_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    binding_name: str,
+) -> None:
+    import photsim7.aperture as legacy_aperture
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    raw_paths, coadd_paths, q = _series_fixture(
+        tmp_path / "inputs",
+        stamp_shape=(21, 23),
+        target_yx=(10, 11),
+    )
+    import et_mainsim.stamp_science_analysis as backend
+
+    publication = backend.analyze_stamp_science_product_set_v1(
+        _request(
+            tmp_path,
+            raw_paths=raw_paths,
+            coadd_paths=coadd_paths,
+            q=q,
+            output_name="common-binding-products",
+        )
+    )
+    child_manifest_path = publication.science_optimal_aperture.manifest_path
+    child_manifest = json.loads(child_manifest_path.read_text(encoding="utf-8"))
+    contract = child_manifest["contract"]
+    if binding_name == "raw_semantic_identity":
+        contract["input_raw_shards"][0]["semantic_sha256"] = "f" * 64
+    else:
+        contract["policy"]["stream_batch_frames"] += 1
+
+    encoded_contract = json.dumps(
+        contract,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    with h5py.File(
+        publication.science_optimal_aperture.hdf5_path,
+        "r+",
+    ) as handle:
+        del handle["analysis_contract_json"]
+        handle.create_dataset(
+            "analysis_contract_json",
+            data=np.bytes_(encoded_contract),
+        )
+    child_manifest["artifacts"]["photometry.h5"] = backend._file_identity(
+        publication.science_optimal_aperture.hdf5_path
+    )
+    child_manifest_path.write_text(
+        json.dumps(child_manifest),
+        encoding="utf-8",
+    )
+    product_set = json.loads(
+        publication.manifest_path.read_text(encoding="utf-8")
+    )
+    product_set["products"]["science_optimal_aperture_v1"][
+        "analysis_manifest"
+    ] = backend._file_identity(child_manifest_path)
+    publication.manifest_path.write_text(
+        json.dumps(product_set),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="raw semantic identities/policy",
+    ):
+        backend.validate_stamp_science_analysis_product_set_v1(
+            publication.output_dir
+        )
+
+
+@pytest.mark.parametrize(
+    "analysis_product",
+    [None, "reference_fixed13_v1"],
+)
+def test_published_aperture_loader_requires_science_optimal_product_role(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    analysis_product: str | None,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    analysis_dir = tmp_path / "published-aperture"
+    analysis_dir.mkdir()
+    contract = {}
+    if analysis_product is not None:
+        contract["analysis_product"] = analysis_product
+    (analysis_dir / "analysis_manifest.json").write_text(
+        json.dumps({"contract": contract}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        backend,
+        "validate_stamp_science_analysis_v1",
+        lambda _path: None,
+    )
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="science_optimal_aperture_v1",
+    ):
+        backend._load_published_aperture_v1(analysis_dir)
 
 
 @pytest.mark.parametrize(

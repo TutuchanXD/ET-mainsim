@@ -4266,6 +4266,7 @@ def validate_stamp_science_analysis_product_set_v1(
         )
     validations: dict[str, StampScienceAnalysisValidation] = {}
     common_context: Mapping[str, Any] | None = None
+    common_raw_policy_binding: Mapping[str, Any] | None = None
     for name in sorted(expected_names):
         record = products[name]
         if (
@@ -4290,16 +4291,54 @@ def validate_stamp_science_analysis_product_set_v1(
             label=f"{name} analysis manifest",
         )
         contract = child_manifest.get("contract")
-        context = contract.get("analysis_context") if isinstance(contract, Mapping) else None
+        if (
+            not isinstance(contract, Mapping)
+            or contract.get("analysis_product") != name
+        ):
+            raise StampScienceAnalysisContractError(
+                f"analysis product does not match its directory role: {name}"
+            )
+        context = contract.get("analysis_context")
         if not isinstance(context, Mapping):
             raise StampScienceAnalysisContractError(
                 f"analysis product lacks bound analysis context: {name}"
             )
+        raw_shards = contract.get("input_raw_shards")
+        raw_relative_flux = contract.get("raw_relative_flux")
+        policy = contract.get("policy")
+        if (
+            not isinstance(raw_shards, list)
+            or not raw_shards
+            or any(
+                not isinstance(item, Mapping)
+                or not isinstance(item.get("semantic_sha256"), str)
+                or len(item["semantic_sha256"]) != 64
+                for item in raw_shards
+            )
+            or not isinstance(raw_relative_flux, Mapping)
+            or not isinstance(raw_relative_flux.get("sha256"), str)
+            or len(raw_relative_flux["sha256"]) != 64
+            or not isinstance(policy, Mapping)
+        ):
+            raise StampScienceAnalysisContractError(
+                f"analysis product lacks bound raw semantic identities/policy: {name}"
+            )
+        raw_policy_binding = {
+            "input_raw_shards": raw_shards,
+            "raw_relative_flux": raw_relative_flux,
+            "policy": policy,
+        }
         if common_context is None:
             common_context = dict(context)
         elif dict(context) != dict(common_context):
             raise StampScienceAnalysisContractError(
                 "analysis products bind different source/production contexts"
+            )
+        if common_raw_policy_binding is None:
+            common_raw_policy_binding = raw_policy_binding
+        elif raw_policy_binding != common_raw_policy_binding:
+            raise StampScienceAnalysisContractError(
+                "analysis products bind different raw semantic identities/policy"
             )
         validations[name] = validation
     if dict(manifest.get("analysis_context", {})) != dict(common_context or {}):
@@ -5961,6 +6000,11 @@ def _load_published_aperture_v1(
     if not isinstance(contract, dict):
         raise StampScienceAnalysisContractError(
             "published aperture manifest lacks its analysis contract"
+        )
+    if contract.get("analysis_product") != "science_optimal_aperture_v1":
+        raise StampScienceAnalysisContractError(
+            "published aperture analysis_product must be "
+            "science_optimal_aperture_v1"
         )
     definition_payload = _read_json_object(
         analysis_dir / "aperture_definition.json",
