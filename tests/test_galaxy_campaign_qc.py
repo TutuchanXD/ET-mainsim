@@ -346,6 +346,68 @@ def test_campaign_qc_accepts_bound_publication_receipts_for_v3_staged_delivery(
     assert result.partial_artifacts == ()
 
 
+def test_campaign_qc_rejects_staged_receipt_after_same_size_payload_drift(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.galaxy_campaign_qc import (
+        GalaxyCampaignDeliveryQCRequest,
+        audit_galaxy_campaign_delivery_v1,
+    )
+
+    manifest_path = _write_fixture_run(
+        tmp_path,
+        schema_version=3,
+        delivery_execution_mode="staged_local_scratch_v1",
+    )
+    for source_id in SOURCE_IDS:
+        for shard_id in (0, 1):
+            _write_publication_receipt(
+                manifest_path,
+                source_id=source_id,
+                shard_id=shard_id,
+            )
+
+    member_path = (
+        manifest_path.parent
+        / "cases"
+        / "injected"
+        / "stamps"
+        / "target_41"
+        / "delivery"
+        / "shard_00000"
+        / "raw.h5"
+    )
+    compact_names = (
+        "raw_frame_start_index",
+        "raw_frame_stop_index_exclusive",
+        "time_start_seconds",
+        "exposure_seconds",
+    )
+    size_before_mutation = member_path.stat().st_size
+    with h5py.File(member_path, "r+") as handle:
+        compact_before = {name: handle[name][:] for name in compact_names}
+        handle["final_dn"][0, 0, 0] += 1
+    with h5py.File(member_path, "r") as handle:
+        for name, before in compact_before.items():
+            assert np.array_equal(handle[name][:], before)
+    assert member_path.stat().st_size == size_before_mutation
+
+    result = audit_galaxy_campaign_delivery_v1(
+        GalaxyCampaignDeliveryQCRequest(
+            production_manifest_path=manifest_path,
+            case="injected",
+        )
+    )
+
+    assert result.ready is False
+    assert result.invalid_bundle_count == 1
+    assert result.invalid_bundles[0]["product"] == "publication_receipt"
+    assert result.invalid_bundles[0]["path"].endswith("publication_receipt.json")
+    assert "SHA-256 conflicts with current bundle bytes" in result.invalid_bundles[0][
+        "error"
+    ]
+
+
 def test_campaign_qc_requires_receipts_for_v3_staged_delivery(
     tmp_path: Path,
 ) -> None:

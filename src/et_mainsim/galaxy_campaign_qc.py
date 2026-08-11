@@ -812,12 +812,11 @@ def _validate_optional_publication_receipt(
     shard: ContinuousTimeShard,
     bundles: tuple[_ExpectedBundle, ...],
 ) -> None:
-    """Validate one present publisher receipt without re-reading HDF payloads.
+    """Validate one present publisher receipt against current bundle bytes.
 
     The publisher calculated each SHA-256 from both scratch and destination
-    before the atomic directory rename.  Campaign QC therefore validates the
-    immutable receipt binding, exact paths and current sizes; it deliberately
-    avoids a second multi-terabyte hash sweep.
+    before the atomic directory rename.  Campaign QC re-computes each current
+    member identity with a bounded-memory streaming file reader.
     """
 
     payload = _strict_receipt_json_object(path)
@@ -924,6 +923,19 @@ def _validate_optional_publication_receipt(
         ):
             raise GalaxyCampaignDeliveryQCError(
                 f"publication receipt member {name} SHA-256 is invalid"
+            )
+        current_identity = file_identity(member_path)
+        if not _exact_json_value(
+            member_receipt["size_bytes"],
+            current_identity["size_bytes"],
+        ):
+            raise GalaxyCampaignDeliveryQCError(
+                f"publication receipt member {name} size changed during validation"
+            )
+        if sha256 != current_identity["sha256"]:
+            raise GalaxyCampaignDeliveryQCError(
+                f"publication receipt member {name} SHA-256 conflicts with "
+                "current bundle bytes"
             )
 
 
