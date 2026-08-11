@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -406,6 +408,74 @@ def test_campaign_qc_rejects_staged_receipt_after_same_size_payload_drift(
     assert "SHA-256 conflicts with current bundle bytes" in result.invalid_bundles[0][
         "error"
     ]
+
+
+def test_campaign_qc_rejects_atomic_member_replacement_during_receipt_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from et_mainsim.galaxy_campaign_qc import (
+        GalaxyCampaignDeliveryQCRequest,
+        audit_galaxy_campaign_delivery_v1,
+    )
+
+    manifest_path = _write_fixture_run(
+        tmp_path,
+        schema_version=3,
+        delivery_execution_mode="staged_local_scratch_v1",
+    )
+    for source_id in SOURCE_IDS:
+        for shard_id in (0, 1):
+            _write_publication_receipt(
+                manifest_path,
+                source_id=source_id,
+                shard_id=shard_id,
+            )
+
+    member_path = (
+        manifest_path.parent
+        / "cases"
+        / "injected"
+        / "stamps"
+        / "target_41"
+        / "delivery"
+        / "shard_00000"
+        / "raw.h5"
+    )
+    replacement_path = tmp_path / "replacement-raw.h5"
+    shutil.copy2(member_path, replacement_path)
+    with h5py.File(replacement_path, "r+") as handle:
+        handle["final_dn"][0, 0, 0] += 1
+    assert replacement_path.stat().st_size == member_path.stat().st_size
+    assert _sha256(replacement_path) != _sha256(member_path)
+
+    original_path_open = Path.open
+    target_path = member_path.resolve()
+    swapped = False
+
+    def _open_then_replace_path(path: Path, *args, **kwargs):
+        nonlocal swapped
+        handle = original_path_open(path, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if path == target_path and mode == "rb" and not swapped:
+            os.replace(replacement_path, target_path)
+            swapped = True
+        return handle
+
+    monkeypatch.setattr(Path, "open", _open_then_replace_path)
+
+    result = audit_galaxy_campaign_delivery_v1(
+        GalaxyCampaignDeliveryQCRequest(
+            production_manifest_path=manifest_path,
+            case="injected",
+        )
+    )
+
+    assert swapped is True
+    assert result.ready is False
+    assert result.invalid_bundle_count == 1
+    assert result.invalid_bundles[0]["product"] == "publication_receipt"
+    assert "replaced during SHA-256 validation" in result.invalid_bundles[0]["error"]
 
 
 def test_campaign_qc_requires_receipts_for_v3_staged_delivery(

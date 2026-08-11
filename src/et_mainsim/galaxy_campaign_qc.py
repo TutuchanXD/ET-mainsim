@@ -25,6 +25,7 @@ import json
 import math
 import os
 from pathlib import Path
+import stat
 from typing import Any, Literal
 import uuid
 
@@ -171,6 +172,56 @@ def _snapshot_file_identity(path: Path, raw: bytes) -> dict[str, Any]:
         "path": str(path),
         "size_bytes": len(raw),
         "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _file_stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _stable_streaming_file_identity(path: Path) -> dict[str, Any]:
+    source = path.expanduser().absolute()
+    digest = hashlib.sha256()
+    try:
+        with source.open("rb") as handle:
+            descriptor_before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(descriptor_before.st_mode):
+                raise GalaxyCampaignDeliveryQCError(
+                    "publication receipt member is not a regular file"
+                )
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+            descriptor_after = os.fstat(handle.fileno())
+            path_after = os.stat(source, follow_symlinks=False)
+    except OSError as error:
+        raise GalaxyCampaignDeliveryQCError(
+            "publication receipt member could not be hashed"
+        ) from error
+
+    descriptor_identity_before = _file_stat_identity(descriptor_before)
+    descriptor_identity_after = _file_stat_identity(descriptor_after)
+    if descriptor_identity_after != descriptor_identity_before:
+        raise GalaxyCampaignDeliveryQCError(
+            "publication receipt member changed during SHA-256 validation"
+        )
+    path_identity_after = _file_stat_identity(path_after)
+    if (
+        not stat.S_ISREG(path_after.st_mode)
+        or path_identity_after[:3] != descriptor_identity_after[:3]
+    ):
+        raise GalaxyCampaignDeliveryQCError(
+            "publication receipt member path was replaced during SHA-256 validation"
+        )
+    return {
+        "path": str(source),
+        "size_bytes": int(descriptor_after.st_size),
+        "sha256": digest.hexdigest(),
     }
 
 
@@ -924,7 +975,7 @@ def _validate_optional_publication_receipt(
             raise GalaxyCampaignDeliveryQCError(
                 f"publication receipt member {name} SHA-256 is invalid"
             )
-        current_identity = file_identity(member_path)
+        current_identity = _stable_streaming_file_identity(member_path)
         if not _exact_json_value(
             member_receipt["size_bytes"],
             current_identity["size_bytes"],
