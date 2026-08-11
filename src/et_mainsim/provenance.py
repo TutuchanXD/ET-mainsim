@@ -26,12 +26,15 @@ _CANONICAL_DIST_INFO_FILES = frozenset(
 
 
 def _git_output(repo: Path, *args: str) -> str | None:
-    result = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
     if result.returncode != 0:
         return None
     return result.stdout.strip()
@@ -63,6 +66,81 @@ def _normalized_distribution_name(name: str) -> str:
 
 def _is_generated_cache_file(path: Path) -> bool:
     return "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}
+
+
+def _resolved_git_top_level(path: Path | str) -> Path | None:
+    candidate = Path(path).expanduser().resolve()
+    if not candidate.is_dir():
+        return None
+    value = _git_output(candidate, "rev-parse", "--show-toplevel")
+    if not value:
+        return None
+    top_level = Path(value).expanduser().resolve()
+    if not top_level.is_dir():
+        return None
+    return top_level
+
+
+def _git_top_level_owning_package(
+    git_root: Path | str,
+    package_root: Path | str,
+) -> Path | None:
+    """Resolve the Git root only when its index fully owns the package tree."""
+
+    requested_top_level = _resolved_git_top_level(git_root)
+    package = Path(package_root).expanduser().resolve()
+    package_top_level = _resolved_git_top_level(package)
+    if (
+        requested_top_level is None
+        or package_top_level != requested_top_level
+        or not package.is_dir()
+    ):
+        return None
+    try:
+        relative_package = package.relative_to(requested_top_level)
+    except ValueError:
+        return None
+
+    pathspec = relative_package.as_posix()
+    tracked_output = _git_output(
+        requested_top_level,
+        "ls-files",
+        "--cached",
+        "-z",
+        "--",
+        pathspec,
+    )
+    if tracked_output is None:
+        return None
+    tracked_files: set[str] = set()
+    for label in tracked_output.split("\0"):
+        if not label:
+            continue
+        try:
+            relative = Path(label).relative_to(relative_package)
+        except ValueError:
+            return None
+        if not _is_generated_cache_file(relative):
+            tracked_files.add(relative.as_posix())
+
+    actual_files: set[str] = set()
+    try:
+        for candidate in package.rglob("*"):
+            if candidate.is_symlink():
+                return None
+            if not candidate.is_file():
+                continue
+            relative = candidate.relative_to(package)
+            if (
+                relative.parts[:1] != (".git",)
+                and not _is_generated_cache_file(relative)
+            ):
+                actual_files.add(relative.as_posix())
+    except OSError:
+        return None
+    if not actual_files or not actual_files.issubset(tracked_files):
+        return None
+    return requested_top_level
 
 
 def _record_sha256(path: Path) -> tuple[str, str, int] | None:
@@ -224,13 +302,24 @@ def _package_provenance(
     distribution_name: str,
     fallback_version: str | None = None,
 ) -> dict[str, Any]:
-    git = git_provenance(git_root)
+    package = Path(package_root).expanduser().resolve()
+    owned_git_root = _git_top_level_owning_package(git_root, package)
+    git = (
+        git_provenance(owned_git_root)
+        if owned_git_root is not None
+        else {
+            "root": str(package),
+            "commit": None,
+            "branch": None,
+            "dirty": None,
+        }
+    )
     version = _distribution_version(distribution_name) or fallback_version
     result = {**git, "version": version}
-    if git["commit"] is None and git["dirty"] is None:
+    if owned_git_root is None:
         identity = _installed_distribution_identity_v1(
             distribution_name,
-            package_root,
+            package,
         )
         if identity is not None:
             result["distribution_identity"] = identity
