@@ -553,28 +553,66 @@ def test_runtime_paths_requires_formal_pixel_phase_profile_contract(
         )
 
 
-def test_delivery_execution_mode_defaults_legacy_manifests_and_rejects_unknown() -> None:
+def test_delivery_execution_mode_defaults_missing_mode_for_literal_v2_manifest() -> None:
     import et_mainsim.galaxy_stamp_production as production
 
     assert (
-        production.delivery_execution_mode_from_manifest({"delivery": {}})
+        production.delivery_execution_mode_from_manifest(
+            {
+                "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": 2,
+                "delivery": {},
+            }
+        )
         == production.DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE
     )
+
+
+def test_delivery_execution_mode_requires_explicit_mode_for_v3_manifest() -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
+    with pytest.raises(ValueError, match="delivery.execution_mode"):
+        production.delivery_execution_mode_from_manifest(
+            {
+                "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": 3,
+                "delivery": {},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "direct_shared_filesystem",
+        "staged_local_scratch_v1",
+    ],
+)
+def test_delivery_execution_mode_accepts_explicit_supported_v3_modes(mode: str) -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
     assert (
         production.delivery_execution_mode_from_manifest(
             {
-                "delivery": {
-                    "execution_mode": (
-                        production.STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE
-                    )
-                }
+                "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": 3,
+                "delivery": {"execution_mode": mode},
             }
         )
-        == production.STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE
+        == mode
     )
+
+
+def test_delivery_execution_mode_rejects_unknown_v3_mode() -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
     with pytest.raises(ValueError, match="delivery.execution_mode"):
         production.delivery_execution_mode_from_manifest(
-            {"delivery": {"execution_mode": "mixed_writer_mode"}}
+            {
+                "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": 3,
+                "delivery": {"execution_mode": "mixed_writer_mode"},
+            }
         )
 
 

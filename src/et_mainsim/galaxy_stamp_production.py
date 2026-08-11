@@ -121,12 +121,18 @@ def delivery_execution_mode_from_manifest(
     delivery = manifest.get("delivery")
     if not isinstance(delivery, Mapping):
         raise ValueError("production manifest delivery must be an object")
-    return _normalise_delivery_execution_mode(
-        delivery.get(
-            "execution_mode",
-            DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE,
+    if "execution_mode" not in delivery:
+        schema_version = manifest.get("schema_version")
+        if (
+            manifest.get("schema_id") == GALAXY_STAMP_PRODUCTION_SCHEMA_ID
+            and type(schema_version) is int
+            and schema_version == 2
+        ):
+            return DIRECT_SHARED_FILESYSTEM_DELIVERY_EXECUTION_MODE
+        raise ValueError(
+            "delivery.execution_mode is required for non-v2 production manifests"
         )
-    )
+    return _normalise_delivery_execution_mode(delivery["execution_mode"])
 
 
 def _strict_source_id(value: Any, *, name: str) -> int:

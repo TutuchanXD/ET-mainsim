@@ -35,6 +35,7 @@ def _formal_receipts(
     *,
     provenance_ready: bool = True,
     chosen_psf_id: object = "psf-12deg",
+    schema_version: int = 2,
 ) -> dict[str, Path]:
     run_root = tmp_path / "galaxy_independent_90d_v3"
     quality_control = run_root / "quality_control"
@@ -48,7 +49,7 @@ def _formal_receipts(
         run_root / "production_manifest.json",
         {
             "schema_id": "et_mainsim.galaxy_stamp_production.v1",
-            "schema_version": 2,
+            "schema_version": schema_version,
             "run_id": run_root.name,
             "observation_product": "final_dn",
             "background_realization_delivered": False,
@@ -269,6 +270,26 @@ def test_readiness_accepts_integer_psf_ids_from_the_provenance_audit(
     )
 
     paths = _formal_receipts(tmp_path, chosen_psf_id=1)
+
+    readiness = validate_galaxy_notebook_readiness_v1(_readiness_request(paths))
+
+    assert readiness.run_id == "galaxy_independent_90d_v3"
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    (2, 3),
+    ids=("legacy-v2", "current-v3"),
+)
+def test_readiness_accepts_supported_formal_galaxy_manifest_versions(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    from et_mainsim.notebook_report_assets import (
+        validate_galaxy_notebook_readiness_v1,
+    )
+
+    paths = _formal_receipts(tmp_path, schema_version=schema_version)
 
     readiness = validate_galaxy_notebook_readiness_v1(_readiness_request(paths))
 
@@ -577,8 +598,14 @@ def test_pr_asset_wrapper_records_the_final_dn_readiness_chain(tmp_path: Path) -
     assert receipt["assets"][0]["filename"] == "quality.png"
 
 
+@pytest.mark.parametrize(
+    "schema_version",
+    (2, 3),
+    ids=("legacy-v2", "current-v3"),
+)
 def test_generic_export_refuses_a_formal_galaxy_manifest_without_readiness(
     tmp_path: Path,
+    schema_version: int,
 ) -> None:
     from et_mainsim.notebook_report_assets import (
         ExecutedNotebookReportAssetRequest,
@@ -587,18 +614,21 @@ def test_generic_export_refuses_a_formal_galaxy_manifest_without_readiness(
         export_executed_notebook_png_assets_v1,
     )
 
-    paths = _formal_receipts(tmp_path)
+    paths = _formal_receipts(tmp_path, schema_version=schema_version)
+    report_root = tmp_path / "generic-pr-assets"
 
     with pytest.raises(NotebookReportAssetError, match="require export_galaxy_pr_assets_v1"):
         export_executed_notebook_png_assets_v1(
             ExecutedNotebookReportAssetRequest(
                 executed_notebook_path=_executed_notebook_path(tmp_path / "executed.ipynb"),
-                report_root=tmp_path / "generic-pr-assets",
+                report_root=report_root,
                 production_manifest_path=paths["manifest"],
                 asset_specs=(NotebookPngAssetSpec("quality-figure", "quality.png"),),
-                required_markers=("ET_STAMP_REPORT_GATE=ready",),
+                required_markers=(_SINGLE_SOURCE_MARKER,),
             )
         )
+
+    assert not report_root.exists()
 
 
 def test_single_source_scope_refuses_the_campaign_summary_marker(tmp_path: Path) -> None:
