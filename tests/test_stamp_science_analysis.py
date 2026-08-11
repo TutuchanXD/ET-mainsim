@@ -353,6 +353,13 @@ def _request(
             "production_manifest": "unit-test-production-manifest",
             "source_id": "fixture-1",
             "case": case,
+            "noise_model": {
+                "schema_id": "et_mainsim.formal_stamp_noise_parameters.v1",
+                "source": "unit-test",
+                "read_noise_e_per_raw_pixel": 1.0,
+                "quantization_noise_e_per_raw_pixel": 0.0,
+                "quantization_formula": "unit-test",
+            },
         },
         read_noise_e_per_pixel=1.0,
         quantization_noise_e_per_pixel=0.0,
@@ -1165,6 +1172,13 @@ def test_expectation_only_injected_aperture_round_trips_into_static_product_set(
             "source_identity": source_identity,
             "source_id": "42",
             "case": "injected",
+            "noise_model": {
+                "schema_id": "et_mainsim.formal_stamp_noise_parameters.v1",
+                "source": "unit-test",
+                "read_noise_e_per_raw_pixel": 1.0,
+                "quantization_noise_e_per_raw_pixel": 0.0,
+                "quantization_formula": "unit-test",
+            },
         },
     )
     monkeypatch.setattr(
@@ -3256,6 +3270,207 @@ def test_publication_cross_binds_every_cadence_contract_surface(
     with pytest.raises(
         backend.StampScienceAnalysisContractError,
         match="cadence|policy|background strategy",
+    ):
+        backend.validate_stamp_science_analysis_v1(product_root)
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
+        "raw_shard_gap",
+        "shifted_cadence_time",
+        "fitted_model",
+        "observed_flux",
+        "positive_variance",
+        "missing_cdpp_policy",
+        "changed_cdpp_window",
+        "cdpp_payload",
+    ],
+)
+def test_publication_recomputes_authoritative_analysis_semantics(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    tamper_mode: str,
+) -> None:
+    from astropy.table import Table
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "recomputed-semantics-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    manifest_path = product_root / "analysis_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    contract = manifest["contract"]
+    hdf_path = product_root / "photometry.h5"
+    changed_artifacts: set[str] = {"photometry.h5"}
+    table_updates: dict[str, dict[str, np.ndarray]] = {}
+    contract_changed = tamper_mode in {
+        "raw_shard_gap",
+        "missing_cdpp_policy",
+        "changed_cdpp_window",
+    }
+
+    if tamper_mode == "raw_shard_gap":
+        first_shard = contract["input_raw_shards"][0]
+        first_shard["last_raw_frame_stop"] -= 1
+        first_shard["last_time_end_seconds"] -= 10.0
+    elif tamper_mode == "missing_cdpp_policy":
+        del contract["policy"]["photometry"]["minimum_coverage_fraction"]
+    elif tamper_mode == "changed_cdpp_window":
+        contract["policy"]["photometry"]["cdpp_windows_minutes"] = [2]
+
+    with h5py.File(hdf_path, "r+") as handle:
+        group = handle["cadences/30s"]
+        exposure = np.asarray(group["exposure_seconds"], dtype=np.float64)
+        if tamper_mode == "shifted_cadence_time":
+            shifted = np.asarray(
+                group["time_start_seconds"], dtype=np.float64
+            ) + 5.0
+            group["time_start_seconds"][:] = shifted
+            for artifact_name in (
+                "photometry.ecsv",
+                "reference_lightcurve.ecsv",
+                "centroid_quality.ecsv",
+            ):
+                table_updates[artifact_name] = {
+                    "time_start_seconds": shifted,
+                }
+        elif tamper_mode == "fitted_model":
+            flux = np.asarray(
+                group["flux_expectation_bgsub_e"], dtype=np.float64
+            )
+            valid = np.asarray(group["aperture_valid"], dtype=bool)
+            fitted = np.asarray(
+                group["fitted_flux_expectation_e"], dtype=np.float64
+            ) * 1.01
+            residual = np.full(fitted.shape, np.nan, dtype=np.float64)
+            residual[valid] = flux[valid] - fitted[valid]
+            residual_ppm = np.full(fitted.shape, np.nan, dtype=np.float64)
+            residual_ppm[valid] = (
+                residual[valid] / fitted[valid] * 1_000_000.0
+            )
+            values = {
+                "fitted_flux_expectation_e": fitted,
+                "residual_expectation_e": residual,
+                "residual_expectation_ppm": residual_ppm,
+                "fitted_flux_expectation_e_per_s": fitted / exposure,
+            }
+            for name, value in values.items():
+                group[name][:] = value
+            group.attrs["fit_scale_expectation_e_per_raw_factor"] = (
+                float(group.attrs["fit_scale_expectation_e_per_raw_factor"])
+                * 1.01
+            )
+            table_updates["photometry.ecsv"] = values
+            table_updates["reference_lightcurve.ecsv"] = values
+        elif tamper_mode == "observed_flux":
+            flux = np.asarray(
+                group["flux_expectation_bgsub_e"], dtype=np.float64
+            )
+            flux[np.isfinite(flux)] += 7.0
+            rate = flux / exposure
+            group["flux_expectation_bgsub_e"][:] = flux
+            group["flux_expectation_bgsub_e_per_s"][:] = rate
+            values = {
+                "flux_expectation_bgsub_e": flux,
+                "flux_expectation_bgsub_e_per_s": rate,
+            }
+            table_updates["photometry.ecsv"] = values
+            table_updates["reference_lightcurve.ecsv"] = values
+        elif tamper_mode == "positive_variance":
+            background_variance = np.asarray(
+                group["background_variance_e2"], dtype=np.float64
+            ) + 1.0
+            source_variance = np.asarray(
+                group["source_variance_e2"], dtype=np.float64
+            )
+            read_variance = np.asarray(
+                group["read_variance_e2"], dtype=np.float64
+            )
+            quantization_variance = np.asarray(
+                group["quantization_variance_e2"], dtype=np.float64
+            )
+            uncertainty = np.sqrt(
+                source_variance
+                + background_variance
+                + read_variance
+                + quantization_variance
+            )
+            uncertainty_valid = np.asarray(
+                group["uncertainty_valid"], dtype=bool
+            )
+            uncertainty[~uncertainty_valid] = np.nan
+            values = {
+                "background_variance_e2": background_variance,
+                "flux_uncertainty_e": uncertainty,
+                "model_flux_uncertainty_e": uncertainty,
+                "model_flux_uncertainty_e_per_s": uncertainty / exposure,
+            }
+            for name, value in values.items():
+                group[name][:] = value
+            table_updates["photometry.ecsv"] = values
+        elif tamper_mode == "cdpp_payload":
+            payload = json.loads(handle["cdpp_json"][()].decode("utf-8"))
+            row = payload["cadences"]["30s"]["expectation_background"][
+                "binned_rows"
+            ][0]
+            row["model_flux_rate_e_per_s"] *= 1.1
+            del handle["cdpp_json"]
+            handle.create_dataset(
+                "cdpp_json",
+                data=np.bytes_(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ),
+            )
+            (product_root / "cdpp.json").write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            changed_artifacts.add("cdpp.json")
+
+        if contract_changed:
+            del handle["analysis_contract_json"]
+            handle.create_dataset(
+                "analysis_contract_json",
+                data=np.bytes_(
+                    json.dumps(
+                        contract,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ),
+            )
+
+    for artifact_name, updates in table_updates.items():
+        table_path = product_root / artifact_name
+        table = Table.read(table_path, format="ascii.ecsv")
+        selected = np.asarray(table["cadence_seconds"]) == 30
+        for name, value in updates.items():
+            table[name][selected] = value
+        table.write(table_path, format="ascii.ecsv", overwrite=True)
+        changed_artifacts.add(artifact_name)
+
+    if contract_changed:
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    for artifact_name in sorted(changed_artifacts):
+        _rehash_product_artifact(
+            root,
+            product_name=product_name,
+            artifact_name=artifact_name,
+        )
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="authoritative analysis semantics",
     ):
         backend.validate_stamp_science_analysis_v1(product_root)
 

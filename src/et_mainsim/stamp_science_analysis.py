@@ -61,6 +61,7 @@ from .stamp_science_photometry import (
     SCIENCE_PHOTOMETRY_SCHEMA_VERSION,
     ScienceApertureDefinition,
     ScienceFluxUncertaintyModelResult,
+    SciencePhotometryContractError,
     SciencePhotometryResult,
     ScienceVariabilityModelResult,
     StampSciencePhotometryPolicy,
@@ -4770,6 +4771,370 @@ def _publication_cadence_contract_v1(
 
 
 @dataclass(frozen=True)
+class _RawCadenceAnchor:
+    first_time_start_seconds: float
+
+
+def _raw_cadence_anchor_contract_v1(
+    contract: Mapping[str, Any],
+    *,
+    raw_frame_interval: Mapping[str, int],
+    raw_exposure_seconds: float,
+) -> _RawCadenceAnchor:
+    raw_shards = contract.get("input_raw_shards")
+    if not isinstance(raw_shards, list) or not raw_shards:
+        raise StampScienceAnalysisContractError(
+            "authoritative analysis semantics raw-shard coverage is invalid "
+            "for representative calibrated-frame provenance"
+        )
+    expected_start = raw_frame_interval["start_index"]
+    expected_time: float | None = None
+    first_time: float | None = None
+    for shard in raw_shards:
+        if not isinstance(shard, Mapping):
+            raise StampScienceAnalysisContractError(
+                "authoritative analysis semantics raw-shard coverage is invalid "
+                "for representative calibrated-frame provenance"
+            )
+        start = shard.get("first_raw_frame_start")
+        stop = shard.get("last_raw_frame_stop")
+        frame_count = shard.get("frame_count")
+        time_start = shard.get("first_time_start_seconds")
+        time_stop = shard.get("last_time_end_seconds")
+        if (
+            not _is_native_int64_index(start)
+            or not _is_native_int64_index(stop)
+            or not _is_native_int64_index(frame_count)
+            or frame_count <= 0
+            or stop <= start
+            or stop - start != frame_count
+            or type(time_start) not in {int, float}
+            or type(time_stop) not in {int, float}
+            or not math.isfinite(float(time_start))
+            or not math.isfinite(float(time_stop))
+            or start != expected_start
+            or (
+                expected_time is not None
+                and not math.isclose(
+                    float(time_start),
+                    expected_time,
+                    rel_tol=0.0,
+                    abs_tol=_TIME_ATOL_SECONDS,
+                )
+            )
+            or not math.isclose(
+                float(time_stop) - float(time_start),
+                frame_count * raw_exposure_seconds,
+                rel_tol=0.0,
+                abs_tol=_TIME_ATOL_SECONDS,
+            )
+        ):
+            raise StampScienceAnalysisContractError(
+                "authoritative analysis semantics raw-shard coverage is invalid "
+                "for representative calibrated-frame provenance"
+            )
+        if first_time is None:
+            first_time = float(time_start)
+        expected_start = stop
+        expected_time = float(time_stop)
+    if (
+        expected_start != raw_frame_interval["stop_index_exclusive"]
+        or first_time is None
+    ):
+        raise StampScienceAnalysisContractError(
+            "authoritative analysis semantics raw-shard coverage is invalid "
+            "for representative calibrated-frame provenance"
+        )
+    return _RawCadenceAnchor(first_time_start_seconds=first_time)
+
+
+def _publication_analysis_policy_v1(
+    contract: Mapping[str, Any],
+) -> StampScienceAnalysisPolicy:
+    policy_value = contract.get("policy")
+    try:
+        policy = _analysis_policy_from_json(policy_value)
+        encoded = _canonical_json_text(
+            policy_value,
+            name="authoritative analysis semantics policy",
+        )
+        roundtrip = _canonical_json_text(
+            policy.to_dict(),
+            name="authoritative analysis semantics policy round trip",
+        )
+    except (SciencePhotometryContractError, TypeError, ValueError) as error:
+        raise StampScienceAnalysisContractError(
+            "authoritative analysis semantics policy is invalid"
+        ) from error
+    if encoded != roundtrip:
+        raise StampScienceAnalysisContractError(
+            "authoritative analysis semantics policy is not type-strict"
+        )
+    return policy
+
+
+def _analysis_noise_parameters_v1(
+    contract: Mapping[str, Any],
+) -> tuple[float, float]:
+    context = contract.get("analysis_context")
+    noise_model = (
+        context.get("noise_model") if isinstance(context, Mapping) else None
+    )
+    if not isinstance(noise_model, Mapping):
+        raise StampScienceAnalysisContractError(
+            "authoritative analysis semantics noise model is invalid"
+        )
+    values = tuple(
+        noise_model.get(name)
+        for name in (
+            "read_noise_e_per_raw_pixel",
+            "quantization_noise_e_per_raw_pixel",
+        )
+    )
+    if any(
+        type(value) not in {int, float}
+        or not math.isfinite(float(value))
+        or float(value) < 0.0
+        for value in values
+    ):
+        raise StampScienceAnalysisContractError(
+            "authoritative analysis semantics noise model is invalid"
+        )
+    return float(values[0]), float(values[1])
+
+
+def _arrays_match_exactly(actual: Any, expected: Any) -> bool:
+    try:
+        return bool(
+            np.array_equal(
+                np.asarray(actual),
+                np.asarray(expected),
+                equal_nan=True,
+            )
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _numeric_scalar_matches_exactly(actual: Any, expected: float) -> bool:
+    if isinstance(actual, (bool, np.bool_)) or not isinstance(
+        actual,
+        (int, float, np.integer, np.floating),
+    ):
+        return False
+    resolved = float(actual)
+    return bool(
+        resolved == expected
+        or (math.isnan(resolved) and math.isnan(expected))
+    )
+
+
+def _validate_recomputed_cadence_semantics_v1(
+    group: Any,
+    *,
+    cadence_name: str,
+    factor: int,
+    time_seconds: NDArray[np.float64],
+    exposure_seconds: NDArray[np.float64],
+    raw_frame_start_index: NDArray[np.int64],
+    raw_frame_stop_index_exclusive: NDArray[np.int64],
+    raw_frame_interval: Mapping[str, int],
+    raw_relative_flux: NDArray[np.float64],
+    photometry_policy: StampSciencePhotometryPolicy,
+    aperture_mask: NDArray[Any],
+    read_noise_e_per_raw_pixel: float,
+    quantization_noise_e_per_raw_pixel: float,
+    authoritative_cdpp: Mapping[str, Any],
+) -> None:
+    local_start = (
+        raw_frame_start_index - raw_frame_interval["start_index"]
+    )
+    local_stop = (
+        raw_frame_stop_index_exclusive - raw_frame_interval["start_index"]
+    )
+    aperture_valid = np.asarray(group["aperture_valid"])
+    expectation_flux = np.asarray(
+        group["flux_expectation_bgsub_e"],
+        dtype=np.float64,
+    )
+    local_flux = np.asarray(group["flux_local_bgsub_e"], dtype=np.float64)
+    local_valid = np.asarray(aperture_valid, dtype=bool) & np.isfinite(
+        local_flux
+    )
+    try:
+        expectation_model = fit_science_variability_model_v1(
+            flux_e=expectation_flux,
+            aperture_valid=aperture_valid,
+            raw_relative_flux=raw_relative_flux,
+            raw_frame_start_index=local_start,
+            raw_frame_stop_index_exclusive=local_stop,
+        )
+        if photometry_policy.local_background_enabled:
+            local_model = fit_science_variability_model_v1(
+                flux_e=local_flux,
+                aperture_valid=local_valid,
+                raw_relative_flux=raw_relative_flux,
+                raw_frame_start_index=local_start,
+                raw_frame_stop_index_exclusive=local_stop,
+            )
+        else:
+            local_model = _unavailable_local_variability_model(
+                expectation_model
+            )
+        uncertainty = compute_science_flux_uncertainty_model_v1(
+            fitted_source_expectation_e=expectation_model.fitted_flux_e,
+            aperture_mask=aperture_mask,
+            read_noise_e_per_raw_pixel=read_noise_e_per_raw_pixel,
+            quantization_noise_e_per_raw_pixel=(
+                quantization_noise_e_per_raw_pixel
+            ),
+            coadd_factor=factor,
+            cadence_valid=expectation_model.valid_mask,
+            background_expectation_aperture_e=np.asarray(
+                group["background_expectation_aperture_e"],
+                dtype=np.float64,
+            ),
+        )
+        expectation_cdpp = compute_science_cdpp_v1(
+            time_seconds=time_seconds,
+            exposure_seconds=exposure_seconds,
+            flux_e=expectation_flux,
+            aperture_valid=aperture_valid,
+            model_flux_e=expectation_model.fitted_flux_e,
+            residual_e=expectation_model.residual_e,
+            windows_minutes=photometry_policy.cdpp_windows_minutes,
+            minimum_coverage_fraction=(
+                photometry_policy.minimum_coverage_fraction
+            ),
+            minimum_accepted_bins=photometry_policy.minimum_accepted_bins,
+            bin_origin_seconds=photometry_policy.bin_origin_seconds,
+        )
+        local_cdpp = None
+        if photometry_policy.local_background_enabled:
+            local_cdpp = compute_science_cdpp_v1(
+                time_seconds=time_seconds,
+                exposure_seconds=exposure_seconds,
+                flux_e=local_flux,
+                aperture_valid=local_valid,
+                model_flux_e=local_model.fitted_flux_e,
+                residual_e=local_model.residual_e,
+                windows_minutes=photometry_policy.cdpp_windows_minutes,
+                minimum_coverage_fraction=(
+                    photometry_policy.minimum_coverage_fraction
+                ),
+                minimum_accepted_bins=(
+                    photometry_policy.minimum_accepted_bins
+                ),
+                bin_origin_seconds=photometry_policy.bin_origin_seconds,
+            )
+    except (SciencePhotometryContractError, TypeError, ValueError) as error:
+        raise StampScienceAnalysisContractError(
+            f"authoritative analysis semantics for cadence {cadence_name} "
+            "cannot be recomputed"
+        ) from error
+
+    expected_arrays = {
+        "raw_factor_sum": expectation_model.raw_factor_sum,
+        "fitted_flux_expectation_e": expectation_model.fitted_flux_e,
+        "residual_expectation_e": expectation_model.residual_e,
+        "residual_expectation_ppm": expectation_model.residual_ppm,
+        "fitted_flux_local_e": local_model.fitted_flux_e,
+        "residual_local_e": local_model.residual_e,
+        "residual_local_ppm": local_model.residual_ppm,
+        "local_model_valid": local_model.valid_mask,
+        "flux_uncertainty_e": uncertainty.uncertainty_e,
+        "source_variance_e2": uncertainty.source_variance_e2,
+        "background_variance_e2": uncertainty.background_variance_e2,
+        "read_variance_e2": uncertainty.read_variance_e2,
+        "quantization_variance_e2": uncertainty.quantization_variance_e2,
+        "uncertainty_valid": uncertainty.valid_mask,
+        "uncertainty_coadd_factor": uncertainty.coadd_factor,
+        "flux_expectation_bgsub_e_per_s": expectation_flux
+        / exposure_seconds,
+        "flux_local_bgsub_e_per_s": local_flux / exposure_seconds,
+        "fitted_flux_expectation_e_per_s": expectation_model.fitted_flux_e
+        / exposure_seconds,
+        "fitted_flux_local_e_per_s": local_model.fitted_flux_e
+        / exposure_seconds,
+        "model_flux_uncertainty_e": uncertainty.uncertainty_e,
+        "model_flux_uncertainty_e_per_s": uncertainty.uncertainty_e
+        / exposure_seconds,
+    }
+    if any(
+        not _arrays_match_exactly(group[name], expected)
+        for name, expected in expected_arrays.items()
+    ):
+        raise StampScienceAnalysisContractError(
+            f"authoritative analysis semantics for cadence {cadence_name} "
+            "differ from recomputed model/uncertainty values"
+        )
+    if (
+        not _arrays_match_exactly(
+            local_model.raw_factor_sum,
+            expectation_model.raw_factor_sum,
+        )
+        or not _numeric_scalar_matches_exactly(
+            group.attrs.get("fit_scale_expectation_e_per_raw_factor"),
+            expectation_model.fit_scale_e_per_raw_factor,
+        )
+        or not _numeric_scalar_matches_exactly(
+            group.attrs.get("fit_scale_local_e_per_raw_factor"),
+            local_model.fit_scale_e_per_raw_factor,
+        )
+        or not _numeric_scalar_matches_exactly(
+            group.attrs.get("fit_intercept_e"),
+            expectation_model.fit_intercept_e,
+        )
+    ):
+        raise StampScienceAnalysisContractError(
+            f"authoritative analysis semantics for cadence {cadence_name} "
+            "fit attributes differ"
+        )
+    try:
+        uncertainty_metadata = _decode_hdf_json(
+            group.attrs.get("uncertainty_model_json"),
+            name=f"cadence {cadence_name} uncertainty_model_json",
+        )
+    except StampScienceAnalysisContractError as error:
+        raise StampScienceAnalysisContractError(
+            f"authoritative analysis semantics for cadence {cadence_name} "
+            "uncertainty metadata is invalid"
+        ) from error
+    if uncertainty_metadata != _json_safe(uncertainty.metadata):
+        raise StampScienceAnalysisContractError(
+            f"authoritative analysis semantics for cadence {cadence_name} "
+            "uncertainty metadata differs"
+        )
+    expected_cdpp = _json_safe(
+        {
+            "coadd_factor": factor,
+            "expectation_background": _cdpp_payload(expectation_cdpp),
+            "local_background": _cdpp_payload(local_cdpp),
+        }
+    )
+    cadence_payload = authoritative_cdpp.get("cadences")
+    actual_cdpp = (
+        cadence_payload.get(cadence_name)
+        if isinstance(cadence_payload, Mapping)
+        else None
+    )
+    if _canonical_json_text(
+        actual_cdpp,
+        name=f"authoritative analysis semantics cadence {cadence_name} CDPP",
+    ) != _canonical_json_text(
+        expected_cdpp,
+        name=(
+            f"authoritative analysis semantics recomputed cadence "
+            f"{cadence_name} CDPP"
+        ),
+    ):
+        raise StampScienceAnalysisContractError(
+            f"authoritative analysis semantics for cadence {cadence_name} "
+            "CDPP background role/value differs from recomputation"
+        )
+
+
+@dataclass(frozen=True)
 class _RepresentativeFrameProvenance:
     selection_roles: tuple[str, ...]
     raw_frame_start_indices: tuple[int, ...]
@@ -5020,6 +5385,16 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         raise StampScienceAnalysisContractError(
             "analysis contract observation/background semantics are invalid"
         )
+    analysis_policy = _publication_analysis_policy_v1(contract)
+    raw_cadence_anchor = _raw_cadence_anchor_contract_v1(
+        contract,
+        raw_frame_interval=raw_frame_interval,
+        raw_exposure_seconds=raw_exposure_seconds,
+    )
+    (
+        read_noise_e_per_raw_pixel,
+        quantization_noise_e_per_raw_pixel,
+    ) = _analysis_noise_parameters_v1(contract)
     representative_provenance = _representative_frame_provenance_contract_v1(
         contract,
         raw_frame_interval=raw_frame_interval,
@@ -5116,7 +5491,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         q = np.asarray(handle["raw_relative_flux"], dtype=np.float64)
         if (
             q.ndim != 1
-            or q.size == 0
+            or q.size != raw_frame_interval["count"]
             or not np.all(np.isfinite(q))
             or np.any(q <= 0.0)
         ):
@@ -5143,6 +5518,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         cadence_seconds: list[int] = []
         raw_frame_count = 0
         cadence_group = handle.get("cadences")
+        semantic_aperture_group = handle.get("aperture")
         if (
             not isinstance(cadence_group, h5py.Group)
             or set(cadence_group) != expected_cadence_names
@@ -5150,6 +5526,16 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             raise StampScienceAnalysisContractError(
                 "authoritative HDF5 cadence group set differs from contract"
             )
+        if (
+            not isinstance(semantic_aperture_group, h5py.Group)
+            or "aperture_mask" not in semantic_aperture_group
+        ):
+            raise StampScienceAnalysisContractError(
+                "authoritative HDF5 aperture product is incomplete"
+            )
+        semantic_aperture = np.asarray(
+            semantic_aperture_group["aperture_mask"]
+        )
         for factor, seconds in zip(
             expected_factors,
             expected_cadence_seconds,
@@ -5180,9 +5566,22 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             exposure = np.asarray(group["exposure_seconds"], dtype=np.float64)
             start_dataset = group["raw_frame_start_index"]
             stop_dataset = group["raw_frame_stop_index_exclusive"]
-            starts = np.asarray(start_dataset, dtype=np.int64)
-            stops = np.asarray(stop_dataset, dtype=np.int64)
+            raw_starts = np.asarray(start_dataset)
+            raw_stops = np.asarray(stop_dataset)
             expected_exposure = raw_exposure_seconds * factor
+            expected_count = raw_frame_interval["count"] // factor
+            expected_starts = (
+                raw_frame_interval["start_index"]
+                + np.arange(expected_count, dtype=np.int64) * factor
+            )
+            expected_stops = expected_starts + factor
+            expected_time = (
+                raw_cadence_anchor.first_time_start_seconds
+                + (
+                    expected_starts - raw_frame_interval["start_index"]
+                )
+                * raw_exposure_seconds
+            )
             if (
                 not np.all(np.isfinite(time))
                 or not np.all(np.isfinite(exposure))
@@ -5194,17 +5593,23 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                 )
                 or start_dataset.dtype.kind not in {"i", "u"}
                 or stop_dataset.dtype.kind not in {"i", "u"}
+                or count != expected_count
+                or not np.array_equal(raw_starts, expected_starts)
+                or not np.array_equal(raw_stops, expected_stops)
+                or not np.allclose(
+                    time,
+                    expected_time,
+                    rtol=0.0,
+                    atol=_TIME_ATOL_SECONDS,
+                )
                 or (count > 1 and not _formal_time_intervals_are_contiguous(time, exposure))
-                or np.any(stops - starts != factor)
-                or (count > 1 and not np.all(starts[1:] == stops[:-1]))
-                or int(starts[0]) != raw_frame_interval["start_index"]
-                or int(stops[-1])
-                != raw_frame_interval["stop_index_exclusive"]
-                or count * factor != raw_frame_interval["count"]
             ):
                 raise StampScienceAnalysisContractError(
-                    f"authoritative HDF5 cadence {name} intervals are invalid"
+                    f"authoritative analysis semantics cadence {name} "
+                    "intervals differ from raw-shard coverage"
                 )
+            starts = np.asarray(raw_starts, dtype=np.int64)
+            stops = np.asarray(raw_stops, dtype=np.int64)
             uncertainty_valid_raw = np.asarray(group["uncertainty_valid"])
             uncertainty_factor = np.asarray(group["uncertainty_coadd_factor"])
             if (
@@ -5313,6 +5718,24 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                 raise StampScienceAnalysisContractError(
                     f"authoritative HDF5 cadence {name} rate/model uncertainty differs"
                 )
+            _validate_recomputed_cadence_semantics_v1(
+                group,
+                cadence_name=name,
+                factor=factor,
+                time_seconds=time,
+                exposure_seconds=exposure,
+                raw_frame_start_index=starts,
+                raw_frame_stop_index_exclusive=stops,
+                raw_frame_interval=raw_frame_interval,
+                raw_relative_flux=q,
+                photometry_policy=analysis_policy.photometry,
+                aperture_mask=semantic_aperture,
+                read_noise_e_per_raw_pixel=read_noise_e_per_raw_pixel,
+                quantization_noise_e_per_raw_pixel=(
+                    quantization_noise_e_per_raw_pixel
+                ),
+                authoritative_cdpp=authoritative_cdpp,
+            )
             cadence_seconds.append(seconds)
             if factor == 1:
                 raw_frame_count = count
