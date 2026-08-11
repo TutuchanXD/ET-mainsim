@@ -1513,6 +1513,68 @@ def test_published_aperture_loader_requires_science_optimal_product_role(
 
 
 @pytest.mark.parametrize(
+    ("artifact_kind", "required_name"),
+    [
+        ("hdf5", "signal_template_e"),
+        ("hdf5", "noise_template_e"),
+        ("hdf5", "training_raw_frame_indices"),
+        ("definition", "maximum_cumulative_snr"),
+        ("definition", "algorithm"),
+        ("definition", "signal_template_shape"),
+    ],
+)
+def test_published_aperture_loader_rejects_missing_required_oa_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_kind: str,
+    required_name: str,
+) -> None:
+    import photsim7.aperture as legacy_aperture
+
+    monkeypatch.setattr(
+        legacy_aperture,
+        "maximize_cumulative_snr",
+        _select_target_pixels,
+    )
+    raw_paths, coadd_paths, q = _series_fixture(
+        tmp_path / "inputs",
+        stamp_shape=(21, 23),
+        target_yx=(10, 11),
+    )
+    import et_mainsim.stamp_science_analysis as backend
+
+    publication = backend.analyze_stamp_science_product_set_v1(
+        _request(
+            tmp_path,
+            raw_paths=raw_paths,
+            coadd_paths=coadd_paths,
+            q=q,
+            output_name="analysis-products",
+        )
+    )
+    product = publication.science_optimal_aperture
+    if artifact_kind == "hdf5":
+        artifact_path = product.hdf5_path
+        with h5py.File(artifact_path, "r+") as handle:
+            del handle[f"aperture/{required_name}"]
+    else:
+        artifact_path = product.aperture_definition_path
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        payload.pop(required_name)
+        artifact_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    manifest = json.loads(product.manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"][artifact_path.name] = backend._file_identity(artifact_path)
+    product.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="published aperture|authoritative HDF5 aperture|aperture definition",
+    ):
+        backend._load_published_aperture_v1(product.output_dir)
+
+
+@pytest.mark.parametrize(
     ("fixture_kwargs", "message"),
     [
         ({"second_identity": "different-series"}, "incompatible shard identities"),

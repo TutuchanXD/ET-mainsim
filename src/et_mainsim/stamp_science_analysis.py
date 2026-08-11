@@ -3855,6 +3855,14 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         raise StampScienceAnalysisContractError(
             "analysis manifest lacks contract/artifact identities"
         )
+    analysis_product = contract.get("analysis_product")
+    if analysis_product not in {
+        "reference_fixed13_v1",
+        "science_optimal_aperture_v1",
+    }:
+        raise StampScienceAnalysisContractError(
+            "analysis contract analysis_product is invalid"
+        )
     captured_contract = contract.get("captured_flux_qa")
     captured_cadences = (
         captured_contract.get("cadences")
@@ -3906,6 +3914,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                 f"analysis artifact hash/readback mismatch: {name}"
             )
     hdf_path = root / "photometry.h5"
+    science_training_indices: NDArray[np.int64] | None = None
     with h5py.File(hdf_path, "r") as handle:
         schema_id = handle.attrs.get("schema_id")
         if isinstance(schema_id, bytes):
@@ -4079,8 +4088,28 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                 int(item.removesuffix("s")) for item in handle["cadences"]
             ):
                 raw_frame_count = count
-        aperture = np.asarray(handle["aperture/aperture_mask"], dtype=bool)
-        background = np.asarray(handle["aperture/background_mask"], dtype=bool)
+        aperture_group = handle.get("aperture")
+        required_aperture_datasets = {
+            "aperture_mask",
+            "background_mask",
+        }
+        if analysis_product == "science_optimal_aperture_v1":
+            required_aperture_datasets.update(
+                {
+                    "signal_template_e",
+                    "noise_template_e",
+                    "training_raw_frame_indices",
+                }
+            )
+        if (
+            not isinstance(aperture_group, h5py.Group)
+            or not required_aperture_datasets.issubset(aperture_group)
+        ):
+            raise StampScienceAnalysisContractError(
+                "authoritative HDF5 aperture product is incomplete"
+            )
+        aperture = np.asarray(aperture_group["aperture_mask"], dtype=bool)
+        background = np.asarray(aperture_group["background_mask"], dtype=bool)
         if (
             aperture.ndim != 2
             or background.shape != aperture.shape
@@ -4090,6 +4119,25 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             raise StampScienceAnalysisContractError(
                 "authoritative HDF5 aperture masks are invalid"
             )
+        if analysis_product == "science_optimal_aperture_v1":
+            signal_template = np.asarray(
+                aperture_group["signal_template_e"], dtype=np.float64
+            )
+            noise_template = np.asarray(
+                aperture_group["noise_template_e"], dtype=np.float64
+            )
+            science_training_indices = np.asarray(
+                aperture_group["training_raw_frame_indices"], dtype=np.int64
+            )
+            if (
+                signal_template.shape != aperture.shape
+                or noise_template.shape != aperture.shape
+                or science_training_indices.ndim != 1
+                or science_training_indices.size == 0
+            ):
+                raise StampScienceAnalysisContractError(
+                    "authoritative HDF5 aperture training products are invalid"
+                )
     aperture_npy = np.load(root / "aperture_mask.npy", allow_pickle=False)
     background_npy = np.load(root / "background_mask.npy", allow_pickle=False)
     if not np.array_equal(aperture_npy, aperture) or not np.array_equal(
@@ -4109,6 +4157,56 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         raise StampScienceAnalysisContractError(
             "aperture definition schema is invalid"
         )
+    if analysis_product == "science_optimal_aperture_v1":
+        required_definition_fields = {
+            "maximum_cumulative_snr",
+            "algorithm",
+            "signal_template_shape",
+            "training_raw_frame_indices",
+        }
+        if not required_definition_fields.issubset(aperture_definition):
+            raise StampScienceAnalysisContractError(
+                "aperture definition lacks science-optimal training fields"
+            )
+        maximum_cumulative_snr = aperture_definition["maximum_cumulative_snr"]
+        algorithm = aperture_definition["algorithm"]
+        signal_template_shape = aperture_definition["signal_template_shape"]
+        recorded_training_indices = aperture_definition["training_raw_frame_indices"]
+        target_peak_yx = aperture_definition.get("target_peak_yx")
+        if (
+            isinstance(maximum_cumulative_snr, bool)
+            or not isinstance(maximum_cumulative_snr, (int, float))
+            or not math.isfinite(float(maximum_cumulative_snr))
+            or not isinstance(algorithm, str)
+            or not algorithm
+            or not isinstance(signal_template_shape, list)
+            or len(signal_template_shape) != 2
+            or any(
+                isinstance(item, bool) or not isinstance(item, int)
+                for item in signal_template_shape
+            )
+            or tuple(signal_template_shape) != aperture.shape
+            or not isinstance(recorded_training_indices, list)
+            or (
+                target_peak_yx is not None
+                and (
+                    not isinstance(target_peak_yx, list)
+                    or len(target_peak_yx) != 2
+                    or any(
+                        isinstance(item, bool) or not isinstance(item, int)
+                        for item in target_peak_yx
+                    )
+                )
+            )
+            or science_training_indices is None
+            or not np.array_equal(
+                np.asarray(recorded_training_indices),
+                science_training_indices,
+            )
+        ):
+            raise StampScienceAnalysisContractError(
+                "aperture definition science-optimal training fields are invalid"
+            )
     _read_json_object(root / "cdpp.json", label="CDPP product")
     quality_summary = _read_json_object(
         root / "quality_summary.json", label="quality summary"
