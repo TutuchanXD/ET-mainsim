@@ -6,10 +6,9 @@ from pathlib import Path
 import pytest
 
 
-def _write_formal_manifest(tmp_path: Path) -> Path:
+def _write_formal_manifest(tmp_path: Path, *, schema_version: int = 3) -> Path:
     from et_mainsim.galaxy_stamp_production import (
         GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
-        GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
     )
     from et_mainsim.stamp_inputs import file_identity
 
@@ -23,7 +22,7 @@ def _write_formal_manifest(tmp_path: Path) -> Path:
         json.dumps(
             {
                 "schema_id": GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
-                "schema_version": GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
+                "schema_version": schema_version,
                 "run_id": "policy-fixture",
                 "observation_product": "final_dn",
                 "background_realization_delivered": False,
@@ -43,6 +42,63 @@ def _write_formal_manifest(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return manifest_path
+
+
+@pytest.mark.parametrize("schema_version", (2, 3))
+def test_raw_coverage_policy_reader_accepts_supported_galaxy_manifest_versions(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    from et_mainsim.raw_coverage_policy import (
+        FrozenRawCoveragePolicyRequest,
+        write_frozen_raw_coverage_policy_v1,
+    )
+
+    manifest_path = _write_formal_manifest(
+        tmp_path,
+        schema_version=schema_version,
+    )
+
+    policy = write_frozen_raw_coverage_policy_v1(
+        FrozenRawCoveragePolicyRequest(
+            production_manifest_path=manifest_path,
+            output_path=manifest_path.parent / "analysis" / "policy.json",
+            minimum_coverage_fraction=0.95,
+            minimum_accepted_bins=10,
+        )
+    )
+
+    assert policy.run_id == "policy-fixture"
+
+
+@pytest.mark.parametrize("schema_version", (1, 4))
+def test_raw_coverage_policy_reader_rejects_unsupported_galaxy_manifest_versions(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    from et_mainsim.raw_coverage_policy import (
+        FrozenRawCoveragePolicyError,
+        FrozenRawCoveragePolicyRequest,
+        write_frozen_raw_coverage_policy_v1,
+    )
+
+    manifest_path = _write_formal_manifest(
+        tmp_path,
+        schema_version=schema_version,
+    )
+
+    with pytest.raises(
+        FrozenRawCoveragePolicyError,
+        match="unsupported Galaxy production manifest version",
+    ):
+        write_frozen_raw_coverage_policy_v1(
+            FrozenRawCoveragePolicyRequest(
+                production_manifest_path=manifest_path,
+                output_path=manifest_path.parent / "analysis" / "policy.json",
+                minimum_coverage_fraction=0.95,
+                minimum_accepted_bins=10,
+            )
+        )
 
 
 def test_frozen_raw_coverage_policy_is_manifest_bound_and_immutable(

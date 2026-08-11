@@ -83,12 +83,11 @@ def _write_publication_receipt(
     return receipt_path
 
 
-def _write_fixture_run(tmp_path: Path) -> Path:
+def _write_fixture_run(tmp_path: Path, *, schema_version: int = 3) -> Path:
     """Build a tiny complete raw+coadd Galaxy delivery campaign."""
 
     from et_mainsim.galaxy_stamp_production import (
         GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
-        GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
     )
     from et_mainsim.stamp_delivery import (
         StampDeliveryBundle,
@@ -111,7 +110,7 @@ def _write_fixture_run(tmp_path: Path) -> Path:
     manifest_path = run_root / "production_manifest.json"
     manifest = {
         "schema_id": GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
-        "schema_version": GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "run_id": RUN_ID,
         "run_root": str(run_root),
         "observation_product": "final_dn",
@@ -207,6 +206,36 @@ def _write_fixture_run(tmp_path: Path) -> Path:
                 )
                 write_stamp_delivery_bundle(destination, bundle)
     return manifest_path
+
+
+@pytest.mark.parametrize("schema_version", (2, 3))
+def test_campaign_qc_reader_accepts_supported_galaxy_manifest_versions(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    import et_mainsim.galaxy_campaign_qc as campaign_qc
+
+    manifest_path = _write_fixture_run(tmp_path, schema_version=schema_version)
+
+    _, manifest, _, _, _ = campaign_qc._load_campaign(manifest_path)
+
+    assert manifest["schema_version"] == schema_version
+
+
+@pytest.mark.parametrize("schema_version", (1, 4))
+def test_campaign_qc_reader_rejects_unsupported_galaxy_manifest_versions(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    import et_mainsim.galaxy_campaign_qc as campaign_qc
+
+    manifest_path = _write_fixture_run(tmp_path, schema_version=schema_version)
+
+    with pytest.raises(
+        campaign_qc.GalaxyCampaignDeliveryQCError,
+        match="unsupported Galaxy production manifest version",
+    ):
+        campaign_qc._load_campaign(manifest_path)
 
 
 def test_campaign_qc_accepts_complete_manifest_anchored_delivery(

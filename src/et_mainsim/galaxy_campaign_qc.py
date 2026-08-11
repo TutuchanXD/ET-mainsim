@@ -32,7 +32,6 @@ import numpy as np
 
 from .galaxy_stamp_production import (
     GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
-    GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
 )
 from .stamp_inputs import file_identity
 from .stamp_delivery import (
@@ -50,6 +49,7 @@ from .time_shards import ContinuousTimeShard, ContinuousTimeShardPlan
 
 GALAXY_CAMPAIGN_DELIVERY_QC_SCHEMA_ID = "et_mainsim.galaxy_campaign_delivery_qc.v1"
 GALAXY_CAMPAIGN_DELIVERY_QC_SCHEMA_VERSION = 1
+_SUPPORTED_GALAXY_STAMP_PRODUCTION_SCHEMA_VERSIONS = frozenset({2, 3})
 
 CampaignCase = Literal["static", "injected"]
 
@@ -396,7 +396,9 @@ def _load_campaign(
     )
     if manifest.get("schema_id") != GALAXY_STAMP_PRODUCTION_SCHEMA_ID:
         raise GalaxyCampaignDeliveryQCError("unsupported Galaxy production manifest")
-    if int(manifest.get("schema_version", 0)) != GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION:
+    if int(manifest.get("schema_version", 0)) not in (
+        _SUPPORTED_GALAXY_STAMP_PRODUCTION_SCHEMA_VERSIONS
+    ):
         raise GalaxyCampaignDeliveryQCError(
             "unsupported Galaxy production manifest version"
         )

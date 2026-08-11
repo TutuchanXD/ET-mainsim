@@ -34,7 +34,6 @@ import numpy as np
 from .galaxy_lightcurves import read_galaxy_factor_snapshot
 from .galaxy_stamp_production import (
     GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
-    GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
 )
 from .reference_photometry import (
     STANDARD_CDPP_WINDOWS_MINUTES,
@@ -56,6 +55,7 @@ STANDARD_STAMP_ANALYSIS_LIGHTCURVE_SCHEMA_ID = (
 _INCOMPLETE_ARCHIVE_SCHEMA_ID = (
     "et_mainsim.standard_stamp_analysis_incomplete_archive.v1"
 )
+_SUPPORTED_GALAXY_STAMP_PRODUCTION_SCHEMA_VERSIONS = frozenset({2, 3})
 
 AnalysisCase = Literal["static", "injected"]
 
@@ -265,7 +265,9 @@ def _load_galaxy_manifest(path: Path) -> tuple[Path, dict[str, Any]]:
             "standard_stamp_analysis_v1 currently requires a formal Galaxy "
             "production manifest"
         )
-    if int(manifest.get("schema_version", 0)) != GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION:
+    if int(manifest.get("schema_version", 0)) not in (
+        _SUPPORTED_GALAXY_STAMP_PRODUCTION_SCHEMA_VERSIONS
+    ):
         raise StandardStampAnalysisError(
             "unsupported Galaxy production manifest version"
         )

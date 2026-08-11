@@ -26,7 +26,6 @@ import numpy as np
 
 from .galaxy_stamp_production import (
     GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
-    GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
 )
 from .raw_coverage_policy import (
     FrozenRawCoveragePolicy,
@@ -48,6 +47,7 @@ _COVERAGE_SCHEMA_ID = "et_mainsim.raw_coverage_aware_stamp_analysis.v3"
 _COVERAGE_SCHEMA_VERSION = 3
 _CAMPAIGN_QC_SCHEMA_ID = "et_mainsim.galaxy_campaign_delivery_qc.v1"
 _TIME_TOLERANCE = 1e-8
+_SUPPORTED_GALAXY_STAMP_PRODUCTION_SCHEMA_VERSIONS = frozenset({2, 3})
 
 
 class GalaxyRawCoverageCampaignSummaryError(ValueError):
@@ -380,7 +380,9 @@ def _load_campaign(
     manifest = _json_object(manifest_path, label="production manifest")
     if manifest.get("schema_id") != GALAXY_STAMP_PRODUCTION_SCHEMA_ID:
         raise GalaxyRawCoverageCampaignSummaryError("unsupported Galaxy production manifest")
-    if int(manifest.get("schema_version", 0)) != GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION:
+    if int(manifest.get("schema_version", 0)) not in (
+        _SUPPORTED_GALAXY_STAMP_PRODUCTION_SCHEMA_VERSIONS
+    ):
         raise GalaxyRawCoverageCampaignSummaryError(
             "unsupported Galaxy production manifest version"
         )
