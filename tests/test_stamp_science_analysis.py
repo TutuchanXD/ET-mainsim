@@ -2032,6 +2032,233 @@ def test_published_analysis_validator_rejects_a_tampered_portable_artifact(
         backend.validate_stamp_science_analysis_v1(publication.output_dir)
 
 
+@pytest.fixture(scope="module")
+def _schema_version_publication_root(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    import photsim7.aperture as legacy_aperture
+
+    root = tmp_path_factory.mktemp("schema-version-publication")
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            legacy_aperture,
+            "maximize_cumulative_snr",
+            _select_target_pixels,
+        )
+        raw_paths, coadd_paths, q = _series_fixture(
+            root / "inputs",
+            stamp_shape=(21, 23),
+            target_yx=(10, 11),
+        )
+        import et_mainsim.stamp_science_analysis as backend
+
+        publication = backend.analyze_stamp_science_product_set_v1(
+            _request(
+                root,
+                raw_paths=raw_paths,
+                coadd_paths=coadd_paths,
+                q=q,
+                output_name="baseline-products",
+            )
+        )
+    return publication.output_dir
+
+
+@pytest.mark.parametrize(
+    "schema_surface",
+    [
+        "analysis_manifest",
+        "analysis_contract",
+        "science_photometry_contract",
+        "reference_lightcurve_contract",
+        "hdf_analysis_attr",
+        "aperture_definition",
+        "quality_summary",
+        "reference_lightcurve_ecsv",
+        "photometry_ecsv",
+        "product_set_manifest",
+    ],
+)
+@pytest.mark.parametrize(
+    "invalid_version",
+    [
+        pytest.param(2.0, id="float"),
+        pytest.param("2", id="string"),
+        pytest.param(True, id="bool"),
+    ],
+)
+def test_public_readback_requires_native_integer_schema_versions(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    schema_surface: str,
+    invalid_version: object,
+) -> None:
+    from astropy.table import Table
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "schema-version-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    product_set_manifest_path = root / "product_set_manifest.json"
+    if schema_surface == "product_set_manifest":
+        product_set_manifest = json.loads(
+            product_set_manifest_path.read_text(encoding="utf-8")
+        )
+        product_set_manifest["schema_version"] = invalid_version
+        product_set_manifest_path.write_text(
+            json.dumps(product_set_manifest),
+            encoding="utf-8",
+        )
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="schema/completeness",
+        ):
+            backend.validate_stamp_science_analysis_product_set_v1(root)
+        return
+
+    child_manifest_path = product_root / "analysis_manifest.json"
+    child_manifest = json.loads(child_manifest_path.read_text(encoding="utf-8"))
+    if schema_surface == "analysis_manifest":
+        child_manifest["schema_version"] = invalid_version
+    elif schema_surface in {
+        "analysis_contract",
+        "science_photometry_contract",
+        "reference_lightcurve_contract",
+    }:
+        contract = child_manifest["contract"]
+        if schema_surface == "analysis_contract":
+            contract["schema_version"] = invalid_version
+        elif schema_surface == "science_photometry_contract":
+            contract["science_photometry_schema_version"] = invalid_version
+        else:
+            contract["reference_lightcurve"]["schema_version"] = invalid_version
+        with h5py.File(product_root / "photometry.h5", "r+") as handle:
+            del handle["analysis_contract_json"]
+            handle.create_dataset(
+                "analysis_contract_json",
+                data=np.bytes_(
+                    json.dumps(
+                        contract,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ),
+            )
+        child_manifest["artifacts"]["photometry.h5"] = backend._file_identity(
+            product_root / "photometry.h5"
+        )
+    elif schema_surface == "hdf_analysis_attr":
+        with h5py.File(product_root / "photometry.h5", "r+") as handle:
+            handle.attrs["schema_version"] = invalid_version
+        child_manifest["artifacts"]["photometry.h5"] = backend._file_identity(
+            product_root / "photometry.h5"
+        )
+    elif schema_surface in {"aperture_definition", "quality_summary"}:
+        artifact_name = (
+            "aperture_definition.json"
+            if schema_surface == "aperture_definition"
+            else "quality_summary.json"
+        )
+        artifact_path = product_root / artifact_name
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        payload["schema_version"] = invalid_version
+        artifact_path.write_text(json.dumps(payload), encoding="utf-8")
+        child_manifest["artifacts"][artifact_name] = backend._file_identity(
+            artifact_path
+        )
+    else:
+        artifact_name = (
+            "reference_lightcurve.ecsv"
+            if schema_surface == "reference_lightcurve_ecsv"
+            else "photometry.ecsv"
+        )
+        artifact_path = product_root / artifact_name
+        table = Table.read(artifact_path, format="ascii.ecsv")
+        table.meta["schema_version"] = invalid_version
+        table.write(artifact_path, format="ascii.ecsv", overwrite=True)
+        child_manifest["artifacts"][artifact_name] = backend._file_identity(
+            artifact_path
+        )
+
+    child_manifest_path.write_text(json.dumps(child_manifest), encoding="utf-8")
+    product_set_manifest = json.loads(
+        product_set_manifest_path.read_text(encoding="utf-8")
+    )
+    product_set_manifest["products"][product_name]["analysis_manifest"] = (
+        backend._file_identity(child_manifest_path)
+    )
+    product_set_manifest_path.write_text(
+        json.dumps(product_set_manifest),
+        encoding="utf-8",
+    )
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="schema|contract",
+        ):
+            validator(path)
+
+
+@pytest.mark.parametrize(
+    ("attribute_name", "invalid_value"),
+    [
+        pytest.param("complete", 1, id="complete-integer"),
+        pytest.param(
+            "background_realization_used",
+            0,
+            id="background-realization-integer",
+        ),
+    ],
+)
+def test_public_readback_requires_native_hdf_boolean_analysis_attributes(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    attribute_name: str,
+    invalid_value: int,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "hdf-boolean-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    hdf_path = product_root / "photometry.h5"
+    with h5py.File(hdf_path, "r+") as handle:
+        handle.attrs[attribute_name] = invalid_value
+
+    child_manifest_path = product_root / "analysis_manifest.json"
+    child_manifest = json.loads(child_manifest_path.read_text(encoding="utf-8"))
+    child_manifest["artifacts"]["photometry.h5"] = backend._file_identity(hdf_path)
+    child_manifest_path.write_text(json.dumps(child_manifest), encoding="utf-8")
+    product_set_manifest_path = root / "product_set_manifest.json"
+    product_set_manifest = json.loads(
+        product_set_manifest_path.read_text(encoding="utf-8")
+    )
+    product_set_manifest["products"][product_name]["analysis_manifest"] = (
+        backend._file_identity(child_manifest_path)
+    )
+    product_set_manifest_path.write_text(
+        json.dumps(product_set_manifest),
+        encoding="utf-8",
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="schema/completeness",
+        ):
+            validator(path)
+
+
 @pytest.mark.parametrize("tamper_mode", ["nan", "positive_drift"])
 def test_publication_and_product_set_bind_authoritative_q_content_identity(
     tmp_path: Path,
@@ -2106,7 +2333,19 @@ def test_publication_and_product_set_bind_authoritative_q_content_identity(
 
 @pytest.mark.parametrize(
     "tamper_mode",
-    ["json_arbitrary", "ecsv_schema", "ecsv_dtype", "ecsv_value"],
+    [
+        "json_arbitrary",
+        "json_numeric_type",
+        "ecsv_schema",
+        "ecsv_dtype",
+        "ecsv_value",
+        "negative_observed",
+        "negative_residual",
+        "binned_schema",
+        "binned_invariant",
+        "expectation_status",
+        "local_status_wrong_contract",
+    ],
 )
 def test_publication_and_product_set_bind_portable_cdpp_to_authoritative_hdf5(
     tmp_path: Path,
@@ -2138,13 +2377,26 @@ def test_publication_and_product_set_bind_portable_cdpp_to_authoritative_hdf5(
         )
     )
     product = publication.science_optimal_aperture
+    artifact_paths: list[Path]
     if tamper_mode == "json_arbitrary":
         artifact_path = product.cdpp_path
         artifact_path.write_text(
             json.dumps({"arbitrary": "nonempty"}),
             encoding="utf-8",
         )
-    else:
+        artifact_paths = [artifact_path]
+    elif tamper_mode == "json_numeric_type":
+        payload = json.loads(product.cdpp_path.read_text(encoding="utf-8"))
+        cadence_name = min(
+            payload["cadences"],
+            key=lambda name: int(name.removesuffix("s")),
+        )
+        payload["cadences"][cadence_name]["coadd_factor"] = float(
+            payload["cadences"][cadence_name]["coadd_factor"]
+        )
+        product.cdpp_path.write_text(json.dumps(payload), encoding="utf-8")
+        artifact_paths = [product.cdpp_path]
+    elif tamper_mode in {"ecsv_schema", "ecsv_dtype", "ecsv_value"}:
         artifact_path = product.output_dir / "cdpp.ecsv"
         table = Table.read(artifact_path, format="ascii.ecsv")
         if tamper_mode == "ecsv_schema":
@@ -2157,13 +2409,100 @@ def test_publication_and_product_set_bind_portable_cdpp_to_authoritative_hdf5(
         else:
             table["observed_cdpp_ppm"][0] += 1.0
         table.write(artifact_path, format="ascii.ecsv", overwrite=True)
+        artifact_paths = [artifact_path]
+    else:
+        with h5py.File(product.hdf5_path, "r+") as handle:
+            payload = json.loads(handle["cdpp_json"][()].decode("utf-8"))
+            cadence_name = min(
+                payload["cadences"],
+                key=lambda name: int(name.removesuffix("s")),
+            )
+            cadence_seconds = int(cadence_name.removesuffix("s"))
+            cadence = payload["cadences"][cadence_name]
+            expectation = cadence["expectation_background"]
+            window_name = min(
+                expectation["metrics_by_window_minutes"],
+                key=int,
+            )
+            table = Table.read(
+                product.output_dir / "cdpp.ecsv",
+                format="ascii.ecsv",
+            )
+            if tamper_mode in {"negative_observed", "negative_residual"}:
+                column = (
+                    "observed_cdpp_ppm"
+                    if tamper_mode == "negative_observed"
+                    else "residual_cdpp_ppm"
+                )
+                expectation["metrics_by_window_minutes"][window_name][column] = -1.0
+                table[column][0] = -1.0
+            elif tamper_mode == "binned_schema":
+                expectation["binned_rows"][0].pop("coverage_fraction")
+            elif tamper_mode == "binned_invariant":
+                expectation["binned_rows"][0]["coverage_fraction"] = -1.0
+            elif tamper_mode == "expectation_status":
+                cadence["expectation_background"] = {
+                    "status": "not_computed",
+                    "reason": "background_strategy_delivered_expectation_only",
+                }
+                table = table[
+                    ~(
+                        (np.asarray(table["cadence_seconds"]) == cadence_seconds)
+                        & (
+                            np.asarray(table["background_estimator"])
+                            == "expectation_background"
+                        )
+                    )
+                ]
+            else:
+                cadence["local_background"] = {
+                    "status": "not_computed",
+                    "reason": "background_strategy_delivered_expectation_only",
+                }
+                table = table[
+                    ~(
+                        (np.asarray(table["cadence_seconds"]) == cadence_seconds)
+                        & (
+                            np.asarray(table["background_estimator"])
+                            == "local_background"
+                        )
+                    )
+                ]
+            del handle["cdpp_json"]
+            handle.create_dataset(
+                "cdpp_json",
+                data=np.bytes_(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ),
+            )
+        product.cdpp_path.write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+        table.write(
+            product.output_dir / "cdpp.ecsv",
+            format="ascii.ecsv",
+            overwrite=True,
+        )
+        artifact_paths = [
+            product.hdf5_path,
+            product.cdpp_path,
+            product.output_dir / "cdpp.ecsv",
+        ]
 
     child_manifest = json.loads(
         product.manifest_path.read_text(encoding="utf-8")
     )
-    child_manifest["artifacts"][artifact_path.name] = backend._file_identity(
-        artifact_path
-    )
+    for artifact_path in artifact_paths:
+        child_manifest["artifacts"][artifact_path.name] = backend._file_identity(
+            artifact_path
+        )
     product.manifest_path.write_text(
         json.dumps(child_manifest),
         encoding="utf-8",
@@ -2188,7 +2527,12 @@ def test_publication_and_product_set_bind_portable_cdpp_to_authoritative_hdf5(
     ):
         with pytest.raises(
             backend.StampScienceAnalysisContractError,
-            match="CDPP",
+            match=(
+                "CDPP background role"
+                if tamper_mode
+                in {"expectation_status", "local_status_wrong_contract"}
+                else "CDPP"
+            ),
         ):
             validator(path)
 
