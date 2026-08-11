@@ -439,6 +439,28 @@ def test_load_manifest_rejects_legacy_v2_schema_explicitly(tmp_path) -> None:
         production._load_manifest(manifest_path)
 
 
+@pytest.mark.parametrize("schema_version", (3.0, "3", True))
+def test_load_manifest_rejects_non_native_integer_v3_schema(
+    tmp_path,
+    schema_version,
+) -> None:
+    import et_mainsim.galaxy_stamp_production as production
+
+    manifest_path = tmp_path / "invalid-v3.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_id": production.GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+                "schema_version": schema_version,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported Galaxy.*version"):
+        production._load_manifest(manifest_path)
+
+
 def test_formal_pixel_phase_profile_contract_fails_closed_on_manifest_and_asset_drift(
     tmp_path,
     monkeypatch,

@@ -1034,13 +1034,13 @@ def _load_manifest(path: Path | str) -> tuple[Path, dict[str, Any]]:
     if payload.get("schema_id") != GALAXY_STAMP_PRODUCTION_SCHEMA_ID:
         raise ValueError("unsupported Galaxy stamp production manifest")
     schema_version = payload.get("schema_version")
-    if not isinstance(schema_version, bool) and schema_version == 2:
+    if type(schema_version) is int and schema_version == 2:
         raise ValueError(
             "legacy Galaxy stamp production manifest version 2 is unsupported; "
             "prepare a v3 manifest"
         )
     if (
-        isinstance(schema_version, bool)
+        type(schema_version) is not int
         or schema_version != GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION
     ):
         raise ValueError("unsupported Galaxy stamp production manifest version")

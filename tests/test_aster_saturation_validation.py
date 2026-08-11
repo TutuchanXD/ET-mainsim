@@ -355,3 +355,25 @@ def test_aster_manifest_loader_rejects_legacy_v1_schema_explicitly(tmp_path) -> 
 
     with pytest.raises(ValueError, match="legacy.*version 1.*unsupported.*v2"):
         validation._load_manifest(manifest_path)
+
+
+@pytest.mark.parametrize("schema_version", (2.0, "2", True))
+def test_aster_manifest_loader_rejects_non_native_integer_v2_schema(
+    tmp_path,
+    schema_version,
+) -> None:
+    import et_mainsim.aster_saturation_validation as validation
+
+    manifest_path = tmp_path / "invalid-v2.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_id": validation.ASTER_G6_SATURATION_SCHEMA_ID,
+                "schema_version": schema_version,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported Aster.*version"):
+        validation._load_manifest(manifest_path)

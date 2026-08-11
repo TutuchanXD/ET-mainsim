@@ -616,13 +616,13 @@ def _load_manifest(path: Path | str) -> tuple[Path, dict[str, Any]]:
     if payload.get("schema_id") != ASTER_G6_SATURATION_SCHEMA_ID:
         raise ValueError("unsupported Aster saturation validation manifest")
     schema_version = payload.get("schema_version")
-    if not isinstance(schema_version, bool) and schema_version == 1:
+    if type(schema_version) is int and schema_version == 1:
         raise ValueError(
             "legacy Aster saturation manifest version 1 is unsupported; "
             "prepare a v2 manifest"
         )
     if (
-        isinstance(schema_version, bool)
+        type(schema_version) is not int
         or schema_version != ASTER_G6_SATURATION_SCHEMA_VERSION
     ):
         raise ValueError("unsupported Aster saturation validation manifest version")
