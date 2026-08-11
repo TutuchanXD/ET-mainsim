@@ -2236,6 +2236,22 @@ class _RepresentativeFrame:
     input_shard_index: int
 
 
+def _direct_sample_local_indices(
+    frame_count: int,
+    *,
+    samples_per_shard: int,
+) -> tuple[int, ...]:
+    count = min(samples_per_shard, frame_count)
+    if count == 1:
+        return (0,)
+    return tuple(
+        int(value)
+        for value in np.rint(
+            np.linspace(0, frame_count - 1, num=count)
+        ).astype(np.int64)
+    )
+
+
 def _direct_samples(
     headers: Mapping[int, tuple[_InputHeader, ...]],
     *,
@@ -2244,17 +2260,10 @@ def _direct_samples(
     result: list[_DirectSample] = []
     for factor, series in sorted(headers.items()):
         for header in series:
-            count = min(samples_per_shard, header.formal.frame_count)
-            if count == 1:
-                indices = (0,)
-            else:
-                indices = tuple(
-                    int(value)
-                    for value in np.rint(
-                        np.linspace(0, header.formal.frame_count - 1, num=count)
-                    ).astype(np.int64)
-                )
-            for index in indices:
+            for index in _direct_sample_local_indices(
+                header.formal.frame_count,
+                samples_per_shard=samples_per_shard,
+            ):
                 result.append(
                     _DirectSample(
                         factor=factor,
@@ -4995,80 +5004,106 @@ def _validate_publication_direct_parity_v1(
         raise StampScienceAnalysisContractError(
             "analysis direct-coadd parity contract is invalid"
         )
-    bound_shards: dict[tuple[int, str], Mapping[str, Any]] = {}
+    configured_factors = set(policy.coadd_factors) - {1}
+    parsed_shards: dict[int, list[Any]] = {}
     for factor_text, records in direct_shards.items():
         if (
             not isinstance(factor_text, str)
             or not factor_text.isdecimal()
             or str(int(factor_text)) != factor_text
             or not isinstance(records, list)
+            or not records
         ):
             raise StampScienceAnalysisContractError(
                 "analysis direct-coadd parity contract is invalid"
             )
         factor = int(factor_text)
+        if factor not in configured_factors or factor in parsed_shards:
+            raise StampScienceAnalysisContractError(
+                "analysis direct-coadd parity contract is invalid"
+            )
+        parsed_shards[factor] = records
+
+    actual_factors = set(parsed_shards)
+    if (
+        policy.require_direct_coadd_parity
+        and actual_factors != configured_factors
+    ) or not actual_factors.issubset(configured_factors):
+        raise StampScienceAnalysisContractError(
+            "analysis direct-coadd parity contract is invalid"
+        )
+
+    expected_samples: list[dict[str, Any]] = []
+    bound_paths: set[tuple[int, str]] = set()
+    for factor, records in sorted(parsed_shards.items()):
+        expected_start = raw_frame_interval["start_index"]
         for record in records:
             path = record.get("path") if isinstance(record, Mapping) else None
+            frame_count = (
+                record.get("frame_count") if isinstance(record, Mapping) else None
+            )
+            first_start = (
+                record.get("first_raw_frame_start")
+                if isinstance(record, Mapping)
+                else None
+            )
+            last_stop = (
+                record.get("last_raw_frame_stop")
+                if isinstance(record, Mapping)
+                else None
+            )
             if (
                 not isinstance(record, Mapping)
                 or type(record.get("coadd_factor")) is not int
                 or record["coadd_factor"] != factor
                 or not isinstance(path, str)
                 or not _is_canonical_absolute_path_text(path)
-                or (factor, path) in bound_shards
+                or (factor, path) in bound_paths
+                or type(frame_count) is not int
+                or not _is_native_int64_index(frame_count)
+                or frame_count <= 0
+                or type(first_start) is not int
+                or not _is_native_int64_index(first_start)
+                or type(last_stop) is not int
+                or not _is_native_int64_index(last_stop)
+                or first_start != expected_start
+                or last_stop <= first_start
+                or last_stop - first_start != frame_count * factor
+                or last_stop > raw_frame_interval["stop_index_exclusive"]
             ):
                 raise StampScienceAnalysisContractError(
                     "analysis direct-coadd parity contract is invalid"
                 )
-            bound_shards[(factor, path)] = record
+            bound_paths.add((factor, path))
+            expected_samples.extend(
+                {
+                    "factor": factor,
+                    "path": path,
+                    "local_frame_index": local_index,
+                    "raw_frame_start_index": first_start + local_index * factor,
+                }
+                for local_index in _direct_sample_local_indices(
+                    frame_count,
+                    samples_per_shard=policy.direct_coadd_samples_per_shard,
+                )
+            )
+            expected_start = last_stop
+        if expected_start != raw_frame_interval["stop_index_exclusive"]:
+            raise StampScienceAnalysisContractError(
+                "analysis direct-coadd parity contract is invalid"
+            )
 
-    seen_samples: set[tuple[int, str, int]] = set()
-    for sample in samples:
-        if not isinstance(sample, Mapping) or set(sample) != (
-            _DIRECT_COADD_PARITY_SAMPLE_FIELDS
-        ):
-            raise StampScienceAnalysisContractError(
-                "analysis direct-coadd parity sample is invalid"
-            )
-        factor = sample.get("factor")
-        path = sample.get("path")
-        local_index = sample.get("local_frame_index")
-        raw_start = sample.get("raw_frame_start_index")
-        if (
-            type(factor) is not int
-            or factor not in policy.coadd_factors
-            or factor == 1
-            or not isinstance(path, str)
-            or type(local_index) is not int
-            or not _is_native_int64_index(local_index)
-            or local_index < 0
-            or type(raw_start) is not int
-            or not _is_native_int64_index(raw_start)
-            or raw_start < raw_frame_interval["start_index"]
-            or raw_start >= raw_frame_interval["stop_index_exclusive"]
-        ):
-            raise StampScienceAnalysisContractError(
-                "analysis direct-coadd parity sample is invalid"
-            )
-        bound = bound_shards.get((factor, path))
-        frame_count = bound.get("frame_count") if bound is not None else None
-        first_start = (
-            bound.get("first_raw_frame_start") if bound is not None else None
+    if _canonical_json_text(
+        samples,
+        name="recorded direct-coadd parity samples",
+    ) != _canonical_json_text(
+        expected_samples,
+        name="recomputed direct-coadd parity samples",
+    ):
+        raise StampScienceAnalysisContractError(
+            "analysis direct-coadd parity samples differ from the deterministic "
+            "factor/shard sample set"
         )
-        sample_key = (factor, path, local_index)
-        if (
-            bound is None
-            or type(frame_count) is not int
-            or frame_count <= local_index
-            or type(first_start) is not int
-            or not _is_native_int64_index(first_start)
-            or raw_start != first_start + local_index * factor
-            or sample_key in seen_samples
-        ):
-            raise StampScienceAnalysisContractError(
-                "analysis direct-coadd parity sample differs from its bound shard"
-            )
-        seen_samples.add(sample_key)
 
 
 def _validate_publication_code_provenance_v1(
@@ -5718,17 +5753,17 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             "analysis contract flux uncertainty model is invalid"
         )
     analysis_policy = _publication_analysis_policy_v1(contract)
+    raw_cadence_anchor = _raw_cadence_anchor_contract_v1(
+        contract,
+        raw_frame_interval=raw_frame_interval,
+        raw_exposure_seconds=raw_exposure_seconds,
+    )
     _validate_publication_direct_parity_v1(
         contract,
         policy=analysis_policy,
         raw_frame_interval=raw_frame_interval,
     )
     _validate_publication_code_provenance_v1(contract)
-    raw_cadence_anchor = _raw_cadence_anchor_contract_v1(
-        contract,
-        raw_frame_interval=raw_frame_interval,
-        raw_exposure_seconds=raw_exposure_seconds,
-    )
     (
         read_noise_e_per_raw_pixel,
         quantization_noise_e_per_raw_pixel,

@@ -2397,6 +2397,41 @@ def test_publication_requires_an_exact_successful_direct_parity_record(
             validator(path)
 
 
+def test_publication_requires_complete_deterministic_direct_parity_samples(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "direct-parity-sample-set-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    manifest = json.loads(
+        (product_root / "analysis_manifest.json").read_text(encoding="utf-8")
+    )
+    contract = manifest["contract"]
+    parity = contract["direct_coadd_parity"]
+    assert parity["sample_count"] == len(parity["samples"]) == 2
+    parity["samples"].pop()
+    parity["sample_count"] = len(parity["samples"])
+    _replace_product_contract(
+        root,
+        product_name=product_name,
+        contract=contract,
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="direct.*parity",
+        ):
+            validator(path)
+
+
 def test_publication_cross_binds_representative_pixels_to_factor_one_photometry(
     tmp_path: Path,
     _schema_version_publication_root: Path,
