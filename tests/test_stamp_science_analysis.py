@@ -2462,6 +2462,141 @@ def test_publication_requires_exact_representative_frame_contract(
 @pytest.mark.parametrize(
     "tamper_mode",
     [
+        "selection_policy",
+        "clean_definition",
+        "selection_role",
+        "raw_start",
+        "raw_stop",
+        "input_path",
+        "input_sha",
+        "string_dtype",
+        "contract_frame_length",
+        "contract_field_type",
+        "contract_raw_start_type",
+        "contract_shard_index",
+        "contract_selection_role",
+        "contract_raw_start",
+        "contract_input_path",
+        "contract_input_sha",
+        "contract_frame_extra_field",
+    ],
+)
+def test_publication_binds_representative_frame_provenance_to_contract(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    tamper_mode: str,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "representative-provenance-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    representative_path = product_root / "representative_calibrated_frames.h5"
+    manifest_path = product_root / "analysis_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    contract = manifest["contract"]
+    representative_contract = contract["representative_calibrated_frames"]
+    contract_changed = tamper_mode in {
+        "selection_policy",
+        "clean_definition",
+        "contract_frame_length",
+        "contract_field_type",
+        "contract_raw_start_type",
+        "contract_shard_index",
+        "contract_selection_role",
+        "contract_raw_start",
+        "contract_input_path",
+        "contract_input_sha",
+        "contract_frame_extra_field",
+    }
+    if tamper_mode == "selection_policy":
+        representative_contract["selection_policy"] = "forged_selection_policy"
+    elif tamper_mode == "clean_definition":
+        representative_contract["clean_definition"] = "forged_clean_definition"
+    elif tamper_mode == "contract_frame_length":
+        representative_contract["frames"].pop()
+    elif tamper_mode == "contract_field_type":
+        representative_contract["frames"][0]["input_shard_index"] = 0.0
+    elif tamper_mode == "contract_raw_start_type":
+        representative_contract["frames"][0]["raw_frame_start_index"] = 0.0
+    elif tamper_mode == "contract_shard_index":
+        representative_contract["frames"][0]["input_shard_index"] = 999
+    elif tamper_mode == "contract_selection_role":
+        representative_contract["frames"][0]["selection_role"] = "forged_role"
+    elif tamper_mode == "contract_raw_start":
+        representative_contract["frames"][0]["raw_frame_start_index"] = 1_000
+    elif tamper_mode == "contract_input_path":
+        representative_contract["frames"][0]["input_shard_path"] = (
+            "/forged/input.h5"
+        )
+    elif tamper_mode == "contract_input_sha":
+        representative_contract["frames"][0]["input_shard_semantic_sha256"] = (
+            "0" * 64
+        )
+    elif tamper_mode == "contract_frame_extra_field":
+        representative_contract["frames"][0]["unexpected"] = "unbound"
+    else:
+        with h5py.File(representative_path, "r+") as handle:
+            if tamper_mode == "selection_role":
+                handle["selection_role"][0] = "forged_role"
+            elif tamper_mode == "raw_start":
+                handle["raw_frame_start_index"][0] = 1_000
+                handle["raw_frame_stop_index_exclusive"][0] = 1_001
+            elif tamper_mode == "raw_stop":
+                start = int(handle["raw_frame_start_index"][0])
+                handle["raw_frame_stop_index_exclusive"][0] = start + 2
+            elif tamper_mode == "input_path":
+                handle["input_shard_path"][0] = "/forged/input.h5"
+            elif tamper_mode == "input_sha":
+                handle["input_shard_semantic_sha256"][0] = "0" * 64
+            else:
+                del handle["selection_role"]
+                handle.create_dataset("selection_role", data=np.arange(3))
+
+    if contract_changed:
+        hdf_path = product_root / "photometry.h5"
+        with h5py.File(hdf_path, "r+") as handle:
+            del handle["analysis_contract_json"]
+            handle.create_dataset(
+                "analysis_contract_json",
+                data=np.bytes_(
+                    json.dumps(
+                        contract,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ),
+            )
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        _rehash_product_artifact(
+            root,
+            product_name=product_name,
+            artifact_name="photometry.h5",
+        )
+    else:
+        _rehash_product_artifact(
+            root,
+            product_name=product_name,
+            artifact_name="representative_calibrated_frames.h5",
+        )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="representative calibrated-frame provenance",
+        ):
+            validator(path)
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
         "contract_cadences",
         "policy_factors",
         "policy_raw_exposure",
