@@ -205,6 +205,14 @@ def _require_aster_g6_runtime_contract(
         readout.get(key) != value for key, value in expected_readout.items()
     ):
         raise ValueError("Aster saturation readout is not the frozen contract")
+    dynamic_effects = spec.get("dynamic_effects")
+    dva = (
+        dynamic_effects.get("dva")
+        if isinstance(dynamic_effects, Mapping)
+        else None
+    )
+    if not isinstance(dva, Mapping) or dva.get("enabled") is not False:
+        raise ValueError("Aster saturation DVA must remain disabled")
     artifacts = spec.get("artifacts")
     if (
         not isinstance(artifacts, Mapping)

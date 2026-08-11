@@ -321,6 +321,14 @@ def test_aster_g6_runtime_contract_rejects_manifest_or_profile_drift(
     with pytest.raises(ValueError, match="detector response"):
         validation._require_aster_g6_runtime_contract(prv_off, data_root=data_root)
 
+    dva_on = copy.deepcopy(manifest)
+    dva_on["simulation_spec_base"]["dynamic_effects"]["dva"]["enabled"] = True
+    dva_on["simulation_spec_base_sha256"] = validation._canonical_json_sha256(
+        dva_on["simulation_spec_base"]
+    )
+    with pytest.raises(ValueError, match="DVA"):
+        validation._require_aster_g6_runtime_contract(dva_on, data_root=data_root)
+
     bad_hash = copy.deepcopy(manifest)
     bad_hash["simulation_spec_base_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="simulation spec identity"):
