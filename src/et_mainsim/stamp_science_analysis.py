@@ -6437,7 +6437,13 @@ def validate_stamp_science_analysis_product_set_v1(
         }
         if common_context is None:
             common_context = dict(context)
-        elif dict(context) != dict(common_context):
+        elif _canonical_json_text(
+            dict(context),
+            name=f"{name} analysis context",
+        ) != _canonical_json_text(
+            dict(common_context),
+            name="common child analysis context",
+        ):
             raise StampScienceAnalysisContractError(
                 "analysis products bind different source/production contexts"
             )
@@ -6448,7 +6454,13 @@ def validate_stamp_science_analysis_product_set_v1(
                 "analysis products bind different raw semantic identities/policy"
             )
         validations[name] = validation
-    if dict(manifest.get("analysis_context", {})) != dict(common_context or {}):
+    if _canonical_json_text(
+        manifest.get("analysis_context", {}),
+        name="product-set analysis context",
+    ) != _canonical_json_text(
+        dict(common_context or {}),
+        name="common child analysis context",
+    ):
         raise StampScienceAnalysisContractError(
             "product-set and child analysis contexts differ"
         )

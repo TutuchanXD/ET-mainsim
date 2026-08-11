@@ -2477,6 +2477,29 @@ def test_product_set_binds_supported_formal_profile_to_children(
         backend.validate_stamp_science_analysis_product_set_v1(root)
 
 
+def test_product_set_compares_top_analysis_context_types_exactly(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "top-context-type-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_set_path = root / "product_set_manifest.json"
+    product_set = json.loads(product_set_path.read_text(encoding="utf-8"))
+    noise_model = product_set["analysis_context"]["noise_model"]
+    read_noise = noise_model["read_noise_e_per_raw_pixel"]
+    assert type(read_noise) is float
+    noise_model["read_noise_e_per_raw_pixel"] = int(read_noise)
+    product_set_path.write_text(json.dumps(product_set), encoding="utf-8")
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="product-set and child analysis contexts differ",
+    ):
+        backend.validate_stamp_science_analysis_product_set_v1(root)
+
+
 def test_public_readback_compares_embedded_contract_type_sensitively(
     tmp_path: Path,
     _schema_version_publication_root: Path,
