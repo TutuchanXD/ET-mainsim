@@ -5438,10 +5438,70 @@ STAMP_SCIENCE_ANALYSIS_REQUEST_SCHEMA_VERSION = 2
 STAMP_SCIENCE_FORMAL_PROFILE_ID = "et_stamp_science_formal_10s_v2"
 
 
+def _formal_package_reproducibility_identity_v1(
+    record: object,
+    *,
+    distribution_name: str,
+) -> tuple[Any, ...] | None:
+    """Normalize either a clean checkout or a verified installed wheel."""
+
+    if not isinstance(record, Mapping):
+        return None
+    version = record.get("version")
+    if not isinstance(version, str) or not version:
+        return None
+    commit = record.get("commit")
+    dirty = record.get("dirty")
+    if (
+        isinstance(commit, str)
+        and len(commit) == 40
+        and all(character in "0123456789abcdef" for character in commit.lower())
+        and dirty is False
+    ):
+        return ("clean_git_commit_v1", commit.lower(), version)
+    if commit is not None or dirty is not None:
+        return None
+
+    identity = record.get("distribution_identity")
+    if (
+        not isinstance(identity, Mapping)
+        or set(identity)
+        != {
+            "schema_id",
+            "name",
+            "version",
+            "record_entry_count",
+            "record_tree_sha256",
+        }
+        or identity.get("schema_id")
+        != "et_mainsim.installed_distribution_identity.v1"
+        or identity.get("name") != distribution_name
+        or identity.get("version") != version
+        or type(identity.get("record_entry_count")) is not int
+        or identity["record_entry_count"] <= 0
+    ):
+        return None
+    record_digest = identity.get("record_tree_sha256")
+    if (
+        not isinstance(record_digest, str)
+        or len(record_digest) != 64
+        or record_digest != record_digest.lower()
+        or any(character not in "0123456789abcdef" for character in record_digest)
+    ):
+        return None
+    return (
+        "verified_installed_distribution_v1",
+        distribution_name,
+        version,
+        identity["record_entry_count"],
+        record_digest,
+    )
+
+
 def collect_formal_analysis_code_identity_v1(
     repo_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Collect trusted formal analysis provenance from the executing checkout."""
+    """Collect trusted provenance from a checkout or installed wheel."""
 
     root = (
         Path(__file__).resolve().parents[2]
@@ -5449,18 +5509,20 @@ def collect_formal_analysis_code_identity_v1(
         else Path(repo_root).expanduser().resolve()
     )
     provenance = collect_provenance(root)
-    for name in ("et_mainsim", "photsim7"):
-        record = provenance.get(name)
-        commit = record.get("commit") if isinstance(record, Mapping) else None
-        dirty = record.get("dirty") if isinstance(record, Mapping) else None
+    for provenance_name, distribution_name in (
+        ("et_mainsim", "et-mainsim"),
+        ("photsim7", "photsim7"),
+    ):
         if (
-            not isinstance(commit, str)
-            or len(commit) != 40
-            or any(character not in "0123456789abcdef" for character in commit.lower())
-            or dirty is not False
+            _formal_package_reproducibility_identity_v1(
+                provenance.get(provenance_name),
+                distribution_name=distribution_name,
+            )
+            is None
         ):
             raise StampScienceAnalysisContractError(
-                "formal analysis requires clean known ET-mainsim and Photsim7 commits"
+                "formal analysis requires clean Git commits or verified installed "
+                "distributions for ET-mainsim and Photsim7"
             )
     dependencies = {}
     for distribution in ("numpy", "h5py", "astropy", "matplotlib", "torch"):
@@ -6093,17 +6155,23 @@ def _formal_code_identity_matches_execution_v1(
 ) -> bool:
     """Compare reproducibility invariants while allowing a different run host."""
 
+    required_fields = {
+        "schema_id",
+        "schema_version",
+        "provenance",
+        "analysis_dependencies",
+    }
     if (
-        set(recorded)
-        != {
-            "schema_id",
-            "schema_version",
-            "provenance",
-            "analysis_dependencies",
-        }
+        set(recorded) != required_fields
+        or set(current) != required_fields
         or recorded.get("schema_id")
         != "et_mainsim.formal_analysis_code_identity.v1"
-        or recorded.get("schema_version") != 1
+        or current.get("schema_id")
+        != "et_mainsim.formal_analysis_code_identity.v1"
+        or type(recorded.get("schema_version")) is not int
+        or recorded["schema_version"] != 1
+        or type(current.get("schema_version")) is not int
+        or current["schema_version"] != 1
         or recorded.get("analysis_dependencies")
         != current.get("analysis_dependencies")
     ):
@@ -6114,17 +6182,19 @@ def _formal_code_identity_matches_execution_v1(
         current_provenance, Mapping
     ):
         return False
-    for name in ("et_mainsim", "photsim7"):
-        recorded_repo = recorded_provenance.get(name)
-        current_repo = current_provenance.get(name)
-        if (
-            not isinstance(recorded_repo, Mapping)
-            or not isinstance(current_repo, Mapping)
-            or recorded_repo.get("dirty") is not False
-            or current_repo.get("dirty") is not False
-            or recorded_repo.get("commit") != current_repo.get("commit")
-            or recorded_repo.get("version") != current_repo.get("version")
-        ):
+    for provenance_name, distribution_name in (
+        ("et_mainsim", "et-mainsim"),
+        ("photsim7", "photsim7"),
+    ):
+        recorded_identity = _formal_package_reproducibility_identity_v1(
+            recorded_provenance.get(provenance_name),
+            distribution_name=distribution_name,
+        )
+        current_identity = _formal_package_reproducibility_identity_v1(
+            current_provenance.get(provenance_name),
+            distribution_name=distribution_name,
+        )
+        if recorded_identity is None or recorded_identity != current_identity:
             return False
     recorded_runtime = recorded_provenance.get("runtime")
     current_runtime = current_provenance.get("runtime")

@@ -3712,9 +3712,135 @@ def test_formal_code_identity_is_automatic_and_rejects_dirty_or_unknown_reposito
         monkeypatch.setattr(backend, "collect_provenance", lambda _root, p=broken: p)
         with pytest.raises(
             backend.StampScienceAnalysisContractError,
-            match="clean known ET-mainsim and Photsim7 commits",
+            match="clean Git commits or verified installed distributions",
         ):
             backend.collect_formal_analysis_code_identity_v1()
+
+
+def test_formal_code_identity_accepts_verified_installed_distributions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    installed = {
+        "et_mainsim": {
+            "commit": None,
+            "dirty": None,
+            "version": "0.1.0",
+            "distribution_identity": {
+                "schema_id": "et_mainsim.installed_distribution_identity.v1",
+                "name": "et-mainsim",
+                "version": "0.1.0",
+                "record_entry_count": 12,
+                "record_tree_sha256": "a" * 64,
+            },
+        },
+        "photsim7": {
+            "commit": None,
+            "dirty": None,
+            "version": "0.2.5",
+            "distribution_identity": {
+                "schema_id": "et_mainsim.installed_distribution_identity.v1",
+                "name": "photsim7",
+                "version": "0.2.5",
+                "record_entry_count": 34,
+                "record_tree_sha256": "b" * 64,
+            },
+        },
+        "runtime": {"python": "3.12.11", "hostname": "request-host"},
+    }
+    monkeypatch.setattr(backend, "collect_provenance", lambda _root: installed)
+
+    identity = backend.collect_formal_analysis_code_identity_v1()
+
+    assert identity["provenance"] == installed
+
+
+def test_formal_code_identity_matcher_uses_distribution_content_not_host_or_path() -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    def identity(
+        *,
+        root: str,
+        host: str,
+        et_digest: str = "a" * 64,
+        et_record_entry_count: int = 12,
+        schema_version: object = 1,
+    ):
+        return {
+            "schema_id": "et_mainsim.formal_analysis_code_identity.v1",
+            "schema_version": schema_version,
+            "provenance": {
+                "et_mainsim": {
+                    "root": root,
+                    "commit": None,
+                    "dirty": None,
+                    "version": "0.1.0",
+                    "distribution_identity": {
+                        "schema_id": (
+                            "et_mainsim.installed_distribution_identity.v1"
+                        ),
+                        "name": "et-mainsim",
+                        "version": "0.1.0",
+                        "record_entry_count": et_record_entry_count,
+                        "record_tree_sha256": et_digest,
+                    },
+                },
+                "photsim7": {
+                    "root": f"{root}/photsim7",
+                    "commit": None,
+                    "dirty": None,
+                    "version": "0.2.5",
+                    "distribution_identity": {
+                        "schema_id": (
+                            "et_mainsim.installed_distribution_identity.v1"
+                        ),
+                        "name": "photsim7",
+                        "version": "0.2.5",
+                        "record_entry_count": 34,
+                        "record_tree_sha256": "b" * 64,
+                    },
+                },
+                "runtime": {"python": "3.12.11", "hostname": host},
+            },
+            "analysis_dependencies": {"numpy": "2.2.6"},
+        }
+
+    recorded = identity(root="/request/site-packages", host="request")
+    current = identity(root="/execution/site-packages", host="execution")
+
+    assert backend._formal_code_identity_matches_execution_v1(recorded, current)
+    assert not backend._formal_code_identity_matches_execution_v1(
+        recorded,
+        identity(root="/execution/site-packages", host="execution", et_digest="c" * 64),
+    )
+    assert not backend._formal_code_identity_matches_execution_v1(
+        recorded,
+        identity(
+            root="/execution/site-packages",
+            host="execution",
+            et_record_entry_count=13,
+        ),
+    )
+    for coerced_version in (1.0, True):
+        malformed_recorded = identity(
+            root="/request/site-packages",
+            host="request",
+            schema_version=coerced_version,
+        )
+        malformed_current = identity(
+            root="/execution/site-packages",
+            host="execution",
+            schema_version=coerced_version,
+        )
+        assert not backend._formal_code_identity_matches_execution_v1(
+            malformed_recorded,
+            current,
+        )
+        assert not backend._formal_code_identity_matches_execution_v1(
+            recorded,
+            malformed_current,
+        )
 
 
 def test_formal_execution_identity_is_collected_again_at_analysis_runtime(
