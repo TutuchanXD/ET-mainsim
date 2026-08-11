@@ -53,10 +53,14 @@ from .stamp_science_inputs import (
     read_science_factor_snapshot,
 )
 from .staged_stamp_delivery import (
+    STAMP_SHARD_PUBLICATION_RECEIPT_FILENAME,
+    STAMP_SHARD_PUBLICATION_RECEIPT_SCHEMA_ID,
+    STAMP_SHARD_PUBLICATION_RECEIPT_SCHEMA_VERSION,
+    _full_shard_identity,
     _atomic_publish_directory_noreplace,
     _fsync_directory as _strict_fsync_directory,
 )
-from .time_shards import ContinuousTimeShardPlan
+from .time_shards import ContinuousTimeShard, ContinuousTimeShardPlan
 from .stamp_science_photometry import (
     SCIENCE_PHOTOMETRY_SCHEMA_ID,
     SCIENCE_PHOTOMETRY_SCHEMA_VERSION,
@@ -2088,6 +2092,26 @@ _SEMANTIC_DATASET_NAMES = (
     "raw_frame_start_index",
     "raw_frame_stop_index_exclusive",
 )
+_SEMANTIC_DATASET_DTYPE_ROLES: Mapping[str, tuple[str, frozenset[int]]] = {
+    "final_dn": ("u", frozenset({1, 2, 4, 8})),
+    "background_expectation_e": ("f", frozenset({8})),
+    "captured_flux_fraction": ("f", frozenset({8})),
+    "captured_flux_denominator_e": ("f", frozenset({8})),
+    "captured_flux_qa_pass": ("u", frozenset({1})),
+    "bias_level_sum_dn": ("f", frozenset({8})),
+    "column_noise_sum_dn_by_x": ("f", frozenset({8})),
+    "valid_mask": ("u", frozenset({1})),
+    "fullwell_count": ("u", frozenset({2})),
+    "adc_low_count": ("u", frozenset({2})),
+    "adc_high_count": ("u", frozenset({2})),
+    "cosmic_count": ("u", frozenset({2})),
+    "saturated_mask": ("u", frozenset({1})),
+    "cosmic_mask": ("u", frozenset({1})),
+    "time_start_seconds": ("f", frozenset({8})),
+    "exposure_seconds": ("f", frozenset({8})),
+    "raw_frame_start_index": ("i", frozenset({8})),
+    "raw_frame_stop_index_exclusive": ("i", frozenset({8})),
+}
 _RAW_SHARD_IDENTITY_FIELDS = {
     "path",
     "file_stat",
@@ -2455,7 +2479,11 @@ def _input_header_identity(header: _InputHeader) -> dict[str, Any]:
     }
 
 
-def _resolve_input_byte_identity(header: _InputHeader) -> dict[str, Any]:
+def _resolve_input_byte_identity(
+    header: _InputHeader,
+    *,
+    expected_shard: ContinuousTimeShard | None = None,
+) -> dict[str, Any]:
     """Bind exact HDF5 bytes via a trusted publisher receipt or full SHA256."""
 
     source = header.formal.path
@@ -2464,16 +2492,32 @@ def _resolve_input_byte_identity(header: _InputHeader) -> dict[str, Any]:
         raise StampScienceAnalysisContractError(
             "formal bundle stat changed before byte-identity preflight"
         )
-    receipt_path = source.parent / "publication_receipt.json"
+    receipt_path = source.parent / STAMP_SHARD_PUBLICATION_RECEIPT_FILENAME
     if receipt_path.exists():
         if not receipt_path.is_file() or receipt_path.is_symlink():
             raise StampScienceAnalysisContractError(
                 "publication receipt must be a real regular file"
             )
         receipt_stat = _FileStat.from_path(receipt_path)
+
+        def reject_duplicate_keys(
+            pairs: list[tuple[str, Any]],
+        ) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise StampScienceAnalysisContractError(
+                        f"publication receipt contains duplicate JSON key: {key}"
+                    )
+                result[key] = value
+            return result
+
         try:
             receipt_bytes = receipt_path.read_bytes()
-            receipt = json.loads(receipt_bytes.decode("utf-8"))
+            receipt = json.loads(
+                receipt_bytes.decode("utf-8"),
+                object_pairs_hook=reject_duplicate_keys,
+            )
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise StampScienceAnalysisContractError(
                 "shard publication receipt is not valid UTF-8 JSON"
@@ -2485,42 +2529,152 @@ def _resolve_input_byte_identity(header: _InputHeader) -> dict[str, Any]:
             raise StampScienceAnalysisContractError(
                 "shard publication receipt changed during identity preflight"
             )
+        expected_root_fields = {
+            "schema_id",
+            "schema_version",
+            "complete",
+            "run_id",
+            "case",
+            "target_source_id_int64",
+            "shard",
+            "production_manifest",
+            "members",
+        }
+        target_source_id = receipt.get("target_source_id_int64")
         if (
-            receipt.get("schema_id")
-            != "et_mainsim.stamp_shard_publication_receipt.v1"
-            or receipt.get("schema_version") != 1
+            set(receipt) != expected_root_fields
+            or receipt.get("schema_id")
+            != STAMP_SHARD_PUBLICATION_RECEIPT_SCHEMA_ID
+            or not _is_native_schema_version(
+                receipt.get("schema_version"),
+                STAMP_SHARD_PUBLICATION_RECEIPT_SCHEMA_VERSION,
+            )
             or receipt.get("complete") is not True
+            or type(receipt.get("run_id")) is not str
             or receipt.get("run_id") != header.run_id
+            or type(receipt.get("case")) is not str
             or receipt.get("case") != header.case
-            or str(receipt.get("target_source_id_int64"))
-            != header.target_source_id
+            or type(target_source_id) is not int
+            or not 0 <= target_source_id <= _INT64_MAX
+            or str(target_source_id) != header.target_source_id
         ):
             raise StampScienceAnalysisContractError(
                 "publication receipt identity differs from the formal bundle"
             )
+
+        receipt_shard = receipt.get("shard")
+        shard_fields = {
+            "shard_id",
+            "raw_start_index",
+            "raw_stop_index",
+            "coadd_sizes",
+            "raw_exposure_seconds",
+        }
+        if not isinstance(receipt_shard, dict) or set(receipt_shard) != shard_fields:
+            raise StampScienceAnalysisContractError(
+                "publication receipt shard schema is invalid"
+            )
+        shard_id = receipt_shard.get("shard_id")
+        raw_start = receipt_shard.get("raw_start_index")
+        raw_stop = receipt_shard.get("raw_stop_index")
+        coadd_sizes = receipt_shard.get("coadd_sizes")
+        raw_exposure = receipt_shard.get("raw_exposure_seconds")
+        if (
+            type(shard_id) is not int
+            or shard_id < 0
+            or type(raw_start) is not int
+            or raw_start < 0
+            or type(raw_stop) is not int
+            or raw_stop <= raw_start
+            or not isinstance(coadd_sizes, list)
+            or not coadd_sizes
+            or any(type(value) is not int or value <= 0 for value in coadd_sizes)
+            or coadd_sizes != sorted(set(coadd_sizes))
+            or any(
+                raw_start % factor != 0 or raw_stop % factor != 0
+                for factor in coadd_sizes
+            )
+            or type(raw_exposure) is not float
+            or not math.isfinite(raw_exposure)
+            or raw_exposure <= 0.0
+        ):
+            raise StampScienceAnalysisContractError(
+                "publication receipt shard schema is invalid"
+            )
+        if expected_shard is not None and _canonical_json_text(
+            receipt_shard,
+            name="publication receipt shard",
+        ) != _canonical_json_text(
+            _full_shard_identity(expected_shard),
+            name="frozen time-plan shard",
+        ):
+            raise StampScienceAnalysisContractError(
+                "publication receipt shard conflicts with the frozen time plan"
+            )
+        if (
+            header.formal.first_raw_frame_start != raw_start
+            or header.formal.last_raw_frame_stop != raw_stop
+            or header.formal.coadd_factor not in {1, *coadd_sizes}
+            or header.formal.frame_count
+            != (raw_stop - raw_start) // header.formal.coadd_factor
+            or not math.isclose(
+                header.formal.first_time_start_seconds,
+                raw_start * raw_exposure,
+                rel_tol=0.0,
+                abs_tol=_TIME_ATOL_SECONDS,
+            )
+            or not math.isclose(
+                header.formal.last_time_end_seconds,
+                raw_stop * raw_exposure,
+                rel_tol=0.0,
+                abs_tol=_TIME_ATOL_SECONDS,
+            )
+        ):
+            raise StampScienceAnalysisContractError(
+                "publication receipt shard conflicts with the formal bundle"
+            )
+
         members = receipt.get("members")
-        member = members.get(source.name) if isinstance(members, Mapping) else None
-        if not isinstance(member, Mapping):
+        expected_member_names = {
+            "raw.h5",
+            *(f"coadd_{factor * 10:d}s.h5" for factor in coadd_sizes),
+        }
+        if not isinstance(members, dict) or set(members) != expected_member_names:
+            raise StampScienceAnalysisContractError(
+                "publication receipt members differ from the exact shard delivery set"
+            )
+        expected_member_prefix = (
+            f"cases/{header.case}/stamps/target_{target_source_id}/delivery/"
+            f"shard_{shard_id:05d}"
+        )
+        for name in sorted(expected_member_names):
+            member_value = members[name]
+            expected_relative = f"{expected_member_prefix}/{name}"
+            member_path = source.parent / name
+            if (
+                not isinstance(member_value, dict)
+                or set(member_value)
+                != {"path_relative_to_run_root", "size_bytes", "sha256"}
+                or type(member_value.get("path_relative_to_run_root")) is not str
+                or member_value["path_relative_to_run_root"] != expected_relative
+                or type(member_value.get("size_bytes")) is not int
+                or member_value["size_bytes"] < 0
+                or not _is_lowercase_sha256(member_value.get("sha256"))
+                or member_path.is_symlink()
+                or not member_path.is_file()
+                or member_value["size_bytes"] != member_path.stat().st_size
+                or not member_path.as_posix().endswith(f"/{expected_relative}")
+            ):
+                raise StampScienceAnalysisContractError(
+                    f"publication receipt member {name} identity is invalid"
+                )
+        member = members.get(source.name)
+        if not isinstance(member, dict):  # Exact member set narrows this mapping.
             raise StampScienceAnalysisContractError(
                 "publication receipt does not bind the formal bundle member"
             )
-        sha256 = member.get("sha256")
-        size = member.get("size_bytes")
-        relative = member.get("path_relative_to_run_root")
-        if (
-            not isinstance(sha256, str)
-            or len(sha256) != 64
-            or any(character not in "0123456789abcdef" for character in sha256)
-            or isinstance(size, bool)
-            or not isinstance(size, int)
-            or size != current_stat.size_bytes
-            or not isinstance(relative, str)
-            or Path(relative).name != source.name
-            or not source.as_posix().endswith(f"/{relative}")
-        ):
-            raise StampScienceAnalysisContractError(
-                "publication receipt member content/stat identity is invalid"
-            )
+        sha256 = member["sha256"]
+        size = member["size_bytes"]
         receipt_production = receipt.get("production_manifest")
         production_relative = (
             receipt_production.get("path_relative_to_run_root")
@@ -2538,26 +2692,22 @@ def _resolve_input_byte_identity(header: _InputHeader) -> dict[str, Any]:
             else None
         )
         if (
-            not isinstance(receipt_production, Mapping)
-            or not isinstance(production_relative, str)
-            or Path(production_relative).name
-            != Path(header.production_manifest_reference).name
-            or isinstance(production_size, bool)
-            or not isinstance(production_size, int)
+            not isinstance(receipt_production, dict)
+            or set(receipt_production)
+            != {"path_relative_to_run_root", "size_bytes", "sha256"}
+            or type(production_relative) is not str
+            or production_relative != Path(header.production_manifest_reference).name
+            or type(production_size) is not int
             or production_size < 0
-            or not isinstance(production_sha256, str)
-            or len(production_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in production_sha256
-            )
+            or not _is_lowercase_sha256(production_sha256)
         ):
             raise StampScienceAnalysisContractError(
                 "publication receipt lacks a valid production-manifest identity"
             )
         recorded_production = header.production_manifest_content_identity
-        if recorded_production is not None and (
-            receipt_production.get("size_bytes")
+        if (
+            not _recorded_content_identity_is_valid(recorded_production)
+            or receipt_production.get("size_bytes")
             != recorded_production.get("size_bytes")
             or receipt_production.get("sha256")
             != recorded_production.get("sha256")
@@ -4908,6 +5058,7 @@ def _semantic_descriptor_is_valid(
     value: Any,
     *,
     expected_shape: list[int],
+    expected_dtype_role: tuple[str, frozenset[int]],
 ) -> bool:
     if (
         not isinstance(value, Mapping)
@@ -4918,9 +5069,15 @@ def _semantic_descriptor_is_valid(
     ):
         return False
     try:
-        return np.dtype(value["dtype"]).str == value["dtype"]
+        dtype = np.dtype(value["dtype"])
     except (TypeError, ValueError):
         return False
+    expected_kind, expected_itemsizes = expected_dtype_role
+    return bool(
+        dtype.str == value["dtype"]
+        and dtype.kind == expected_kind
+        and dtype.itemsize in expected_itemsizes
+    )
 
 
 def _validate_writer_raw_shard_identities_v1(
@@ -5042,6 +5199,7 @@ def _validate_writer_raw_shard_identities_v1(
                     if name in vector_names
                     else column_shape
                 ),
+                expected_dtype_role=_SEMANTIC_DATASET_DTYPE_ROLES[name],
             )
             for name in _SEMANTIC_DATASET_NAMES
         ):
@@ -5050,6 +5208,7 @@ def _validate_writer_raw_shard_identities_v1(
         if not _semantic_descriptor_is_valid(
             gain_identity,
             expected_shape=gain_shape,
+            expected_dtype_role=("f", frozenset({8})),
         ):
             raise StampScienceAnalysisContractError(error_message)
         recomputed_semantic = hashlib.sha256(
@@ -8368,9 +8527,12 @@ def discover_stamp_science_analysis_bundles_v1(
                 raise StampScienceAnalysisContractError(
                     f"formal shard {shard_id} binds different production bytes"
                 )
-            if requires_receipt and _resolve_input_byte_identity(header).get(
-                "trust_scope"
-            ) != "publisher_receipt_plus_stat_and_formal_header_v1":
+            if requires_receipt and _resolve_input_byte_identity(
+                header,
+                expected_shard=shard,
+            ).get("trust_scope") != (
+                "publisher_receipt_plus_stat_and_formal_header_v1"
+            ):
                 raise StampScienceAnalysisContractError(
                     f"staged formal science shard {shard_id} lacks trusted "
                     "publication receipt identity"
@@ -8521,24 +8683,6 @@ def validate_stamp_science_analysis_request_ready_v1(
         case=str(context.get("case")),
         headers=raw_headers,
     )
-    if _production_requires_publication_receipts_v1(production):
-        all_formal_headers = list(raw_headers)
-        for factor, paths in request.direct_coadd_bundle_paths.items():
-            all_formal_headers.extend(
-                _read_series_headers(
-                    paths,
-                    product_kind="coadd",
-                    coadd_factor=factor,
-                )
-            )
-        if any(
-            _resolve_input_byte_identity(header).get("trust_scope")
-            != "publisher_receipt_plus_stat_and_formal_header_v1"
-            for header in all_formal_headers
-        ):
-            raise StampScienceAnalysisContractError(
-                "formal staged science requests require publication receipts for every HDF5 member"
-            )
     discovery_context = context.get("input_discovery")
     if not isinstance(discovery_context, Mapping):
         raise StampScienceAnalysisContractError(

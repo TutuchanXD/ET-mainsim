@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
+from typing import Any
 
 import h5py
 import numpy as np
@@ -255,6 +256,7 @@ def _write_shard_publication_receipt(
     production_manifest: Path,
     shard_root: Path,
     *,
+    shard: Any,
     run_id: str,
     case: str,
     source_id: int,
@@ -279,7 +281,15 @@ def _write_shard_publication_receipt(
                 "run_id": run_id,
                 "case": case,
                 "target_source_id_int64": source_id,
-                "shard": {},
+                "shard": {
+                    "shard_id": int(shard.shard_id),
+                    "raw_start_index": int(shard.raw_start_index),
+                    "raw_stop_index": int(shard.raw_stop_index),
+                    "coadd_sizes": [int(value) for value in shard.coadd_sizes],
+                    "raw_exposure_seconds": float(
+                        shard.raw_exposure_seconds
+                    ),
+                },
                 "production_manifest": {
                     "path_relative_to_run_root": production_manifest.relative_to(
                         run_root
@@ -371,6 +381,68 @@ def _series_fixture(
     )
 
 
+def _staged_receipt_series_fixture(
+    tmp_path: Path,
+) -> tuple[tuple[Path, ...], dict[int, tuple[Path, ...]], np.ndarray]:
+    from et_mainsim.time_shards import ContinuousTimeShard
+
+    run_root = tmp_path / "run"
+    production_manifest = run_root / "production_manifest.json"
+    production_manifest.parent.mkdir(parents=True)
+    production_manifest.write_text("{}", encoding="utf-8")
+    production_raw = production_manifest.read_bytes()
+    production_identity = {
+        "size_bytes": len(production_raw),
+        "sha256": hashlib.sha256(production_raw).hexdigest(),
+    }
+    shard = ContinuousTimeShard(
+        shard_id=0,
+        raw_start_index=0,
+        raw_stop_index=6,
+        coadd_sizes=(3,),
+        raw_exposure_seconds=10.0,
+    )
+    shard_root = (
+        run_root
+        / "cases"
+        / "injected"
+        / "stamps"
+        / "target_1"
+        / "delivery"
+        / "shard_00000"
+    )
+    shard_root.mkdir(parents=True)
+    planes = _raw_planes(start=0, n_frames=6)
+    q = np.asarray(planes.pop("q"), dtype=np.float64)
+    raw_path = _write_bundle(
+        shard_root / "raw.h5",
+        planes=planes,
+        product_kind="raw",
+        factor=1,
+        shard_id=0,
+        target_source_id="1",
+        production_manifest_identity=production_identity,
+    )
+    coadd_path = _write_bundle(
+        shard_root / "coadd_30s.h5",
+        planes=_coadd_planes(planes, factor=3),
+        product_kind="coadd",
+        factor=3,
+        shard_id=0,
+        target_source_id="1",
+        production_manifest_identity=production_identity,
+    )
+    _write_shard_publication_receipt(
+        production_manifest,
+        shard_root,
+        shard=shard,
+        run_id="fixture-run",
+        case="injected",
+        source_id=1,
+    )
+    return (raw_path,), {3: (coadd_path,)}, q
+
+
 def _request(
     tmp_path: Path,
     *,
@@ -383,6 +455,7 @@ def _request(
     aperture_mode: str = "train",
     frozen_aperture=None,
     aperture_source_identity: dict[str, object] | None = None,
+    source_id: str = "fixture-1",
 ):
     from et_mainsim.stamp_science_analysis import StampScienceAnalysisRequest
 
@@ -395,7 +468,7 @@ def _request(
         code_identity={"git_commit": "unit-test"},
         analysis_context={
             "production_manifest": "unit-test-production-manifest",
-            "source_id": "fixture-1",
+            "source_id": source_id,
             "case": case,
             "noise_model": {
                 "schema_id": "et_mainsim.formal_stamp_noise_parameters.v1",
@@ -1294,35 +1367,7 @@ def test_input_hdf_byte_identity_prefers_a_complete_staged_receipt(
         "maximize_cumulative_snr",
         _select_target_pixels,
     )
-    raw_paths, coadd_paths, q = _series_fixture(tmp_path)
-    members = {}
-    for path in (*raw_paths, *coadd_paths[3]):
-        raw = path.read_bytes()
-        members[path.name] = {
-            "path_relative_to_run_root": path.name,
-            "size_bytes": len(raw),
-            "sha256": hashlib.sha256(raw).hexdigest(),
-        }
-    (tmp_path / "publication_receipt.json").write_text(
-        json.dumps(
-            {
-                "schema_id": "et_mainsim.stamp_shard_publication_receipt.v1",
-                "schema_version": 1,
-                "complete": True,
-                "run_id": "fixture-run",
-                "case": "injected",
-                "target_source_id_int64": "fixture-1",
-                "shard": {},
-                "production_manifest": {
-                    "path_relative_to_run_root": "production_manifest.json",
-                    "size_bytes": 2,
-                    "sha256": "0" * 64,
-                },
-                "members": members,
-            }
-        ),
-        encoding="utf-8",
-    )
+    raw_paths, coadd_paths, q = _staged_receipt_series_fixture(tmp_path)
     import et_mainsim.stamp_science_analysis as backend
 
     publication = backend.analyze_stamp_science_series_v1(
@@ -1331,6 +1376,7 @@ def test_input_hdf_byte_identity_prefers_a_complete_staged_receipt(
             raw_paths=raw_paths,
             coadd_paths=coadd_paths,
             q=q,
+            source_id="1",
         )
     )
 
@@ -1348,38 +1394,41 @@ def test_input_hdf_byte_identity_prefers_a_complete_staged_receipt(
     assert all("publication_receipt" in item for item in byte_identities)
 
 
+@pytest.mark.parametrize("tamper_mode", ["extra_root_field", "extra_member_field"])
+def test_input_hdf_byte_identity_requires_exact_writer_receipt_schema(
+    tmp_path: Path,
+    tamper_mode: str,
+) -> None:
+    raw_paths, _, _ = _staged_receipt_series_fixture(tmp_path)
+    source = raw_paths[0]
+    receipt_path = source.parent / "publication_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if tamper_mode == "extra_root_field":
+        receipt["unexpected"] = None
+    else:
+        receipt["members"][source.name]["unexpected"] = None
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    import et_mainsim.stamp_science_analysis as backend
+
+    header = backend._read_series_headers(
+        (source,),
+        product_kind="raw",
+        coadd_factor=1,
+    )[0]
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="publication receipt.*(?:identity|member)",
+    ):
+        backend._resolve_input_byte_identity(header)
+
+
 def test_input_hdf_byte_identity_verifies_receipt_against_current_bytes(
     tmp_path: Path,
 ) -> None:
-    raw_paths, _, _ = _series_fixture(tmp_path)
+    raw_paths, _, _ = _staged_receipt_series_fixture(tmp_path)
     source = raw_paths[0]
     original = source.read_bytes()
-    (tmp_path / "publication_receipt.json").write_text(
-        json.dumps(
-            {
-                "schema_id": "et_mainsim.stamp_shard_publication_receipt.v1",
-                "schema_version": 1,
-                "complete": True,
-                "run_id": "fixture-run",
-                "case": "injected",
-                "target_source_id_int64": "fixture-1",
-                "shard": {},
-                "production_manifest": {
-                    "path_relative_to_run_root": "production_manifest.json",
-                    "size_bytes": 2,
-                    "sha256": "0" * 64,
-                },
-                "members": {
-                    source.name: {
-                        "path_relative_to_run_root": source.name,
-                        "size_bytes": len(original),
-                        "sha256": hashlib.sha256(original).hexdigest(),
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
     with h5py.File(source, "r+") as handle:
         handle["final_dn"][0, 0, 0] += np.uint64(1)
     assert source.stat().st_size == len(original)
@@ -2490,6 +2539,7 @@ def test_publication_requires_complete_deterministic_direct_parity_samples(
         "forged_writer_role",
         "forged_context_identity",
         "mismatched_frozen_identity",
+        "forged_dataset_dtype",
     ],
 )
 def test_publication_requires_complete_writer_raw_shard_identities(
@@ -2528,13 +2578,50 @@ def test_publication_requires_complete_writer_raw_shard_identities(
             for identity in raw_identities:
                 identity["target_source_id"] = "forged-source"
                 identity["case"] = "static"
-        else:
+        elif tamper_mode == "mismatched_frozen_identity":
             raw_identities[1]["run_id"] = "forged-run"
+        else:
+            descriptor = raw_identity["datasets"]["final_dn"]
+            descriptor["dtype"] = "<f8"
+            raw_identity["semantic_sha256"] = hashlib.sha256(
+                json.dumps(
+                    {
+                        "datasets": raw_identity["datasets"],
+                        "gain_e_per_dn": raw_identity["gain_e_per_dn"],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            representative = contract["representative_calibrated_frames"]
+            selected = [
+                index
+                for index, frame in enumerate(representative["frames"])
+                if frame["input_shard_index"] == 0
+            ]
+            for index in selected:
+                representative["frames"][index][
+                    "input_shard_semantic_sha256"
+                ] = raw_identity["semantic_sha256"]
+            representative_path = (
+                product_root / "representative_calibrated_frames.h5"
+            )
+            with h5py.File(representative_path, "r+") as handle:
+                for index in selected:
+                    handle["input_shard_semantic_sha256"][index] = (
+                        raw_identity["semantic_sha256"]
+                    )
         _replace_product_contract(
             root,
             product_name=product_name,
             contract=contract,
         )
+        if tamper_mode == "forged_dataset_dtype":
+            _rehash_product_artifact(
+                root,
+                product_name=product_name,
+                artifact_name="representative_calibrated_frames.h5",
+            )
 
     for path in (
         *(root / product_name for product_name in product_names),
@@ -5759,10 +5846,37 @@ def test_formal_injected_gate_request_writes_loads_runs_and_validates(
         _write_shard_publication_receipt(
             production_manifest,
             delivery_root / f"shard_{shard_id:05d}",
+            shard=time_plan.shards[shard_id],
             run_id="galaxy-gate-fixture",
             case="injected",
             source_id=42,
         )
+    forged_receipt_path = (
+        delivery_root / "shard_00000" / "publication_receipt.json"
+    )
+    valid_receipt_bytes = forged_receipt_path.read_bytes()
+    forged_receipt = json.loads(valid_receipt_bytes)
+    second_shard = time_plan.shards[1]
+    forged_receipt["shard"] = {
+        "shard_id": int(second_shard.shard_id),
+        "raw_start_index": int(second_shard.raw_start_index),
+        "raw_stop_index": int(second_shard.raw_stop_index),
+        "coadd_sizes": [int(value) for value in second_shard.coadd_sizes],
+        "raw_exposure_seconds": float(second_shard.raw_exposure_seconds),
+    }
+    forged_receipt_path.write_text(json.dumps(forged_receipt), encoding="utf-8")
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="publication receipt.*shard|time.*plan",
+    ):
+        backend.discover_stamp_science_analysis_bundles_v1(
+            production_manifest,
+            source_id="42",
+            case="injected",
+            shard_ids=tuple(range(6)),
+            gate_task_list=gate_task_list,
+        )
+    forged_receipt_path.write_bytes(valid_receipt_bytes)
     discovery = backend.discover_stamp_science_analysis_bundles_v1(
         production_manifest,
         source_id="42",
@@ -5770,6 +5884,7 @@ def test_formal_injected_gate_request_writes_loads_runs_and_validates(
         shard_ids=tuple(range(6)),
         gate_task_list=gate_task_list,
     )
+    assert discovery.shard_ids == tuple(range(6))
     code_identity = {
         "schema_id": "et_mainsim.formal_analysis_code_identity.v1",
         "schema_version": 1,
@@ -5809,22 +5924,36 @@ def test_formal_injected_gate_request_writes_loads_runs_and_validates(
     )
     assert len(request.raw_bundle_paths) == 6
     assert request.raw_relative_flux.shape == (720,)
-    assert backend.validate_stamp_science_analysis_request_ready_v1(request) is request
+    resolve_calls: list[Path] = []
+    original_resolve = backend._resolve_input_byte_identity
+    with pytest.MonkeyPatch.context() as count_monkeypatch:
+        def counted_resolve(*args, **kwargs):
+            resolve_calls.append(args[0].formal.path)
+            return original_resolve(*args, **kwargs)
+
+        count_monkeypatch.setattr(
+            backend,
+            "_resolve_input_byte_identity",
+            counted_resolve,
+        )
+        assert (
+            backend.validate_stamp_science_analysis_request_ready_v1(request)
+            is request
+        )
+    expected_member_count = len(request.raw_bundle_paths) + sum(
+        len(paths) for paths in request.direct_coadd_bundle_paths.values()
+    )
+    assert len(resolve_calls) == expected_member_count
+    assert len(set(resolve_calls)) == expected_member_count
 
     missing_receipt = delivery_root / "shard_00000" / "publication_receipt.json"
     receipt_bytes = missing_receipt.read_bytes()
     missing_receipt.unlink()
-    with pytest.MonkeyPatch.context() as readiness_monkeypatch:
-        readiness_monkeypatch.setattr(
-            backend,
-            "discover_stamp_science_analysis_bundles_v1",
-            lambda *_args, **_kwargs: discovery,
-        )
-        with pytest.raises(
-            backend.StampScienceAnalysisContractError,
-            match="publication receipts for every HDF5 member",
-        ):
-            backend.validate_stamp_science_analysis_request_ready_v1(request)
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="publication receipt",
+    ):
+        backend.validate_stamp_science_analysis_request_ready_v1(request)
     missing_receipt.write_bytes(receipt_bytes)
     assert backend.validate_stamp_science_analysis_request_ready_v1(request) is request
 
