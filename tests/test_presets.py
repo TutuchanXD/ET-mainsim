@@ -62,7 +62,21 @@ assert 'ray' not in sys.modules
 def test_project_requires_shared_exposure_photsim7_release() -> None:
     payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "photsim7>=0.2.3,<0.3" in payload["project"]["dependencies"]
+    assert "photsim7>=0.2.5,<0.3" in payload["project"]["dependencies"]
+
+
+def test_photsim7_stamp_centering_matches_formal_nearest_integer_policy() -> None:
+    from photsim7.stamp_products import StampWindow
+
+    window = StampWindow.centered_on(
+        target_x_detector_pix=100.75,
+        target_y_detector_pix=200.60,
+        shape=(27, 27),
+        detector_shape=(9120, 8900),
+    )
+
+    assert window.x_start_detector_pix + 13 == 101
+    assert window.y_start_detector_pix + 13 == 201
 
 
 def test_project_requires_semantic_registry_identity_release() -> None:
