@@ -380,8 +380,10 @@ def _load_campaign(
     manifest = _json_object(manifest_path, label="production manifest")
     if manifest.get("schema_id") != GALAXY_STAMP_PRODUCTION_SCHEMA_ID:
         raise GalaxyRawCoverageCampaignSummaryError("unsupported Galaxy production manifest")
-    if int(manifest.get("schema_version", 0)) not in (
-        _SUPPORTED_GALAXY_STAMP_PRODUCTION_SCHEMA_VERSIONS
+    schema_version = manifest.get("schema_version")
+    if (
+        type(schema_version) is not int
+        or schema_version not in _SUPPORTED_GALAXY_STAMP_PRODUCTION_SCHEMA_VERSIONS
     ):
         raise GalaxyRawCoverageCampaignSummaryError(
             "unsupported Galaxy production manifest version"

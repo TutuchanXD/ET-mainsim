@@ -83,7 +83,7 @@ def _write_publication_receipt(
     return receipt_path
 
 
-def _write_fixture_run(tmp_path: Path, *, schema_version: int = 3) -> Path:
+def _write_fixture_run(tmp_path: Path, *, schema_version: object = 3) -> Path:
     """Build a tiny complete raw+coadd Galaxy delivery campaign."""
 
     from et_mainsim.galaxy_stamp_production import (
@@ -226,6 +226,22 @@ def test_campaign_qc_reader_accepts_supported_galaxy_manifest_versions(
 def test_campaign_qc_reader_rejects_unsupported_galaxy_manifest_versions(
     tmp_path: Path,
     schema_version: int,
+) -> None:
+    import et_mainsim.galaxy_campaign_qc as campaign_qc
+
+    manifest_path = _write_fixture_run(tmp_path, schema_version=schema_version)
+
+    with pytest.raises(
+        campaign_qc.GalaxyCampaignDeliveryQCError,
+        match="unsupported Galaxy production manifest version",
+    ):
+        campaign_qc._load_campaign(manifest_path)
+
+
+@pytest.mark.parametrize("schema_version", (3.5, "3", True))
+def test_campaign_qc_reader_rejects_non_native_integer_manifest_versions(
+    tmp_path: Path,
+    schema_version: object,
 ) -> None:
     import et_mainsim.galaxy_campaign_qc as campaign_qc
 

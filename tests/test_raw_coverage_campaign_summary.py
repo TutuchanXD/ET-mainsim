@@ -35,7 +35,7 @@ def _write_complete_campaign_fixture(
     tmp_path: Path,
     *,
     minimum_accepted_bins: int = 2,
-    schema_version: int = 3,
+    schema_version: object = 3,
 ) -> tuple[Path, Path, Path, Path]:
     """Create ten policy-consistent, tiny published source analyses."""
 
@@ -350,6 +350,38 @@ def test_raw_coverage_campaign_summary_reader_accepts_supported_manifest_version
 def test_raw_coverage_campaign_summary_reader_rejects_unsupported_manifest_versions(
     tmp_path: Path,
     schema_version: int,
+) -> None:
+    from et_mainsim.raw_coverage_campaign_summary import (
+        GalaxyRawCoverageCampaignSummaryError,
+        GalaxyRawCoverageCampaignSummaryRequest,
+        audit_galaxy_raw_coverage_campaign_v1,
+    )
+
+    manifest_path, qc_path, policy_path, output_dir = (
+        _write_complete_campaign_fixture(tmp_path)
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = schema_version
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        GalaxyRawCoverageCampaignSummaryError,
+        match="unsupported Galaxy production manifest version",
+    ):
+        audit_galaxy_raw_coverage_campaign_v1(
+            GalaxyRawCoverageCampaignSummaryRequest(
+                production_manifest_path=manifest_path,
+                campaign_qc_path=qc_path,
+                coverage_policy_path=policy_path,
+                output_dir=output_dir,
+            )
+        )
+
+
+@pytest.mark.parametrize("schema_version", (3.5, "3", True))
+def test_raw_coverage_campaign_summary_rejects_non_native_integer_manifest_versions(
+    tmp_path: Path,
+    schema_version: object,
 ) -> None:
     from et_mainsim.raw_coverage_campaign_summary import (
         GalaxyRawCoverageCampaignSummaryError,

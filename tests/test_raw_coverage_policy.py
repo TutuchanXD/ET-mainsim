@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 
-def _write_formal_manifest(tmp_path: Path, *, schema_version: int = 3) -> Path:
+def _write_formal_manifest(tmp_path: Path, *, schema_version: object = 3) -> Path:
     from et_mainsim.galaxy_stamp_production import (
         GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
     )
@@ -75,6 +75,36 @@ def test_raw_coverage_policy_reader_accepts_supported_galaxy_manifest_versions(
 def test_raw_coverage_policy_reader_rejects_unsupported_galaxy_manifest_versions(
     tmp_path: Path,
     schema_version: int,
+) -> None:
+    from et_mainsim.raw_coverage_policy import (
+        FrozenRawCoveragePolicyError,
+        FrozenRawCoveragePolicyRequest,
+        write_frozen_raw_coverage_policy_v1,
+    )
+
+    manifest_path = _write_formal_manifest(
+        tmp_path,
+        schema_version=schema_version,
+    )
+
+    with pytest.raises(
+        FrozenRawCoveragePolicyError,
+        match="unsupported Galaxy production manifest version",
+    ):
+        write_frozen_raw_coverage_policy_v1(
+            FrozenRawCoveragePolicyRequest(
+                production_manifest_path=manifest_path,
+                output_path=manifest_path.parent / "analysis" / "policy.json",
+                minimum_coverage_fraction=0.95,
+                minimum_accepted_bins=10,
+            )
+        )
+
+
+@pytest.mark.parametrize("schema_version", (3.5, "3", True))
+def test_raw_coverage_policy_reader_rejects_non_native_integer_manifest_versions(
+    tmp_path: Path,
+    schema_version: object,
 ) -> None:
     from et_mainsim.raw_coverage_policy import (
         FrozenRawCoveragePolicyError,

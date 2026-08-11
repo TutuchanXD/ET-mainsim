@@ -21,7 +21,7 @@ def _write_formal_galaxy_run(
     *,
     case: str,
     write_delivery: bool = True,
-    schema_version: int = 3,
+    schema_version: object = 3,
 ) -> Path:
     """Build a compact, two-shard Galaxy formal-delivery fixture.
 
@@ -220,6 +220,27 @@ def test_standard_analysis_reader_accepts_supported_galaxy_manifest_versions(
 def test_standard_analysis_reader_rejects_unsupported_galaxy_manifest_versions(
     tmp_path: Path,
     schema_version: int,
+) -> None:
+    import et_mainsim.standard_stamp_analysis as analysis
+
+    manifest_path = _write_formal_galaxy_run(
+        tmp_path,
+        case="injected",
+        write_delivery=False,
+        schema_version=schema_version,
+    )
+
+    with pytest.raises(
+        analysis.StandardStampAnalysisError,
+        match="unsupported Galaxy production manifest version",
+    ):
+        analysis._load_galaxy_manifest(manifest_path)
+
+
+@pytest.mark.parametrize("schema_version", (3.5, "3", True))
+def test_standard_analysis_reader_rejects_non_native_integer_manifest_versions(
+    tmp_path: Path,
+    schema_version: object,
 ) -> None:
     import et_mainsim.standard_stamp_analysis as analysis
 
