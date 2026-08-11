@@ -251,6 +251,50 @@ def _write_bundle(
     return path
 
 
+def _write_shard_publication_receipt(
+    production_manifest: Path,
+    shard_root: Path,
+    *,
+    run_id: str,
+    case: str,
+    source_id: int,
+) -> Path:
+    run_root = production_manifest.parent
+    members = {}
+    for path in sorted(shard_root.glob("*.h5")):
+        raw = path.read_bytes()
+        members[path.name] = {
+            "path_relative_to_run_root": path.relative_to(run_root).as_posix(),
+            "size_bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    production_raw = production_manifest.read_bytes()
+    receipt = shard_root / "publication_receipt.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema_id": "et_mainsim.stamp_shard_publication_receipt.v1",
+                "schema_version": 1,
+                "complete": True,
+                "run_id": run_id,
+                "case": case,
+                "target_source_id_int64": source_id,
+                "shard": {},
+                "production_manifest": {
+                    "path_relative_to_run_root": production_manifest.relative_to(
+                        run_root
+                    ).as_posix(),
+                    "size_bytes": len(production_raw),
+                    "sha256": hashlib.sha256(production_raw).hexdigest(),
+                },
+                "members": members,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return receipt
+
+
 def _series_fixture(
     tmp_path: Path,
     *,
@@ -487,7 +531,10 @@ def test_static_analysis_reuses_the_frozen_injected_aperture_without_training(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    raw_paths, coadd_paths, q = _series_fixture(tmp_path)
+    raw_paths, coadd_paths, q = _series_fixture(
+        tmp_path,
+        science_case="static",
+    )
     import et_mainsim.stamp_science_analysis as backend
 
     monkeypatch.setattr(
@@ -1104,7 +1151,11 @@ def test_expectation_only_injected_aperture_round_trips_into_static_product_set(
     production = SimpleNamespace(
         manifest_path=production_manifest.resolve(),
         manifest_binding=production_binding,
-        manifest={},
+        manifest={
+            "schema_id": "et_mainsim.galaxy_stamp_production.v1",
+            "schema_version": 2,
+            "delivery": {},
+        },
         run_id="fixture-run",
         source_identity=source_identity,
         target={},
@@ -1552,7 +1603,7 @@ def test_product_set_validation_binds_common_raw_semantics_and_policy(
 
     with pytest.raises(
         backend.StampScienceAnalysisContractError,
-        match="raw semantic identities/policy",
+        match="raw-shard identity|raw semantic identities/policy",
     ):
         backend.validate_stamp_science_analysis_product_set_v1(
             publication.output_dir
@@ -2430,6 +2481,73 @@ def test_publication_requires_complete_deterministic_direct_parity_samples(
             match="direct.*parity",
         ):
             validator(path)
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
+        "missing_identity_fields",
+        "forged_writer_role",
+        "forged_context_identity",
+        "mismatched_frozen_identity",
+    ],
+)
+def test_publication_requires_complete_writer_raw_shard_identities(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    tamper_mode: str,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / f"raw-shard-identity-{tamper_mode}-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_names = (
+        "reference_fixed13_v1",
+        "science_optimal_aperture_v1",
+    )
+    for product_name in product_names:
+        product_root = root / product_name
+        manifest = json.loads(
+            (product_root / "analysis_manifest.json").read_text(encoding="utf-8")
+        )
+        contract = manifest["contract"]
+        raw_identities = contract["input_raw_shards"]
+        raw_identity = raw_identities[0]
+        if tamper_mode == "missing_identity_fields":
+            for name in (
+                "byte_identity",
+                "manifest_identity_sha256",
+                "production_manifest_content_identity",
+                "gain_e_per_dn",
+            ):
+                del raw_identity[name]
+        elif tamper_mode == "forged_writer_role":
+            raw_identity["product_kind"] = "coadd"
+            raw_identity["coadd_factor"] = 3
+        elif tamper_mode == "forged_context_identity":
+            for identity in raw_identities:
+                identity["target_source_id"] = "forged-source"
+                identity["case"] = "static"
+        else:
+            raw_identities[1]["run_id"] = "forged-run"
+        _replace_product_contract(
+            root,
+            product_name=product_name,
+            contract=contract,
+        )
+
+    for path in (
+        *(root / product_name for product_name in product_names),
+        root,
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="raw-shard identity",
+        ):
+            if path == root:
+                backend.validate_stamp_science_analysis_product_set_v1(path)
+            else:
+                backend.validate_stamp_science_analysis_v1(path)
 
 
 def test_publication_cross_binds_representative_pixels_to_factor_one_photometry(
@@ -3459,7 +3577,9 @@ def test_publication_binds_representative_frame_provenance_to_contract(
     ):
         with pytest.raises(
             backend.StampScienceAnalysisContractError,
-            match="representative calibrated-frame provenance",
+            match=(
+                "raw-shard identity|representative calibrated-frame provenance"
+            ),
         ):
             validator(path)
 
@@ -4892,6 +5012,7 @@ def test_formal_request_writer_derives_noise_and_freezes_ready_profile(
                 "schema_version": 3,
                 "run_id": "galaxy-formal-v1",
                 "delivery": {
+                    "execution_mode": "direct_shared_filesystem",
                     "raw_exposure_seconds": 10.0,
                     "cadence_seconds": [30.0, 60.0, 120.0, 300.0],
                     "coadd_sizes": [3, 6, 12, 30],
@@ -5115,7 +5236,11 @@ def test_canonical_bundle_discovery_supports_static_subset_and_rejects_injected_
         manifest_path=production_manifest.resolve(),
         run_id="fixture-run",
         source_identity={"production_track": "galaxy"},
-        manifest={"delivery": {}},
+        manifest={
+            "schema_id": "et_mainsim.galaxy_stamp_production.v1",
+            "schema_version": 2,
+            "delivery": {},
+        },
         manifest_binding={
             "path": str(production_manifest.resolve()),
             "identity": backend._file_identity(production_manifest),
@@ -5229,7 +5354,42 @@ def test_canonical_bundle_discovery_supports_static_subset_and_rejects_injected_
             case="injected",
         )
     production.source_identity = {"production_track": "galaxy"}
-    production.manifest = {"delivery": {}}
+    production.manifest = {
+        "schema_id": "et_mainsim.galaxy_stamp_production.v1",
+        "schema_version": 3,
+        "delivery": {"execution_mode": "staged_local_scratch_v1"},
+    }
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="publication receipt",
+    ):
+        backend.discover_stamp_science_analysis_bundles_v1(
+            production_manifest,
+            source_id="42",
+            case="injected",
+        )
+
+    production.manifest["delivery"]["execution_mode"] = (
+        "direct_shared_filesystem"
+    )
+    direct = backend.discover_stamp_science_analysis_bundles_v1(
+        production_manifest,
+        source_id="42",
+        case="injected",
+    )
+    assert direct.shard_ids == (0, 1)
+
+    production.manifest = {
+        "schema_id": "et_mainsim.galaxy_stamp_production.v1",
+        "schema_version": 2,
+        "delivery": {},
+    }
+    legacy = backend.discover_stamp_science_analysis_bundles_v1(
+        production_manifest,
+        source_id="42",
+        case="injected",
+    )
+    assert legacy.shard_ids == (0, 1)
 
     missing = (
         run_root
@@ -5282,7 +5442,11 @@ def test_injected_gate_discovery_only_admits_bound_contiguous_shards_zero_to_fiv
         manifest_path=production_manifest.resolve(),
         run_id="fixture-run",
         source_identity={"production_track": "galaxy"},
-        manifest={"delivery": {}},
+        manifest={
+            "schema_id": "et_mainsim.galaxy_stamp_production.v1",
+            "schema_version": 2,
+            "delivery": {},
+        },
         manifest_binding={
             "path": str(production_manifest.resolve()),
             "identity": backend._file_identity(production_manifest),
@@ -5484,6 +5648,7 @@ def test_formal_injected_gate_request_writes_loads_runs_and_validates(
                 "schema_version": 3,
                 "run_id": "galaxy-gate-fixture",
                 "delivery": {
+                    "execution_mode": "staged_local_scratch_v1",
                     "raw_exposure_seconds": 10.0,
                     "cadence_seconds": [30.0, 60.0, 120.0, 300.0],
                     "coadd_sizes": [3, 6, 12, 30],
@@ -5579,6 +5744,32 @@ def test_formal_injected_gate_request_writes_loads_runs_and_validates(
         ),
         encoding="utf-8",
     )
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="publication receipt",
+    ):
+        backend.discover_stamp_science_analysis_bundles_v1(
+            production_manifest,
+            source_id="42",
+            case="injected",
+            shard_ids=tuple(range(6)),
+            gate_task_list=gate_task_list,
+        )
+    for shard_id in range(6):
+        _write_shard_publication_receipt(
+            production_manifest,
+            delivery_root / f"shard_{shard_id:05d}",
+            run_id="galaxy-gate-fixture",
+            case="injected",
+            source_id=42,
+        )
+    discovery = backend.discover_stamp_science_analysis_bundles_v1(
+        production_manifest,
+        source_id="42",
+        case="injected",
+        shard_ids=tuple(range(6)),
+        gate_task_list=gate_task_list,
+    )
     code_identity = {
         "schema_id": "et_mainsim.formal_analysis_code_identity.v1",
         "schema_version": 1,
@@ -5618,6 +5809,23 @@ def test_formal_injected_gate_request_writes_loads_runs_and_validates(
     )
     assert len(request.raw_bundle_paths) == 6
     assert request.raw_relative_flux.shape == (720,)
+    assert backend.validate_stamp_science_analysis_request_ready_v1(request) is request
+
+    missing_receipt = delivery_root / "shard_00000" / "publication_receipt.json"
+    receipt_bytes = missing_receipt.read_bytes()
+    missing_receipt.unlink()
+    with pytest.MonkeyPatch.context() as readiness_monkeypatch:
+        readiness_monkeypatch.setattr(
+            backend,
+            "discover_stamp_science_analysis_bundles_v1",
+            lambda *_args, **_kwargs: discovery,
+        )
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="publication receipts for every HDF5 member",
+        ):
+            backend.validate_stamp_science_analysis_request_ready_v1(request)
+    missing_receipt.write_bytes(receipt_bytes)
     assert backend.validate_stamp_science_analysis_request_ready_v1(request) is request
 
     publication = backend.analyze_stamp_science_product_set_v1(request)

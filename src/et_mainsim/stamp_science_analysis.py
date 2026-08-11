@@ -47,6 +47,7 @@ from .galaxy_lightcurves import (
     GALAXY_FACTOR_SNAPSHOT_SCHEMA_ID,
     read_galaxy_factor_snapshot,
 )
+from .galaxy_stamp_production import delivery_execution_mode_from_manifest
 from .stamp_science_inputs import (
     SCIENCE_FACTOR_SNAPSHOT_SCHEMA_ID,
     read_science_factor_snapshot,
@@ -2087,6 +2088,40 @@ _SEMANTIC_DATASET_NAMES = (
     "raw_frame_start_index",
     "raw_frame_stop_index_exclusive",
 )
+_RAW_SHARD_IDENTITY_FIELDS = {
+    "path",
+    "file_stat",
+    "product_kind",
+    "coadd_factor",
+    "frame_count",
+    "stamp_shape",
+    "gain_mode",
+    "manifest_identity_sha256",
+    "provenance_identity_sha256",
+    "series_manifest_identity_sha256",
+    "series_provenance_identity_sha256",
+    "first_raw_frame_start",
+    "last_raw_frame_stop",
+    "first_time_start_seconds",
+    "last_time_end_seconds",
+    "target_source_id",
+    "case",
+    "run_id",
+    "production_manifest_reference",
+    "production_manifest_content_identity",
+    "identity_mode",
+    "semantic_sha256",
+    "datasets",
+    "gain_e_per_dn",
+    "byte_identity",
+}
+_INPUT_HEADER_IDENTITY_FIELDS = _RAW_SHARD_IDENTITY_FIELDS - {
+    "identity_mode",
+    "semantic_sha256",
+    "datasets",
+    "gain_e_per_dn",
+    "byte_identity",
+}
 
 
 class _SemanticShardHasher:
@@ -4859,6 +4894,284 @@ def _publication_cadence_contract_v1(
     )
 
 
+def _recorded_content_identity_is_valid(value: Any) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and set(value) == {"size_bytes", "sha256"}
+        and type(value.get("size_bytes")) is int
+        and value["size_bytes"] >= 0
+        and _is_lowercase_sha256(value.get("sha256"))
+    )
+
+
+def _semantic_descriptor_is_valid(
+    value: Any,
+    *,
+    expected_shape: list[int],
+) -> bool:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"dtype", "shape", "sha256"}
+        or type(value.get("dtype")) is not str
+        or value.get("shape") != expected_shape
+        or not _is_lowercase_sha256(value.get("sha256"))
+    ):
+        return False
+    try:
+        return np.dtype(value["dtype"]).str == value["dtype"]
+    except (TypeError, ValueError):
+        return False
+
+
+def _validate_writer_raw_shard_identities_v1(
+    contract: Mapping[str, Any],
+    raw_shards: list[Any],
+) -> None:
+    error_message = "writer raw-shard identity schema/frozen fields are invalid"
+    context = contract.get("analysis_context")
+    if (
+        not isinstance(context, Mapping)
+        or type(context.get("source_id")) is not str
+        or not context["source_id"]
+        or context.get("case") not in {"static", "injected"}
+    ):
+        raise StampScienceAnalysisContractError(error_message)
+
+    frozen_identity: dict[str, Any] | None = None
+    seen_paths: set[str] = set()
+    for shard in raw_shards:
+        if not isinstance(shard, Mapping) or set(shard) != _RAW_SHARD_IDENTITY_FIELDS:
+            raise StampScienceAnalysisContractError(error_message)
+        path = shard.get("path")
+        file_stat = shard.get("file_stat")
+        frame_count = shard.get("frame_count")
+        stamp_shape = shard.get("stamp_shape")
+        first_time = shard.get("first_time_start_seconds")
+        last_time = shard.get("last_time_end_seconds")
+        production_identity = shard.get("production_manifest_content_identity")
+        if (
+            not _is_canonical_absolute_path_text(path)
+            or path in seen_paths
+            or not isinstance(file_stat, Mapping)
+            or set(file_stat) != {"device", "inode", "size_bytes", "mtime_ns"}
+            or any(
+                type(file_stat.get(name)) is not int or file_stat[name] < 0
+                for name in ("device", "inode", "size_bytes", "mtime_ns")
+            )
+            or file_stat["size_bytes"] <= 0
+            or shard.get("product_kind") != "raw"
+            or type(shard.get("coadd_factor")) is not int
+            or shard["coadd_factor"] != 1
+            or type(frame_count) is not int
+            or frame_count <= 0
+            or not isinstance(stamp_shape, list)
+            or len(stamp_shape) != 2
+            or any(type(value) is not int or value <= 0 for value in stamp_shape)
+            or shard.get("gain_mode") not in {"scalar", "stamp_map"}
+            or any(
+                not _is_lowercase_sha256(shard.get(name))
+                for name in (
+                    "manifest_identity_sha256",
+                    "provenance_identity_sha256",
+                    "series_manifest_identity_sha256",
+                    "series_provenance_identity_sha256",
+                    "semantic_sha256",
+                )
+            )
+            or type(first_time) is not float
+            or type(last_time) is not float
+            or not math.isfinite(first_time)
+            or not math.isfinite(last_time)
+            or type(shard.get("target_source_id")) is not str
+            or not shard["target_source_id"]
+            or shard["target_source_id"] != context["source_id"]
+            or shard.get("case") != context["case"]
+            or type(shard.get("run_id")) is not str
+            or not shard["run_id"]
+            or type(shard.get("production_manifest_reference")) is not str
+            or not shard["production_manifest_reference"]
+            or shard["production_manifest_reference"].strip()
+            != shard["production_manifest_reference"]
+            or (
+                production_identity is not None
+                and not _recorded_content_identity_is_valid(production_identity)
+            )
+            or shard.get("identity_mode")
+            != "canonical_semantic_planes_sha256_v1"
+        ):
+            raise StampScienceAnalysisContractError(error_message)
+        seen_paths.add(path)
+
+        datasets = shard.get("datasets")
+        gain_identity = shard.get("gain_e_per_dn")
+        if not isinstance(datasets, Mapping) or set(datasets) != set(
+            _SEMANTIC_DATASET_NAMES
+        ):
+            raise StampScienceAnalysisContractError(error_message)
+        cube_shape = [frame_count, *stamp_shape]
+        vector_shape = [frame_count]
+        column_shape = [frame_count, stamp_shape[1]]
+        cube_names = {
+            "final_dn",
+            "background_expectation_e",
+            "valid_mask",
+            "fullwell_count",
+            "adc_low_count",
+            "adc_high_count",
+            "cosmic_count",
+            "saturated_mask",
+            "cosmic_mask",
+        }
+        vector_names = {
+            "captured_flux_fraction",
+            "captured_flux_denominator_e",
+            "captured_flux_qa_pass",
+            "bias_level_sum_dn",
+            "time_start_seconds",
+            "exposure_seconds",
+            "raw_frame_start_index",
+            "raw_frame_stop_index_exclusive",
+        }
+        if any(
+            not _semantic_descriptor_is_valid(
+                datasets[name],
+                expected_shape=(
+                    cube_shape
+                    if name in cube_names
+                    else vector_shape
+                    if name in vector_names
+                    else column_shape
+                ),
+            )
+            for name in _SEMANTIC_DATASET_NAMES
+        ):
+            raise StampScienceAnalysisContractError(error_message)
+        gain_shape = [1] if shard["gain_mode"] == "scalar" else stamp_shape
+        if not _semantic_descriptor_is_valid(
+            gain_identity,
+            expected_shape=gain_shape,
+        ):
+            raise StampScienceAnalysisContractError(error_message)
+        recomputed_semantic = hashlib.sha256(
+            json.dumps(
+                {
+                    "datasets": dict(datasets),
+                    "gain_e_per_dn": dict(gain_identity),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if recomputed_semantic != shard["semantic_sha256"]:
+            raise StampScienceAnalysisContractError(error_message)
+
+        byte_identity = shard.get("byte_identity")
+        trust_scope = (
+            byte_identity.get("trust_scope")
+            if isinstance(byte_identity, Mapping)
+            else None
+        )
+        common_byte_fields = {
+            "trust_scope",
+            "size_bytes",
+            "sha256",
+            "runtime_path",
+            "runtime_hostname",
+        }
+        expected_byte_fields = (
+            common_byte_fields | {"publication_receipt"}
+            if trust_scope
+            == "publisher_receipt_plus_stat_and_formal_header_v1"
+            else common_byte_fields
+        )
+        if (
+            not isinstance(byte_identity, Mapping)
+            or trust_scope
+            not in {
+                "locally_computed_full_file_sha256_v1",
+                "publisher_receipt_plus_stat_and_formal_header_v1",
+            }
+            or set(byte_identity) != expected_byte_fields
+            or type(byte_identity.get("size_bytes")) is not int
+            or byte_identity["size_bytes"] <= 0
+            or byte_identity["size_bytes"] != file_stat["size_bytes"]
+            or not _is_lowercase_sha256(byte_identity.get("sha256"))
+            or byte_identity.get("runtime_path") != path
+            or type(byte_identity.get("runtime_hostname")) is not str
+            or not byte_identity["runtime_hostname"]
+        ):
+            raise StampScienceAnalysisContractError(error_message)
+        if trust_scope == "publisher_receipt_plus_stat_and_formal_header_v1":
+            receipt = byte_identity.get("publication_receipt")
+            receipt_path = receipt.get("path") if isinstance(receipt, Mapping) else None
+            if (
+                not isinstance(receipt, Mapping)
+                or set(receipt) != {"path", "identity"}
+                or not _is_canonical_absolute_path_text(receipt_path)
+                or Path(receipt_path).name != "publication_receipt.json"
+                or Path(receipt_path).parent != Path(path).parent
+                or not _recorded_content_identity_is_valid(receipt.get("identity"))
+            ):
+                raise StampScienceAnalysisContractError(error_message)
+
+        current_frozen = {
+            name: shard[name]
+            for name in (
+                "stamp_shape",
+                "gain_mode",
+                "series_manifest_identity_sha256",
+                "series_provenance_identity_sha256",
+                "target_source_id",
+                "case",
+                "run_id",
+                "production_manifest_reference",
+                "production_manifest_content_identity",
+                "gain_e_per_dn",
+            )
+        }
+        if frozen_identity is None:
+            frozen_identity = current_frozen
+        elif _canonical_json_text(
+            current_frozen,
+            name="raw-shard frozen identity",
+        ) != _canonical_json_text(
+            frozen_identity,
+            name="first raw-shard frozen identity",
+        ):
+            raise StampScienceAnalysisContractError(error_message)
+
+    if context.get("formal_profile_id") == STAMP_SCIENCE_FORMAL_PROFILE_ID:
+        raw_bindings = context.get("raw_bundles")
+        if (
+            not isinstance(raw_bindings, list)
+            or len(raw_bindings) != len(raw_shards)
+        ):
+            raise StampScienceAnalysisContractError(error_message)
+        for binding, shard in zip(raw_bindings, raw_shards, strict=True):
+            header_identity = (
+                binding.get("identity") if isinstance(binding, Mapping) else None
+            )
+            recorded_header = {
+                name: shard[name] for name in _INPUT_HEADER_IDENTITY_FIELDS
+            }
+            if (
+                not isinstance(binding, Mapping)
+                or set(binding) != {"path", "identity"}
+                or binding.get("path") != shard["path"]
+                or not isinstance(header_identity, Mapping)
+                or set(header_identity) != _INPUT_HEADER_IDENTITY_FIELDS
+                or _canonical_json_text(
+                    header_identity,
+                    name="request raw-bundle header identity",
+                )
+                != _canonical_json_text(
+                    recorded_header,
+                    name="published raw-shard header identity",
+                )
+            ):
+                raise StampScienceAnalysisContractError(error_message)
+
+
 @dataclass(frozen=True)
 class _RawCadenceAnchor:
     first_time_start_seconds: float
@@ -4876,6 +5189,7 @@ def _raw_cadence_anchor_contract_v1(
             "authoritative analysis semantics raw-shard coverage is invalid "
             "for representative calibrated-frame provenance"
         )
+    _validate_writer_raw_shard_identities_v1(contract, raw_shards)
     expected_start = raw_frame_interval["start_index"]
     expected_time: float | None = None
     first_time: float | None = None
@@ -7471,6 +7785,36 @@ class StampScienceAnalysisBundleDiscovery:
     gate_task_list_binding: Mapping[str, Any] | None = None
 
 
+def _production_requires_publication_receipts_v1(
+    production: _ResolvedProductionSource,
+) -> bool:
+    track = production.source_identity.get("production_track")
+    delivery = production.manifest.get("delivery")
+    if not isinstance(delivery, Mapping):
+        raise StampScienceAnalysisContractError(
+            "formal production delivery contract is invalid"
+        )
+    if track in {"aster", "varlc", "wdlc"}:
+        if delivery.get("execution_mode") != "staged_local_scratch_v1":
+            raise StampScienceAnalysisContractError(
+                "formal science production requires staged_local_scratch_v1 delivery"
+            )
+        return True
+    if track != "galaxy":
+        raise StampScienceAnalysisContractError(
+            "formal production track is unsupported"
+        )
+    try:
+        execution_mode = delivery_execution_mode_from_manifest(
+            production.manifest
+        )
+    except ValueError as error:
+        raise StampScienceAnalysisContractError(
+            "formal Galaxy production delivery execution_mode is invalid"
+        ) from error
+    return execution_mode == "staged_local_scratch_v1"
+
+
 def _same_content_identity(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     return bool(
         left.get("size_bytes") == right.get("size_bytes")
@@ -7942,13 +8286,7 @@ def discover_stamp_science_analysis_bundles_v1(
             )
     raw_paths: list[Path] = []
     coadd_paths: dict[int, list[Path]] = {factor: [] for factor in (3, 6, 12, 30)}
-    delivery_contract = production.manifest.get("delivery")
-    requires_receipt = bool(
-        production.source_identity.get("production_track")
-        in {"aster", "varlc", "wdlc"}
-        and isinstance(delivery_contract, Mapping)
-        and delivery_contract.get("execution_mode") == "staged_local_scratch_v1"
-    )
+    requires_receipt = _production_requires_publication_receipts_v1(production)
     for shard_id in selected_ids:
         shard = by_id[shard_id]
         shard_root = delivery_root / f"shard_{shard_id:05d}"
@@ -8183,14 +8521,7 @@ def validate_stamp_science_analysis_request_ready_v1(
         case=str(context.get("case")),
         headers=raw_headers,
     )
-    delivery_contract = production.manifest.get("delivery")
-    staged_science = bool(
-        production.source_identity["production_track"]
-        in {"aster", "varlc", "wdlc"}
-        and isinstance(delivery_contract, Mapping)
-        and delivery_contract.get("execution_mode") == "staged_local_scratch_v1"
-    )
-    if staged_science:
+    if _production_requires_publication_receipts_v1(production):
         all_formal_headers = list(raw_headers)
         for factor, paths in request.direct_coadd_bundle_paths.items():
             all_formal_headers.extend(
