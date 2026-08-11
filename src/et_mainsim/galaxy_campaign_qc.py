@@ -32,6 +32,9 @@ import numpy as np
 
 from .galaxy_stamp_production import (
     GALAXY_STAMP_PRODUCTION_SCHEMA_ID,
+    GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION,
+    STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE,
+    delivery_execution_mode_from_manifest,
 )
 from .stamp_inputs import file_identity
 from .stamp_delivery import (
@@ -418,6 +421,10 @@ def _load_campaign(
         raise GalaxyCampaignDeliveryQCError(
             "production manifest delivery must be an object"
         )
+    try:
+        delivery_execution_mode_from_manifest(manifest)
+    except ValueError as error:
+        raise GalaxyCampaignDeliveryQCError(str(error)) from error
     time_plan_path = _resolve_relative_resource(
         run_root,
         delivery.get("time_plan_relative_path"),
@@ -928,6 +935,7 @@ def _invalid_optional_publication_receipts(
     run_id: str,
     case: CampaignCase,
     expected_bundles: tuple[_ExpectedBundle, ...],
+    publication_receipt_required: bool,
 ) -> tuple[Mapping[str, Any], ...]:
     grouped: dict[tuple[int, int], list[_ExpectedBundle]] = {}
     for bundle in expected_bundles:
@@ -942,6 +950,17 @@ def _invalid_optional_publication_receipts(
         shard = bundles[0].shard
         receipt_path = bundles[0].path.parent / STAMP_SHARD_PUBLICATION_RECEIPT_FILENAME
         if not receipt_path.exists() and not receipt_path.is_symlink():
+            if publication_receipt_required:
+                record = _publication_receipt_record(
+                    source_id=source_id,
+                    shard_id=shard_id,
+                    path=receipt_path,
+                )
+                record["error"] = (
+                    "publication receipt is required for "
+                    "staged_local_scratch_v1 delivery"
+                )
+                invalid.append(record)
             continue
         try:
             _validate_optional_publication_receipt(
@@ -1043,6 +1062,7 @@ def audit_galaxy_campaign_delivery_v1(
         request.production_manifest_path,
         manifest_bytes=frozen_manifest_bytes,
     )
+    delivery_execution_mode = delivery_execution_mode_from_manifest(manifest)
     run_id_value = manifest.get("run_id")
     if not isinstance(run_id_value, str) or not run_id_value.strip():
         raise GalaxyCampaignDeliveryQCError(
@@ -1101,6 +1121,12 @@ def audit_galaxy_campaign_delivery_v1(
             run_id=run_id,
             case=request.case,
             expected_bundles=expected,
+            publication_receipt_required=(
+                manifest["schema_version"]
+                == GALAXY_STAMP_PRODUCTION_SCHEMA_VERSION
+                and delivery_execution_mode
+                == STAGED_LOCAL_SCRATCH_DELIVERY_EXECUTION_MODE
+            ),
         )
     )
 

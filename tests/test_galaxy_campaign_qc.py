@@ -83,7 +83,12 @@ def _write_publication_receipt(
     return receipt_path
 
 
-def _write_fixture_run(tmp_path: Path, *, schema_version: object = 3) -> Path:
+def _write_fixture_run(
+    tmp_path: Path,
+    *,
+    schema_version: object = 3,
+    delivery_execution_mode: object | None = "direct_shared_filesystem",
+) -> Path:
     """Build a tiny complete raw+coadd Galaxy delivery campaign."""
 
     from et_mainsim.galaxy_stamp_production import (
@@ -132,6 +137,8 @@ def _write_fixture_run(tmp_path: Path, *, schema_version: object = 3) -> Path:
             for source_id in SOURCE_IDS
         ],
     }
+    if delivery_execution_mode is not None:
+        manifest["delivery"]["execution_mode"] = delivery_execution_mode
     manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
 
     for source_id in SOURCE_IDS:
@@ -254,6 +261,26 @@ def test_campaign_qc_reader_rejects_non_native_integer_manifest_versions(
         campaign_qc._load_campaign(manifest_path)
 
 
+@pytest.mark.parametrize("delivery_execution_mode", (None, "unknown_writer_mode"))
+def test_campaign_qc_reader_rejects_invalid_v3_delivery_execution_mode(
+    tmp_path: Path,
+    delivery_execution_mode: object | None,
+) -> None:
+    import et_mainsim.galaxy_campaign_qc as campaign_qc
+
+    manifest_path = _write_fixture_run(
+        tmp_path,
+        schema_version=3,
+        delivery_execution_mode=delivery_execution_mode,
+    )
+
+    with pytest.raises(
+        campaign_qc.GalaxyCampaignDeliveryQCError,
+        match="delivery.execution_mode",
+    ):
+        campaign_qc._load_campaign(manifest_path)
+
+
 def test_campaign_qc_accepts_complete_manifest_anchored_delivery(
     tmp_path: Path,
 ) -> None:
@@ -286,7 +313,7 @@ def test_campaign_qc_accepts_complete_manifest_anchored_delivery(
     assert payload["products"]["coadd_60s"]["valid_bundle_count"] == 4
 
 
-def test_campaign_qc_strictly_accepts_optional_bound_publication_receipts(
+def test_campaign_qc_accepts_bound_publication_receipts_for_v3_staged_delivery(
     tmp_path: Path,
 ) -> None:
     from et_mainsim.galaxy_campaign_qc import (
@@ -294,7 +321,11 @@ def test_campaign_qc_strictly_accepts_optional_bound_publication_receipts(
         audit_galaxy_campaign_delivery_v1,
     )
 
-    manifest_path = _write_fixture_run(tmp_path)
+    manifest_path = _write_fixture_run(
+        tmp_path,
+        schema_version=3,
+        delivery_execution_mode="staged_local_scratch_v1",
+    )
     for source_id in SOURCE_IDS:
         for shard_id in (0, 1):
             _write_publication_receipt(
@@ -313,6 +344,70 @@ def test_campaign_qc_strictly_accepts_optional_bound_publication_receipts(
     assert result.ready is True
     assert result.invalid_bundle_count == 0
     assert result.partial_artifacts == ()
+
+
+def test_campaign_qc_requires_receipts_for_v3_staged_delivery(
+    tmp_path: Path,
+) -> None:
+    from et_mainsim.galaxy_campaign_qc import (
+        GalaxyCampaignDeliveryQCRequest,
+        audit_galaxy_campaign_delivery_v1,
+    )
+
+    manifest_path = _write_fixture_run(
+        tmp_path,
+        schema_version=3,
+        delivery_execution_mode="staged_local_scratch_v1",
+    )
+
+    result = audit_galaxy_campaign_delivery_v1(
+        GalaxyCampaignDeliveryQCRequest(
+            production_manifest_path=manifest_path,
+            case="injected",
+        )
+    )
+
+    assert result.ready is False
+    assert result.invalid_bundle_count == 4
+    assert all(
+        record["product"] == "publication_receipt"
+        and "required for staged_local_scratch_v1" in record["error"]
+        for record in result.invalid_bundles
+    )
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "delivery_execution_mode"),
+    (
+        (3, "direct_shared_filesystem"),
+        (2, None),
+    ),
+)
+def test_campaign_qc_keeps_receipts_optional_for_direct_and_legacy_delivery(
+    tmp_path: Path,
+    schema_version: int,
+    delivery_execution_mode: object | None,
+) -> None:
+    from et_mainsim.galaxy_campaign_qc import (
+        GalaxyCampaignDeliveryQCRequest,
+        audit_galaxy_campaign_delivery_v1,
+    )
+
+    manifest_path = _write_fixture_run(
+        tmp_path,
+        schema_version=schema_version,
+        delivery_execution_mode=delivery_execution_mode,
+    )
+
+    result = audit_galaxy_campaign_delivery_v1(
+        GalaxyCampaignDeliveryQCRequest(
+            production_manifest_path=manifest_path,
+            case="injected",
+        )
+    )
+
+    assert result.ready is True
+    assert result.invalid_bundle_count == 0
 
 
 @pytest.mark.parametrize(

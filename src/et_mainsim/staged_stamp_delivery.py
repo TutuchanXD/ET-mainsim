@@ -29,6 +29,7 @@ from uuid import uuid4
 import numpy as np
 
 from .independent_stamp_production import _read_staged_bundle_coverage
+from .stamp_delivery import validate_stamp_delivery_bundle
 from .time_shards import ContinuousTimeShard, ContinuousTimeShardPlan
 
 
@@ -781,6 +782,23 @@ def _validate_shard_contract(
             )
 
 
+def _validate_copied_bundle_payloads(
+    root: Path,
+    *,
+    shard: ContinuousTimeShard,
+) -> None:
+    """Stream-validate every exact copied HDF5 member before publication."""
+
+    for name, _, _ in _expected_members(shard):
+        try:
+            validate_stamp_delivery_bundle(root / name)
+        except (OSError, TypeError, ValueError) as error:
+            raise StagedStampShardPublishError(
+                "full payload validation failed for copied staged delivery "
+                f"member {name}"
+            ) from error
+
+
 def _copy_members_and_verify(
     source_root: Path,
     destination_root: Path,
@@ -1028,6 +1046,10 @@ def publish_staged_independent_stamp_shard(
             run_id=run_id,
             production_manifest_payload=frozen_manifest.payload,
             production_manifest_identity=production_manifest_identity,
+        )
+        _validate_copied_bundle_payloads(
+            staging_root,
+            shard=request.shard,
         )
         receipt_payload = _publication_receipt_payload(
             request=request,

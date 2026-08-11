@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 
@@ -327,6 +328,51 @@ def test_publish_staged_shard_copies_verifies_and_atomically_publishes(tmp_path)
             "size_bytes": len(raw_bytes),
             "sha256": hashlib.sha256(raw_bytes).hexdigest(),
         }
+
+
+def test_publish_staged_shard_revalidates_exact_copied_bundle_bytes_before_publish(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import et_mainsim.staged_stamp_delivery as staged_delivery
+
+    production_manifest, staged_case_root, shard = _make_staged_shard(tmp_path)
+    formal_case_root = production_manifest.parent / "cases" / "injected"
+    request = staged_delivery.StagedStampShardPublishRequest(
+        staged_case_root=staged_case_root,
+        formal_case_root=formal_case_root,
+        production_manifest_path=production_manifest,
+        target_source_id=42,
+        shard=shard,
+        case="injected",
+    )
+    original_copy = staged_delivery._copy_members_and_verify
+
+    def _tamper_destination_after_copy_verification(
+        source_root,
+        destination_root,
+        *,
+        shard,
+    ):
+        identities = original_copy(source_root, destination_root, shard=shard)
+        with h5py.File(destination_root / "raw.h5", "r+") as handle:
+            handle["saturated_mask"][0, 0, 0] = True
+        return identities
+
+    monkeypatch.setattr(
+        staged_delivery,
+        "_copy_members_and_verify",
+        _tamper_destination_after_copy_verification,
+    )
+
+    with pytest.raises(
+        staged_delivery.StagedStampShardPublishError,
+        match="full payload.*raw.h5",
+    ):
+        staged_delivery.publish_staged_independent_stamp_shard(request)
+
+    assert not request.final_shard_root.exists()
+    assert not list(request.final_shard_root.parent.glob(".shard_00000.*"))
 
 
 def test_publish_staged_shard_fails_atomically_if_receipt_readback_fails(
