@@ -300,6 +300,26 @@ _REPRESENTATIVE_FRAME_SELECTION_ROLES = (
     "middle_clean",
     "last_clean",
 )
+_CAPTURED_FLUX_QA_DEFINITION = (
+    "pass_requires_no_detector_edge_or_requested_window_truncation"
+)
+_CAPTURED_FLUX_QA_DENOMINATOR = "source_effective_photon_count_electron"
+_DIRECT_COADD_PARITY_COMPARISON = (
+    "all_formal_planes_exact_except_float_rtol_1e-12_atol_1e-8"
+)
+_DIRECT_COADD_PARITY_FIELDS = {
+    "required",
+    "passed",
+    "comparison",
+    "sample_count",
+    "samples",
+}
+_DIRECT_COADD_PARITY_SAMPLE_FIELDS = {
+    "factor",
+    "path",
+    "local_frame_index",
+    "raw_frame_start_index",
+}
 _REPRESENTATIVE_FRAME_CONTRACT_FIELDS = {
     "selection_role",
     "raw_frame_start_index",
@@ -2348,7 +2368,7 @@ def _validate_direct_parity(
     return {
         "required": bool(samples),
         "passed": True,
-        "comparison": "all_formal_planes_exact_except_float_rtol_1e-12_atol_1e-8",
+        "comparison": _DIRECT_COADD_PARITY_COMPARISON,
         "sample_count": len(rows),
         "samples": rows,
     }
@@ -2501,6 +2521,14 @@ def _resolve_input_byte_identity(header: _InputHeader) -> dict[str, Any]:
             raise StampScienceAnalysisContractError(
                 "publication receipt and formal bundle bind different production manifests"
             )
+        current_identity = _file_identity(source)
+        if (
+            current_identity["size_bytes"] != size
+            or current_identity["sha256"] != sha256
+        ):
+            raise StampScienceAnalysisContractError(
+                "publication receipt digest differs from the current bundle bytes"
+            )
         if _FileStat.from_path(source) != current_stat:
             raise StampScienceAnalysisContractError(
                 "formal bundle stat changed during receipt identity preflight"
@@ -2574,6 +2602,36 @@ def _build_reference_aperture(
             "background_guard_pixels": policy.background_guard_pixels,
             "background_border_pixels": policy.background_border_pixels,
         },
+    )
+
+
+def _bind_aperture_background_policy_v1(
+    aperture: ScienceApertureDefinition,
+    *,
+    policy: StampSciencePhotometryPolicy,
+) -> ScienceApertureDefinition:
+    validated = _validate_frozen_aperture_definition(aperture)
+    metadata = dict(validated.metadata)
+    recorded_strategy = metadata.get("background_strategy")
+    if (
+        recorded_strategy is not None
+        and recorded_strategy != policy.background_strategy
+    ):
+        raise StampScienceAnalysisContractError(
+            "frozen aperture background metadata differs from analysis policy"
+        )
+    metadata["background_strategy"] = policy.background_strategy
+    return ScienceApertureDefinition(
+        aperture_mask=validated.aperture_mask,
+        background_mask=validated.background_mask,
+        signal_template_e=validated.signal_template_e,
+        noise_template_e=validated.noise_template_e,
+        maximum_cumulative_snr=validated.maximum_cumulative_snr,
+        algorithm=validated.algorithm,
+        signal_template_shape=validated.signal_template_shape,
+        target_peak_yx=validated.target_peak_yx,
+        training_raw_frame_indices=validated.training_raw_frame_indices,
+        metadata=metadata,
     )
 
 
@@ -2929,6 +2987,25 @@ def _flux_uncertainty_model_contract_v1() -> dict[str, str]:
     }
 
 
+def _captured_flux_qa_contract_v1(
+    cadence_records: Mapping[str, tuple[bool, float]],
+) -> dict[str, Any]:
+    return {
+        "definition": _CAPTURED_FLUX_QA_DEFINITION,
+        "fraction_denominator": _CAPTURED_FLUX_QA_DENOMINATOR,
+        "post_crop_renormalization": False,
+        "cadences": {
+            name: {
+                "all_pass": bool(all_pass),
+                "minimum_fraction": float(minimum_fraction),
+            }
+            for name, (all_pass, minimum_fraction) in sorted(
+                cadence_records.items()
+            )
+        },
+    }
+
+
 def _build_contract(
     *,
     request: StampScienceAnalysisRequest,
@@ -2971,24 +3048,15 @@ def _build_contract(
             "background_strategy": (
                 request.policy.photometry.background_strategy
             ),
-            "captured_flux_qa": {
-                "definition": (
-                    "pass_requires_no_detector_edge_or_requested_window_truncation"
-                ),
-                "fraction_denominator": (
-                    "source_effective_photon_count_electron"
-                ),
-                "post_crop_renormalization": False,
-                "cadences": {
-                    f"{int(round(float(analysis.exposure_seconds[0])))}s": {
-                        "all_pass": bool(np.all(analysis.captured_flux_qa_pass)),
-                        "minimum_fraction": float(
-                            np.min(analysis.captured_flux_fraction)
-                        ),
-                    }
+            "captured_flux_qa": _captured_flux_qa_contract_v1(
+                {
+                    f"{int(round(float(analysis.exposure_seconds[0])))}s": (
+                        bool(np.all(analysis.captured_flux_qa_pass)),
+                        float(np.min(analysis.captured_flux_fraction)),
+                    )
                     for _, analysis in sorted(analyses.items())
-                },
-            },
+                }
+            ),
             "source_model": "through_origin_integrated_raw_relative_flux_v1",
             "flux_uncertainty_model": _flux_uncertainty_model_contract_v1(),
             "rate_products": {
@@ -4898,6 +4966,201 @@ def _publication_analysis_policy_v1(
     return policy
 
 
+def _validate_publication_direct_parity_v1(
+    contract: Mapping[str, Any],
+    *,
+    policy: StampScienceAnalysisPolicy,
+    raw_frame_interval: Mapping[str, int],
+) -> None:
+    parity = contract.get("direct_coadd_parity")
+    samples = parity.get("samples") if isinstance(parity, Mapping) else None
+    if (
+        not isinstance(parity, Mapping)
+        or set(parity) != _DIRECT_COADD_PARITY_FIELDS
+        or type(parity.get("required")) is not bool
+        or parity.get("passed") is not True
+        or parity.get("comparison") != _DIRECT_COADD_PARITY_COMPARISON
+        or type(parity.get("sample_count")) is not int
+        or not isinstance(samples, list)
+        or parity["sample_count"] != len(samples)
+        or parity["required"] is not bool(samples)
+        or (policy.require_direct_coadd_parity and not samples)
+    ):
+        raise StampScienceAnalysisContractError(
+            "analysis direct-coadd parity contract is invalid"
+        )
+
+    direct_shards = contract.get("input_direct_coadd_shards")
+    if not isinstance(direct_shards, Mapping):
+        raise StampScienceAnalysisContractError(
+            "analysis direct-coadd parity contract is invalid"
+        )
+    bound_shards: dict[tuple[int, str], Mapping[str, Any]] = {}
+    for factor_text, records in direct_shards.items():
+        if (
+            not isinstance(factor_text, str)
+            or not factor_text.isdecimal()
+            or str(int(factor_text)) != factor_text
+            or not isinstance(records, list)
+        ):
+            raise StampScienceAnalysisContractError(
+                "analysis direct-coadd parity contract is invalid"
+            )
+        factor = int(factor_text)
+        for record in records:
+            path = record.get("path") if isinstance(record, Mapping) else None
+            if (
+                not isinstance(record, Mapping)
+                or type(record.get("coadd_factor")) is not int
+                or record["coadd_factor"] != factor
+                or not isinstance(path, str)
+                or not _is_canonical_absolute_path_text(path)
+                or (factor, path) in bound_shards
+            ):
+                raise StampScienceAnalysisContractError(
+                    "analysis direct-coadd parity contract is invalid"
+                )
+            bound_shards[(factor, path)] = record
+
+    seen_samples: set[tuple[int, str, int]] = set()
+    for sample in samples:
+        if not isinstance(sample, Mapping) or set(sample) != (
+            _DIRECT_COADD_PARITY_SAMPLE_FIELDS
+        ):
+            raise StampScienceAnalysisContractError(
+                "analysis direct-coadd parity sample is invalid"
+            )
+        factor = sample.get("factor")
+        path = sample.get("path")
+        local_index = sample.get("local_frame_index")
+        raw_start = sample.get("raw_frame_start_index")
+        if (
+            type(factor) is not int
+            or factor not in policy.coadd_factors
+            or factor == 1
+            or not isinstance(path, str)
+            or type(local_index) is not int
+            or not _is_native_int64_index(local_index)
+            or local_index < 0
+            or type(raw_start) is not int
+            or not _is_native_int64_index(raw_start)
+            or raw_start < raw_frame_interval["start_index"]
+            or raw_start >= raw_frame_interval["stop_index_exclusive"]
+        ):
+            raise StampScienceAnalysisContractError(
+                "analysis direct-coadd parity sample is invalid"
+            )
+        bound = bound_shards.get((factor, path))
+        frame_count = bound.get("frame_count") if bound is not None else None
+        first_start = (
+            bound.get("first_raw_frame_start") if bound is not None else None
+        )
+        sample_key = (factor, path, local_index)
+        if (
+            bound is None
+            or type(frame_count) is not int
+            or frame_count <= local_index
+            or type(first_start) is not int
+            or not _is_native_int64_index(first_start)
+            or raw_start != first_start + local_index * factor
+            or sample_key in seen_samples
+        ):
+            raise StampScienceAnalysisContractError(
+                "analysis direct-coadd parity sample differs from its bound shard"
+            )
+        seen_samples.add(sample_key)
+
+
+def _validate_publication_code_provenance_v1(
+    contract: Mapping[str, Any],
+) -> None:
+    context = contract.get("analysis_context")
+    if (
+        not isinstance(context, Mapping)
+        or context.get("formal_profile_id") != STAMP_SCIENCE_FORMAL_PROFILE_ID
+    ):
+        return
+
+    request_identity = contract.get("request_code_identity")
+    execution_identity = contract.get("execution_code_identity")
+    code_identity = contract.get("code_identity")
+    base_fields = {
+        "schema_id",
+        "schema_version",
+        "provenance",
+        "analysis_dependencies",
+    }
+    if (
+        not isinstance(request_identity, Mapping)
+        or not isinstance(execution_identity, Mapping)
+        or not isinstance(code_identity, Mapping)
+        or set(request_identity) != base_fields
+        or set(execution_identity) != base_fields | {"execution_hardware"}
+        or _canonical_json_text(
+            code_identity,
+            name="analysis code identity",
+        )
+        != _canonical_json_text(
+            execution_identity,
+            name="analysis execution code identity",
+        )
+    ):
+        raise StampScienceAnalysisContractError(
+            "formal analysis code provenance contract is invalid"
+        )
+    hardware = execution_identity.get("execution_hardware")
+    hardware_fields = {
+        "schema_id",
+        "analysis_compute_device",
+        "cpu_count",
+        "machine",
+        "cuda_available",
+        "cuda_device_names",
+    }
+    cpu_count = hardware.get("cpu_count") if isinstance(hardware, Mapping) else None
+    cuda_names = (
+        hardware.get("cuda_device_names")
+        if isinstance(hardware, Mapping)
+        else None
+    )
+    if (
+        not isinstance(hardware, Mapping)
+        or set(hardware) != hardware_fields
+        or hardware.get("schema_id")
+        != "et_mainsim.analysis_execution_hardware.v1"
+        or hardware.get("analysis_compute_device") != "cpu"
+        or (
+            cpu_count is not None
+            and (type(cpu_count) is not int or cpu_count <= 0)
+        )
+        or not isinstance(hardware.get("machine"), str)
+        or type(hardware.get("cuda_available")) is not bool
+        or not isinstance(cuda_names, list)
+        or any(not isinstance(name, str) or not name for name in cuda_names)
+        or (not hardware["cuda_available"] and cuda_names)
+    ):
+        raise StampScienceAnalysisContractError(
+            "formal analysis code provenance execution hardware is invalid"
+        )
+    execution_base = {
+        name: execution_identity[name] for name in sorted(base_fields)
+    }
+    current_identity = collect_formal_analysis_code_identity_v1()
+    if (
+        not _formal_code_identity_matches_execution_v1(
+            request_identity,
+            execution_base,
+        )
+        or not _formal_code_identity_matches_execution_v1(
+            execution_base,
+            current_identity,
+        )
+    ):
+        raise StampScienceAnalysisContractError(
+            "formal analysis code provenance differs from request/current execution"
+        )
+
+
 def _analysis_noise_parameters_v1(
     contract: Mapping[str, Any],
 ) -> tuple[float, float]:
@@ -5455,6 +5718,12 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             "analysis contract flux uncertainty model is invalid"
         )
     analysis_policy = _publication_analysis_policy_v1(contract)
+    _validate_publication_direct_parity_v1(
+        contract,
+        policy=analysis_policy,
+        raw_frame_interval=raw_frame_interval,
+    )
+    _validate_publication_code_provenance_v1(contract)
     raw_cadence_anchor = _raw_cadence_anchor_contract_v1(
         contract,
         raw_frame_interval=raw_frame_interval,
@@ -5502,7 +5771,9 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     authoritative_cdpp: dict[str, Any]
     representative_time_start_seconds: tuple[float, ...] | None = None
     representative_exposure_seconds: tuple[float, ...] | None = None
+    representative_factor_one: dict[str, NDArray[Any]] | None = None
     expected_quality_cadences: dict[str, Any] = {}
+    expected_captured_records: dict[str, tuple[bool, float]] = {}
     with h5py.File(hdf_path, "r") as handle:
         schema_id = handle.attrs.get("schema_id")
         if isinstance(schema_id, bytes):
@@ -5579,7 +5850,14 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         if (
             not isinstance(recorded_q_identity, Mapping)
             or not isinstance(source_identity, Mapping)
-            or dict(recorded_q_identity) != expected_q_identity
+            or _canonical_json_text(
+                recorded_q_identity,
+                name="recorded raw_relative_flux identity",
+            )
+            != _canonical_json_text(
+                expected_q_identity,
+                name="recomputed raw_relative_flux identity",
+            )
         ):
             raise StampScienceAnalysisContractError(
                 "authoritative HDF5 raw_relative_flux identity differs from contract"
@@ -5734,6 +6012,10 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                 captured_flux_qa_pass=captured_qa,
                 captured_flux_fraction=captured_fraction,
             )
+            expected_captured_records[name] = (
+                bool(np.all(captured_qa)),
+                float(np.min(captured_fraction)),
+            )
             uncertainty = np.asarray(group["flux_uncertainty_e"], dtype=np.float64)
             variance_components = tuple(
                 np.asarray(group[item], dtype=np.float64)
@@ -5866,6 +6148,27 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                 representative_exposure_seconds = tuple(
                     float(value) for value in exposure[selected_positions]
                 )
+                representative_factor_one = {
+                    field: np.asarray(group[field])[selected_positions]
+                    for field in (
+                        "flux_expectation_bgsub_e",
+                        "flux_local_bgsub_e",
+                        "local_background_e_per_pixel",
+                        "centroid_x",
+                        "centroid_y",
+                        "aperture_valid",
+                        "aperture_usable_pixel_count",
+                        "aperture_invalid_pixel_count",
+                        "saturated_pixel_count",
+                        "cosmic_pixel_count",
+                        "background_usable_pixel_count",
+                        "quality_bitmask",
+                        "background_expectation_aperture_e",
+                        "captured_flux_fraction",
+                        "captured_flux_denominator_e",
+                        "captured_flux_qa_pass",
+                    )
+                }
         aperture_group = handle.get("aperture")
         required_aperture_datasets = {
             "aperture_mask",
@@ -5921,6 +6224,19 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                 raise StampScienceAnalysisContractError(
                     "authoritative HDF5 aperture training products are invalid"
                 )
+    expected_captured_contract = _captured_flux_qa_contract_v1(
+        expected_captured_records
+    )
+    if _canonical_json_text(
+        captured_contract,
+        name="recorded captured-flux contract",
+    ) != _canonical_json_text(
+        expected_captured_contract,
+        name="recomputed captured-flux contract",
+    ):
+        raise StampScienceAnalysisContractError(
+            "captured-flux contract differs from authoritative HDF5 cadences"
+        )
     aperture_npy = np.load(root / "aperture_mask.npy", allow_pickle=False)
     background_npy = np.load(root / "background_mask.npy", allow_pickle=False)
     if not np.array_equal(aperture_npy, aperture) or not np.array_equal(
@@ -6040,6 +6356,14 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
         raise StampScienceAnalysisContractError(
             "aperture definition reference training fields are invalid"
         )
+    aperture_metadata = aperture_definition["metadata"]
+    if (
+        aperture_metadata.get("background_strategy")
+        != contract.get("background_strategy")
+    ):
+        raise StampScienceAnalysisContractError(
+            "aperture metadata background strategy differs from analysis contract"
+        )
     _validate_cdpp_portable_products_v1(
         root,
         authoritative_payload=authoritative_cdpp,
@@ -6095,6 +6419,7 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     if (
         representative_time_start_seconds is None
         or representative_exposure_seconds is None
+        or representative_factor_one is None
     ):
         raise StampScienceAnalysisContractError(
             "representative calibrated-frame provenance lacks an authoritative "
@@ -6311,6 +6636,83 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
             raise StampScienceAnalysisContractError(
                 "representative frames are not clean for their product aperture"
             )
+        try:
+            representative_photometry = reduce_science_photometry_v1(
+                ReferencePhotometryInput.from_arrays(
+                    final_dn=final,
+                    background_expectation_e=background_expectation,
+                    bias_level_sum_dn=bias,
+                    column_noise_sum_dn_by_x=column,
+                    valid_mask=valid,
+                    saturated_mask=saturated,
+                    cosmic_mask=cosmic,
+                    time_index=np.arange(final.shape[0], dtype=np.float64),
+                    gain_e_per_dn=gain,
+                    time_index_unit="seconds",
+                    exposure_seconds=exposure,
+                ),
+                aperture_mask=aperture,
+                background_mask=(
+                    background
+                    if analysis_policy.photometry.local_background_enabled
+                    else None
+                ),
+                minimum_background_pixels=(
+                    analysis_policy.photometry.minimum_background_pixels
+                ),
+            )
+        except (
+            ReferencePhotometryContractError,
+            SciencePhotometryContractError,
+        ) as error:
+            raise StampScienceAnalysisContractError(
+                "representative calibrated-frame photometry is invalid"
+            ) from error
+        recomputed_fields = {
+            "flux_expectation_bgsub_e": (
+                representative_photometry.flux_expectation_bgsub_e
+            ),
+            "flux_local_bgsub_e": representative_photometry.flux_local_bgsub_e,
+            "local_background_e_per_pixel": (
+                representative_photometry.local_background_e_per_pixel
+            ),
+            "centroid_x": representative_photometry.centroid_x,
+            "centroid_y": representative_photometry.centroid_y,
+            "aperture_valid": representative_photometry.aperture_valid,
+            "aperture_usable_pixel_count": (
+                representative_photometry.aperture_usable_pixel_count
+            ),
+            "aperture_invalid_pixel_count": (
+                representative_photometry.aperture_invalid_pixel_count
+            ),
+            "saturated_pixel_count": (
+                representative_photometry.saturated_pixel_count
+            ),
+            "cosmic_pixel_count": representative_photometry.cosmic_pixel_count,
+            "background_usable_pixel_count": (
+                representative_photometry.background_usable_pixel_count
+            ),
+            "quality_bitmask": representative_photometry.quality_bitmask,
+            "background_expectation_aperture_e": np.sum(
+                background_expectation[:, aperture],
+                axis=1,
+                dtype=np.float64,
+            ),
+            "captured_flux_fraction": captured_fraction,
+            "captured_flux_denominator_e": captured_denominator,
+            "captured_flux_qa_pass": captured_qa,
+        }
+        if any(
+            not _arrays_match_exactly(
+                recomputed_fields[name],
+                representative_factor_one[name],
+            )
+            for name in representative_factor_one
+        ):
+            raise StampScienceAnalysisContractError(
+                "representative calibrated-frame photometry differs from the "
+                "authoritative factor-1 cadence"
+            )
     return StampScienceAnalysisValidation(
         output_dir=root,
         complete=True,
@@ -6449,7 +6851,13 @@ def validate_stamp_science_analysis_product_set_v1(
             )
         if common_raw_policy_binding is None:
             common_raw_policy_binding = raw_policy_binding
-        elif raw_policy_binding != common_raw_policy_binding:
+        elif _canonical_json_text(
+            raw_policy_binding,
+            name=f"{name} raw semantic identities/policy",
+        ) != _canonical_json_text(
+            common_raw_policy_binding,
+            name="common child raw semantic identities/policy",
+        ):
             raise StampScienceAnalysisContractError(
                 "analysis products bind different raw semantic identities/policy"
             )
@@ -6624,6 +7032,10 @@ def analyze_stamp_science_series_v1(
             aperture = _validate_frozen_aperture_definition(
                 request.frozen_aperture
             )
+        aperture = _bind_aperture_background_policy_v1(
+            aperture,
+            policy=request.policy.photometry,
+        )
         samples = _direct_samples(
             direct_headers,
             samples_per_shard=request.policy.direct_coadd_samples_per_shard,
@@ -6750,6 +7162,10 @@ def analyze_stamp_science_product_set_v1(
             science_aperture = _validate_frozen_aperture_definition(
                 request.frozen_aperture
             )
+        science_aperture = _bind_aperture_background_policy_v1(
+            science_aperture,
+            policy=request.policy.photometry,
+        )
         reference_aperture = _build_reference_aperture(
             raw_headers[0].formal.stamp_shape,
             policy=request.policy.photometry,

@@ -1297,6 +1297,56 @@ def test_input_hdf_byte_identity_prefers_a_complete_staged_receipt(
     assert all("publication_receipt" in item for item in byte_identities)
 
 
+def test_input_hdf_byte_identity_verifies_receipt_against_current_bytes(
+    tmp_path: Path,
+) -> None:
+    raw_paths, _, _ = _series_fixture(tmp_path)
+    source = raw_paths[0]
+    original = source.read_bytes()
+    (tmp_path / "publication_receipt.json").write_text(
+        json.dumps(
+            {
+                "schema_id": "et_mainsim.stamp_shard_publication_receipt.v1",
+                "schema_version": 1,
+                "complete": True,
+                "run_id": "fixture-run",
+                "case": "injected",
+                "target_source_id_int64": "fixture-1",
+                "shard": {},
+                "production_manifest": {
+                    "path_relative_to_run_root": "production_manifest.json",
+                    "size_bytes": 2,
+                    "sha256": "0" * 64,
+                },
+                "members": {
+                    source.name: {
+                        "path_relative_to_run_root": source.name,
+                        "size_bytes": len(original),
+                        "sha256": hashlib.sha256(original).hexdigest(),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with h5py.File(source, "r+") as handle:
+        handle["final_dn"][0, 0, 0] += np.uint64(1)
+    assert source.stat().st_size == len(original)
+
+    import et_mainsim.stamp_science_analysis as backend
+
+    header = backend._read_series_headers(
+        (source,),
+        product_kind="raw",
+        coadd_factor=1,
+    )[0]
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="receipt.*current.*bytes",
+    ):
+        backend._resolve_input_byte_identity(header)
+
+
 def test_product_set_publishes_reference_fixed13_and_science_oa_from_one_raw_pass(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2138,6 +2188,261 @@ def _replace_product_contract(
         product_name=product_name,
         artifact_name="photometry.h5",
     )
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    ["minimum_fraction", "definition", "missing_fraction_denominator"],
+)
+def test_publication_recomputes_the_exact_captured_flux_contract(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    tamper_mode: str,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "captured-flux-contract-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    manifest = json.loads(
+        (product_root / "analysis_manifest.json").read_text(encoding="utf-8")
+    )
+    contract = manifest["contract"]
+    captured = contract["captured_flux_qa"]
+    if tamper_mode == "minimum_fraction":
+        record = captured["cadences"]["10s"]
+        record["minimum_fraction"] = float(record["minimum_fraction"]) / 2.0
+    elif tamper_mode == "definition":
+        captured["definition"] = "forged-capture-definition"
+    else:
+        del captured["fraction_denominator"]
+    _replace_product_contract(
+        root,
+        product_name=product_name,
+        contract=contract,
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="captured-flux",
+        ):
+            validator(path)
+
+
+@pytest.mark.parametrize("tamper_mode", ["forged", "missing"])
+def test_publication_binds_aperture_metadata_background_strategy(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    tamper_mode: str,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "aperture-metadata-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    manifest = json.loads(
+        (product_root / "analysis_manifest.json").read_text(encoding="utf-8")
+    )
+    contract = manifest["contract"]
+    metadata = contract["aperture"]["metadata"]
+    if tamper_mode == "forged":
+        metadata["background_strategy"] = "forged-background-strategy"
+    else:
+        del metadata["background_strategy"]
+    _replace_product_contract(
+        root,
+        product_name=product_name,
+        contract=contract,
+    )
+    definition_path = product_root / "aperture_definition.json"
+    definition_path.write_text(
+        json.dumps(contract["aperture"]),
+        encoding="utf-8",
+    )
+    _rehash_product_artifact(
+        root,
+        product_name=product_name,
+        artifact_name=definition_path.name,
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="aperture.*background strategy",
+        ):
+            validator(path)
+
+
+def test_publication_compares_q_identity_types_exactly(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "q-identity-type-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    manifest = json.loads(
+        (product_root / "analysis_manifest.json").read_text(encoding="utf-8")
+    )
+    contract = manifest["contract"]
+    count = contract["raw_relative_flux"]["count"]
+    assert type(count) is int
+    contract["raw_relative_flux"]["count"] = float(count)
+    _replace_product_contract(
+        root,
+        product_name=product_name,
+        contract=contract,
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="raw_relative_flux identity",
+        ):
+            validator(path)
+
+
+def test_product_set_compares_child_raw_bindings_types_exactly(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "child-raw-binding-type-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_names = (
+        "reference_fixed13_v1",
+        "science_optimal_aperture_v1",
+    )
+    for product_name, probe in zip(product_names, (1, 1.0), strict=True):
+        product_root = root / product_name
+        manifest = json.loads(
+            (product_root / "analysis_manifest.json").read_text(encoding="utf-8")
+        )
+        contract = manifest["contract"]
+        contract["raw_relative_flux"]["source_identity"]["type_probe"] = probe
+        _replace_product_contract(
+            root,
+            product_name=product_name,
+            contract=contract,
+        )
+        assert backend.validate_stamp_science_analysis_v1(product_root).complete
+
+    with pytest.raises(
+        backend.StampScienceAnalysisContractError,
+        match="different raw semantic identities/policy",
+    ):
+        backend.validate_stamp_science_analysis_product_set_v1(root)
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    ["missing", "failed", "empty-required-samples"],
+)
+def test_publication_requires_an_exact_successful_direct_parity_record(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    tamper_mode: str,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "direct-parity-contract-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    manifest = json.loads(
+        (product_root / "analysis_manifest.json").read_text(encoding="utf-8")
+    )
+    contract = manifest["contract"]
+    if tamper_mode == "missing":
+        del contract["direct_coadd_parity"]
+    elif tamper_mode == "failed":
+        contract["direct_coadd_parity"]["passed"] = False
+    else:
+        contract["direct_coadd_parity"].update(
+            {
+                "required": False,
+                "sample_count": 0,
+                "samples": [],
+            }
+        )
+    _replace_product_contract(
+        root,
+        product_name=product_name,
+        contract=contract,
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="direct.*parity",
+        ):
+            validator(path)
+
+
+def test_publication_cross_binds_representative_pixels_to_factor_one_photometry(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "representative-pixel-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    representative_path = product_root / "representative_calibrated_frames.h5"
+    aperture = np.load(product_root / "aperture_mask.npy", allow_pickle=False)
+    y, x = np.argwhere(aperture)[0]
+    with h5py.File(representative_path, "r+") as handle:
+        final = np.asarray(handle["final_dn"])
+        final[0, y, x] += np.uint64(1)
+        handle["final_dn"][:] = final
+        bias = np.asarray(handle["bias_level_sum_dn"], dtype=np.float64)
+        column = np.asarray(
+            handle["column_noise_sum_dn_by_x"],
+            dtype=np.float64,
+        )
+        gain = np.asarray(handle["gain_e_per_dn"], dtype=np.float64)
+        calibrated = (
+            final.astype(np.float64) - bias[:, None, None] - column[:, None, :]
+        ) * gain
+        handle["calibrated_e"][:] = calibrated
+        handle["calibrated_bgsub_e"][:] = calibrated - np.asarray(
+            handle["background_expectation_e"],
+            dtype=np.float64,
+        )
+    _rehash_product_artifact(
+        root,
+        product_name=product_name,
+        artifact_name=representative_path.name,
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="representative calibrated-frame photometry",
+        ):
+            validator(path)
 
 
 @pytest.mark.parametrize(
@@ -5285,6 +5590,40 @@ def test_formal_injected_gate_request_writes_loads_runs_and_validates(
         publication.output_dir
     )
     assert validation.complete is True
+
+    product_name = "science_optimal_aperture_v1"
+    product_root = publication.output_dir / product_name
+    child_manifest = json.loads(
+        (product_root / "analysis_manifest.json").read_text(encoding="utf-8")
+    )
+    contract = child_manifest["contract"]
+    forged_request_identity = json.loads(json.dumps(code_identity))
+    forged_request_identity["provenance"]["et_mainsim"]["commit"] = "c" * 40
+    forged_execution_identity = json.loads(
+        json.dumps(contract["execution_code_identity"])
+    )
+    forged_execution_identity["provenance"]["et_mainsim"]["commit"] = "c" * 40
+    contract["request_code_identity"] = forged_request_identity
+    contract["execution_code_identity"] = forged_execution_identity
+    contract["code_identity"] = forged_execution_identity
+    _replace_product_contract(
+        publication.output_dir,
+        product_name=product_name,
+        contract=contract,
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (
+            backend.validate_stamp_science_analysis_product_set_v1,
+            publication.output_dir,
+        ),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="code provenance",
+        ):
+            validator(path)
 
 
 def test_formal_code_identity_is_automatic_and_rejects_dirty_or_unknown_repositories(
