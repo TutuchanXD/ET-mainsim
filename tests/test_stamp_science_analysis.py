@@ -2064,6 +2064,36 @@ def _schema_version_publication_root(
     return publication.output_dir
 
 
+def _rehash_product_artifact(
+    root: Path,
+    *,
+    product_name: str,
+    artifact_name: str,
+) -> None:
+    import et_mainsim.stamp_science_analysis as backend
+
+    product_root = root / product_name
+    artifact_path = product_root / artifact_name
+    child_manifest_path = product_root / "analysis_manifest.json"
+    child_manifest = json.loads(child_manifest_path.read_text(encoding="utf-8"))
+    child_manifest["artifacts"][artifact_name] = backend._file_identity(
+        artifact_path
+    )
+    child_manifest_path.write_text(json.dumps(child_manifest), encoding="utf-8")
+
+    product_set_manifest_path = root / "product_set_manifest.json"
+    product_set_manifest = json.loads(
+        product_set_manifest_path.read_text(encoding="utf-8")
+    )
+    product_set_manifest["products"][product_name]["analysis_manifest"] = (
+        backend._file_identity(child_manifest_path)
+    )
+    product_set_manifest_path.write_text(
+        json.dumps(product_set_manifest),
+        encoding="utf-8",
+    )
+
+
 @pytest.mark.parametrize(
     "schema_surface",
     [
@@ -2672,6 +2702,147 @@ def test_published_analysis_readback_rejects_legacy_photometry_table_schema(
         backend.validate_stamp_science_analysis_v1(publication.output_dir)
 
 
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
+        "metadata",
+        "column_order",
+        "row_order",
+        "row_count",
+        "cadence_axis",
+        "dtype",
+        "value",
+        "local_valid",
+        "qa_nonbinary",
+    ],
+)
+def test_public_readback_binds_portable_photometry_to_authoritative_hdf5(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    tamper_mode: str,
+) -> None:
+    from astropy.table import Table
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "photometry-parity-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    artifact_path = product_root / "photometry.ecsv"
+    table = Table.read(artifact_path, format="ascii.ecsv")
+    if tamper_mode == "metadata":
+        table.meta["unbound_extension"] = "accepted-by-subset-validation"
+    elif tamper_mode == "column_order":
+        table = table[list(reversed(table.colnames))]
+    elif tamper_mode == "row_order":
+        order = np.arange(len(table))
+        order[:2] = order[1::-1]
+        table = table[order]
+    elif tamper_mode == "row_count":
+        table = table[:-1]
+    elif tamper_mode == "cadence_axis":
+        table["cadence_seconds"][0] += 1
+    elif tamper_mode == "dtype":
+        table["quality_bitmask"] = np.asarray(
+            table["quality_bitmask"],
+            dtype=np.float64,
+        )
+    elif tamper_mode == "value":
+        table["centroid_x"][0] += 0.25
+    elif tamper_mode == "local_valid":
+        table["local_background_valid"][0] = not bool(
+            table["local_background_valid"][0]
+        )
+    else:
+        qa = np.ones(len(table), dtype=np.int16)
+        qa[0] = 2
+        table["captured_flux_qa_pass"] = qa
+    table.write(artifact_path, format="ascii.ecsv", overwrite=True)
+    _rehash_product_artifact(
+        root,
+        product_name=product_name,
+        artifact_name="photometry.ecsv",
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="portable photometry ECSV",
+        ):
+            validator(path)
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
+        "metadata",
+        "column_order",
+        "row_order",
+        "row_count",
+        "cadence_axis",
+        "dtype",
+        "value",
+        "valid_nonbinary",
+    ],
+)
+def test_public_readback_binds_centroid_quality_to_authoritative_hdf5(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    tamper_mode: str,
+) -> None:
+    from astropy.table import Table
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "centroid-parity-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    artifact_path = product_root / "centroid_quality.ecsv"
+    table = Table.read(artifact_path, format="ascii.ecsv")
+    if tamper_mode == "metadata":
+        table.meta["unbound_extension"] = "accepted-without-validation"
+    elif tamper_mode == "column_order":
+        table = table[list(reversed(table.colnames))]
+    elif tamper_mode == "row_order":
+        order = np.arange(len(table))
+        order[:2] = order[1::-1]
+        table = table[order]
+    elif tamper_mode == "row_count":
+        table = table[:-1]
+    elif tamper_mode == "cadence_axis":
+        table["cadence_seconds"][0] += 1
+    elif tamper_mode == "dtype":
+        table["quality_bitmask"] = np.asarray(
+            table["quality_bitmask"],
+            dtype=np.float64,
+        )
+    elif tamper_mode == "value":
+        table["centroid_x_stamp_pixel_0based"][0] += 0.25
+    else:
+        validity = np.ones(len(table), dtype=np.int16)
+        validity[0] = 2
+        table["aperture_valid"] = validity
+    table.write(artifact_path, format="ascii.ecsv", overwrite=True)
+    _rehash_product_artifact(
+        root,
+        product_name=product_name,
+        artifact_name="centroid_quality.ecsv",
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="centroid-quality ECSV",
+        ):
+            validator(path)
+
+
 def test_validator_rejects_reference_curve_that_disagrees_with_authoritative_hdf5(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2719,6 +2890,56 @@ def test_validator_rejects_reference_curve_that_disagrees_with_authoritative_hdf
         ),
     ):
         backend.validate_stamp_science_analysis_v1(publication.output_dir)
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        "cadence_seconds",
+        "raw_frame_start_index",
+        "quality_bitmask",
+        "aperture_valid",
+        "captured_flux_qa_pass",
+    ],
+)
+def test_reference_lightcurve_rejects_coercible_bool_and_integer_dtypes(
+    tmp_path: Path,
+    _schema_version_publication_root: Path,
+    column: str,
+) -> None:
+    from astropy.table import Table
+    import et_mainsim.stamp_science_analysis as backend
+
+    root = tmp_path / "reference-dtype-products"
+    shutil.copytree(_schema_version_publication_root, root)
+    product_name = "science_optimal_aperture_v1"
+    product_root = root / product_name
+    artifact_path = product_root / "reference_lightcurve.ecsv"
+    table = Table.read(artifact_path, format="ascii.ecsv")
+    if column in {"aperture_valid", "captured_flux_qa_pass"}:
+        values = np.asarray(table[column], dtype=np.int16)
+        true_indices = np.flatnonzero(values == 1)
+        assert true_indices.size > 0
+        values[int(true_indices[0])] = 2
+        table[column] = values
+    else:
+        table[column] = np.asarray(table[column], dtype=np.float64)
+    table.write(artifact_path, format="ascii.ecsv", overwrite=True)
+    _rehash_product_artifact(
+        root,
+        product_name=product_name,
+        artifact_name="reference_lightcurve.ecsv",
+    )
+
+    for validator, path in (
+        (backend.validate_stamp_science_analysis_v1, product_root),
+        (backend.validate_stamp_science_analysis_product_set_v1, root),
+    ):
+        with pytest.raises(
+            backend.StampScienceAnalysisContractError,
+            match="reference-lightcurve ECSV column dtype differs",
+        ):
+            validator(path)
 
 
 def test_analysis_publication_readback_failure_is_atomic(

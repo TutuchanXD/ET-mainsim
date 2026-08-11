@@ -92,6 +92,81 @@ _REFERENCE_LIGHTCURVE_SCHEMA_ID = (
 _REFERENCE_LIGHTCURVE_SCHEMA_VERSION = 2
 _PHOTOMETRY_TABLE_SCHEMA_ID = "et_mainsim.stamp_science_photometry_table.v2"
 _PHOTOMETRY_TABLE_SCHEMA_VERSION = 2
+_PHOTOMETRY_TABLE_COLUMNS = (
+    "cadence_seconds",
+    "time_start_seconds",
+    "exposure_seconds",
+    "raw_frame_start_index",
+    "raw_frame_stop_index_exclusive",
+    "flux_expectation_bgsub_e",
+    "flux_local_bgsub_e",
+    "local_background_e_per_pixel",
+    "centroid_x",
+    "centroid_y",
+    "aperture_valid",
+    "local_background_valid",
+    "quality_bitmask",
+    "raw_factor_sum",
+    "fitted_flux_expectation_e",
+    "residual_expectation_e",
+    "residual_expectation_ppm",
+    "fitted_flux_local_e",
+    "residual_local_e",
+    "residual_local_ppm",
+    "background_expectation_aperture_e",
+    "captured_flux_fraction",
+    "captured_flux_denominator_e",
+    "captured_flux_qa_pass",
+    "flux_uncertainty_e",
+    "source_variance_e2",
+    "background_variance_e2",
+    "read_variance_e2",
+    "quantization_variance_e2",
+    "uncertainty_valid",
+    "flux_expectation_bgsub_e_per_s",
+    "flux_local_bgsub_e_per_s",
+    "fitted_flux_expectation_e_per_s",
+    "fitted_flux_local_e_per_s",
+    "model_flux_uncertainty_e",
+    "model_flux_uncertainty_e_per_s",
+)
+_PHOTOMETRY_TABLE_HDF_DATASETS = {
+    column: ("local_model_valid" if column == "local_background_valid" else column)
+    for column in _PHOTOMETRY_TABLE_COLUMNS
+    if column != "cadence_seconds"
+}
+_PHOTOMETRY_TABLE_BOOLEAN_COLUMNS = frozenset(
+    {
+        "aperture_valid",
+        "local_background_valid",
+        "captured_flux_qa_pass",
+        "uncertainty_valid",
+    }
+)
+_CENTROID_QUALITY_SCHEMA_ID = "et_mainsim.stamp_science_centroid_quality.v1"
+_CENTROID_QUALITY_COLUMNS = (
+    "cadence_seconds",
+    "time_start_seconds",
+    "exposure_seconds",
+    "centroid_x_stamp_pixel_0based",
+    "centroid_y_stamp_pixel_0based",
+    "aperture_valid",
+    "aperture_usable_pixel_count",
+    "aperture_invalid_pixel_count",
+    "saturated_pixel_count",
+    "cosmic_pixel_count",
+    "background_usable_pixel_count",
+    "quality_bitmask",
+)
+_CENTROID_QUALITY_HDF_DATASETS = {
+    column: {
+        "centroid_x_stamp_pixel_0based": "centroid_x",
+        "centroid_y_stamp_pixel_0based": "centroid_y",
+    }.get(column, column)
+    for column in _CENTROID_QUALITY_COLUMNS
+    if column != "cadence_seconds"
+}
+_CENTROID_QUALITY_BOOLEAN_COLUMNS = frozenset({"aperture_valid"})
 _CDPP_SCHEMA_ID = "et_mainsim.stamp_science_cdpp.v1"
 _CDPP_TABLE_SCHEMA_ID = "et_mainsim.stamp_science_cdpp_table.v1"
 _CDPP_ESTIMATOR = (
@@ -184,6 +259,22 @@ def _reference_lightcurve_contract_v1() -> dict[str, Any]:
             "residual_expectation_ppm",
         ],
         "required_columns": list(_REFERENCE_LIGHTCURVE_REQUIRED_COLUMNS),
+    }
+
+
+def _photometry_table_metadata_v2() -> dict[str, Any]:
+    return {
+        "schema_id": _PHOTOMETRY_TABLE_SCHEMA_ID,
+        "schema_version": _PHOTOMETRY_TABLE_SCHEMA_VERSION,
+        "observation_product": "final_dn",
+        "background_realization_used": False,
+    }
+
+
+def _centroid_quality_metadata_v1() -> dict[str, Any]:
+    return {
+        "schema_id": _CENTROID_QUALITY_SCHEMA_ID,
+        "centroid_coordinate_system": "zero_based_stamp_local_x_column_y_row",
     }
 
 
@@ -3114,12 +3205,7 @@ def _write_portable_ecsv_v1(
         )
         tables.append(table)
     combined = vstack(tables, metadata_conflicts="error")
-    combined.meta = {
-        "schema_id": _PHOTOMETRY_TABLE_SCHEMA_ID,
-        "schema_version": _PHOTOMETRY_TABLE_SCHEMA_VERSION,
-        "observation_product": "final_dn",
-        "background_realization_used": False,
-    }
+    combined.meta = _photometry_table_metadata_v2()
     combined.write(path, format="ascii.ecsv", overwrite=False)
     with path.open("rb") as stream:
         os.fsync(stream.fileno())
@@ -3244,10 +3330,7 @@ def _write_centroid_quality_ecsv_v1(
             )
         )
     combined = vstack(tables, metadata_conflicts="error")
-    combined.meta = {
-        "schema_id": "et_mainsim.stamp_science_centroid_quality.v1",
-        "centroid_coordinate_system": "zero_based_stamp_local_x_column_y_row",
-    }
+    combined.meta = _centroid_quality_metadata_v1()
     combined.write(path, format="ascii.ecsv", overwrite=False)
     _fsync_file(path)
 
@@ -3743,7 +3826,11 @@ def _validate_reference_lightcurve_ecsv_v1(
             "reference-lightcurve ECSV lacks required columns"
         )
 
-    table_cadence = np.asarray(table["cadence_seconds"], dtype=np.int64)
+    table_cadence = np.asarray(table["cadence_seconds"])
+    if table_cadence.dtype.kind != "i":
+        raise StampScienceAnalysisContractError(
+            "reference-lightcurve ECSV column dtype differs: cadence_seconds"
+        )
     total_expected_rows = 0
     with h5py.File(authoritative_hdf5_path, "r") as handle:
         cadence_groups = handle["cadences"]
@@ -3828,15 +3915,24 @@ def _validate_reference_lightcurve_ecsv_v1(
                 ),
             }
             for column, expected in integer_columns.items():
-                actual = np.asarray(table[column], dtype=expected.dtype)[selected]
+                actual_values = np.asarray(table[column])
+                if actual_values.dtype.kind != expected.dtype.kind:
+                    raise StampScienceAnalysisContractError(
+                        "reference-lightcurve ECSV column dtype differs: "
+                        f"{column}"
+                    )
+                actual = actual_values[selected]
                 if not np.array_equal(actual, expected):
                     raise StampScienceAnalysisContractError(
                         "reference-lightcurve ECSV column differs from HDF5: "
                         f"{column}"
                     )
-            aperture_valid = np.asarray(table["aperture_valid"], dtype=bool)[
-                selected
-            ]
+            aperture_valid_values = np.asarray(table["aperture_valid"])
+            if aperture_valid_values.dtype.kind != "b":
+                raise StampScienceAnalysisContractError(
+                    "reference-lightcurve ECSV column dtype differs: aperture_valid"
+                )
+            aperture_valid = aperture_valid_values[selected]
             if not np.array_equal(
                 aperture_valid,
                 np.asarray(group["aperture_valid"], dtype=bool),
@@ -3845,9 +3941,13 @@ def _validate_reference_lightcurve_ecsv_v1(
                     "reference-lightcurve ECSV column differs from HDF5: "
                     "aperture_valid"
                 )
-            captured_qa = np.asarray(
-                table["captured_flux_qa_pass"], dtype=bool
-            )[selected]
+            captured_qa_values = np.asarray(table["captured_flux_qa_pass"])
+            if captured_qa_values.dtype.kind != "b":
+                raise StampScienceAnalysisContractError(
+                    "reference-lightcurve ECSV column dtype differs: "
+                    "captured_flux_qa_pass"
+                )
+            captured_qa = captured_qa_values[selected]
             if not np.array_equal(
                 captured_qa,
                 np.asarray(group["captured_flux_qa_pass"], dtype=bool),
@@ -3862,44 +3962,136 @@ def _validate_reference_lightcurve_ecsv_v1(
         )
 
 
-def _validate_portable_photometry_ecsv_v2(path: Path) -> None:
-    """Reject pre-v2 table layouts even when a manifest re-hashes the file."""
+def _metadata_matches_exactly(
+    actual: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> bool:
+    return set(actual) == set(expected) and all(
+        type(actual[name]) is type(value) and actual[name] == value
+        for name, value in expected.items()
+    )
 
+
+def _validate_portable_cadence_table_parity_v1(
+    path: Path,
+    *,
+    authoritative_hdf5_path: Path,
+    label: str,
+    expected_metadata: Mapping[str, Any],
+    expected_columns: tuple[str, ...],
+    hdf_dataset_by_column: Mapping[str, str],
+    boolean_columns: frozenset[str],
+) -> None:
+    """Bind one portable cadence table exactly to authoritative HDF5 rows."""
+
+    import h5py
     from astropy.table import Table
 
     try:
         table = Table.read(path, format="ascii.ecsv")
     except (OSError, UnicodeError, TypeError, ValueError) as error:
-        raise StampScienceAnalysisContractError(
-            "portable photometry ECSV cannot be read"
-        ) from error
-    required = {
-        "cadence_seconds",
-        "time_start_seconds",
-        "exposure_seconds",
-        "flux_expectation_bgsub_e",
-        "background_expectation_aperture_e",
-        "captured_flux_fraction",
-        "captured_flux_denominator_e",
-        "captured_flux_qa_pass",
-        "aperture_valid",
-        "quality_bitmask",
+        raise StampScienceAnalysisContractError(f"{label} cannot be read") from error
+    if not _metadata_matches_exactly(table.meta, expected_metadata) or tuple(
+        table.colnames
+    ) != expected_columns:
+        raise StampScienceAnalysisContractError(f"{label} schema is invalid")
+
+    expected_parts: dict[str, list[NDArray[Any]]] = {
+        name: [] for name in expected_columns
     }
-    if (
-        table.meta.get("schema_id") != _PHOTOMETRY_TABLE_SCHEMA_ID
-        or not _is_native_schema_version(
-            table.meta.get("schema_version"),
-            _PHOTOMETRY_TABLE_SCHEMA_VERSION,
+    with h5py.File(authoritative_hdf5_path, "r") as handle:
+        cadence_groups = handle["cadences"]
+        cadence_names = sorted(
+            cadence_groups,
+            key=lambda item: int(item.removesuffix("s")),
         )
-        or not required.issubset(table.colnames)
-    ):
+        for cadence_name in cadence_names:
+            seconds = int(cadence_name.removesuffix("s"))
+            group = cadence_groups[cadence_name]
+            count = int(group["time_start_seconds"].shape[0])
+            expected_parts["cadence_seconds"].append(
+                np.full(count, seconds, dtype=np.int32)
+            )
+            for column, dataset_name in hdf_dataset_by_column.items():
+                if dataset_name not in group:
+                    raise StampScienceAnalysisContractError(
+                        f"{label} authoritative HDF5 dataset is missing: "
+                        f"{dataset_name}"
+                    )
+                expected = np.asarray(group[dataset_name])
+                if expected.ndim != 1 or expected.shape != (count,):
+                    raise StampScienceAnalysisContractError(
+                        f"{label} authoritative HDF5 cadence axis is invalid: "
+                        f"{dataset_name}"
+                    )
+                expected_parts[column].append(expected)
+
+    expected_values = {
+        name: np.concatenate(parts) if parts else np.asarray([], dtype=np.float64)
+        for name, parts in expected_parts.items()
+    }
+    expected_row_count = int(expected_values["cadence_seconds"].shape[0])
+    if expected_row_count <= 0 or len(table) != expected_row_count:
         raise StampScienceAnalysisContractError(
-            "portable photometry ECSV v2 schema is invalid"
+            f"{label} row count differs from authoritative HDF5"
         )
-    if not np.all(np.asarray(table["captured_flux_qa_pass"], dtype=bool)):
-        raise StampScienceAnalysisContractError(
-            "portable photometry ECSV captured_flux_qa_pass contains false"
-        )
+    for column in expected_columns:
+        table_column = table[column]
+        mask = getattr(table_column, "mask", None)
+        actual = np.asarray(table_column)
+        expected = expected_values[column]
+        if (
+            actual.ndim != 1
+            or actual.shape != expected.shape
+            or (mask is not None and np.any(mask))
+            or actual.dtype.kind != expected.dtype.kind
+            or (
+                column in boolean_columns
+                and (actual.dtype.kind != "b" or expected.dtype.kind != "b")
+            )
+        ):
+            raise StampScienceAnalysisContractError(
+                f"{label} column dtype/axis differs from authoritative HDF5: "
+                f"{column}"
+            )
+        if not np.array_equal(actual, expected, equal_nan=True):
+            raise StampScienceAnalysisContractError(
+                f"{label} column differs from authoritative HDF5: {column}"
+            )
+
+
+def _validate_portable_photometry_ecsv_v2(
+    path: Path,
+    *,
+    authoritative_hdf5_path: Path,
+) -> None:
+    """Bind the exact v2 portable table to all authoritative cadence rows."""
+
+    _validate_portable_cadence_table_parity_v1(
+        path,
+        authoritative_hdf5_path=authoritative_hdf5_path,
+        label="portable photometry ECSV v2",
+        expected_metadata=_photometry_table_metadata_v2(),
+        expected_columns=_PHOTOMETRY_TABLE_COLUMNS,
+        hdf_dataset_by_column=_PHOTOMETRY_TABLE_HDF_DATASETS,
+        boolean_columns=_PHOTOMETRY_TABLE_BOOLEAN_COLUMNS,
+    )
+
+
+def _validate_centroid_quality_ecsv_v1(
+    path: Path,
+    *,
+    authoritative_hdf5_path: Path,
+) -> None:
+    _validate_portable_cadence_table_parity_v1(
+        path,
+        authoritative_hdf5_path=authoritative_hdf5_path,
+        label="centroid-quality ECSV",
+        expected_metadata=_centroid_quality_metadata_v1(),
+        expected_columns=_CENTROID_QUALITY_COLUMNS,
+        hdf_dataset_by_column=_CENTROID_QUALITY_HDF_DATASETS,
+        boolean_columns=_CENTROID_QUALITY_BOOLEAN_COLUMNS,
+    )
 
 
 def _cdpp_table_rows_from_payload_v1(
@@ -4541,6 +4733,8 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
                 "model_flux_uncertainty_e",
                 "model_flux_uncertainty_e_per_s",
             }
+            required.update(_PHOTOMETRY_TABLE_HDF_DATASETS.values())
+            required.update(_CENTROID_QUALITY_HDF_DATASETS.values())
             if not required.issubset(group):
                 raise StampScienceAnalysisContractError(
                     f"authoritative HDF5 cadence {name} is incomplete"
@@ -4813,11 +5007,18 @@ def _validate_analysis_dir(path: Path) -> StampScienceAnalysisValidation:
     ):
         if (root / name).stat().st_size <= 0:
             raise StampScienceAnalysisContractError(f"portable ECSV is empty: {name}")
-    _validate_portable_photometry_ecsv_v2(root / "photometry.ecsv")
+    _validate_portable_photometry_ecsv_v2(
+        root / "photometry.ecsv",
+        authoritative_hdf5_path=hdf_path,
+    )
     _validate_reference_lightcurve_ecsv_v1(
         root / "reference_lightcurve.ecsv",
         authoritative_hdf5_path=hdf_path,
         contract=contract,
+    )
+    _validate_centroid_quality_ecsv_v1(
+        root / "centroid_quality.ecsv",
+        authoritative_hdf5_path=hdf_path,
     )
     for name in (
         "figures/lightcurve_overview.png",
