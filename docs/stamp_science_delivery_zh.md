@@ -7,7 +7,7 @@ PSF 截获比例及其 QA，使 `27×27` stamp 是否漏光可定量审计。它
 Photsim7 的物理渲染或随机数定义。当前 writer、reader 和流式分析都对
 schema ID/version 失败关闭；新的正式生产不得写或假冒 v1 bundle。
 
-实现位于 `et_mainsim.stamp_delivery`，依赖 `h5py>=3.10`。当前 writer/read
+实现位于 `et_mainsim.stamp_delivery`，依赖 `h5py>=3.15,<4`。当前 writer/read
 API 为：
 
 ```python
@@ -76,8 +76,9 @@ E_bgsub = E_cal - background_expectation_e
 realization。它是正式公共测光后端的默认本底，也是科学团队从交付包自行重做
 电子域图像与孔径测光时的标准输入。不得从 `final_dn` 中扣除任何
 background-realization image；那会把真实观测中应保留的泊松涨落错误删除。
-v2 bundle 不写出这种 realization 平面，且
-`provenance.background_realization_used` 必须为 `false`。
+v2 bundle 不写出这种 realization 平面；HDF5 根属性
+`background_realization_used` 与 `provenance.background_realization_used`
+必须同时为 `false`。
 
 `27×27` 交付不需要额外凑出 1024 个 stamp-local 背景像素。局部背景是
 `delivered_expectation_plus_local_diagnostic` 模式下的**可选诊断量**，不是默认减本底
