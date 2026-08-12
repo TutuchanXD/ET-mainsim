@@ -19,6 +19,12 @@ dependencies = [
   "torch>=2.7,<3",
 ]
 
+[project.optional-dependencies]
+test = [
+  "pandas>=2.2,<3",
+  "pytest==9.0.3",
+]
+
 [project.scripts]
 et-mainsim = "et_mainsim.cli:main"
 

@@ -1,0 +1,103 @@
+name: Full test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  full-test:
+    name: full-test / py${{ matrix.python-version }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    environment:
+      name: ${{ github.event_name == 'pull_request' && 'full-test-pr-review' || 'full-test-private-dependency' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - name: Check out ET-mainsim
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Check out frozen ET-coordinate
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: TutuchanXD/ET-coordinate
+          ref: f9cec8038b021c9540a026b94e876dc3240071d1
+          path: .ci-dependencies/ET-coordinate
+          persist-credentials: false
+      - name: Check out frozen Photsim7 release
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: TutuchanXD/Photsim7
+          ref: 250b6bcbd3a79e3bb775a2e0cdf584b3f552185c
+          path: .ci-dependencies/Photsim7
+          ssh-key: ${{ secrets.PHOTSIM7_READ_ONLY_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            .ci-dependencies/ET-coordinate/pyproject.toml
+            .ci-dependencies/Photsim7/pyproject.toml
+      - name: Install frozen CPU runtime and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.7,<3"
+          python -m pip install .ci-dependencies/ET-coordinate
+          python -m pip install .ci-dependencies/Photsim7
+          python -m pip install -e ".[test]"
+          python -m pip check
+      - name: Run complete hermetic test suite
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+          ET_DATA_DIR: ${{ runner.temp }}/et-mainsim-ci-missing-data
+          FULL_PYTEST_RECEIPT: ${{ runner.temp }}/full-pytest-receipt-py${{ matrix.python-version }}.json
+          MPLBACKEND: Agg
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTEST_ADDOPTS: ""
+        run: python -m ci.run_full_pytest
+      - name: Upload full-test receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: full-pytest-receipt-py${{ matrix.python-version }}
+          path: ${{ runner.temp }}/full-pytest-receipt-py${{ matrix.python-version }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  full-test-gate:
+    name: full-test-gate
+    needs: full-test
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out ET-mainsim
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Evaluate full-test result
+        env:
+          FULL_TEST_EVENT_NAME: ${{ github.event_name }}
+          FULL_TEST_RESULT: ${{ needs.full-test.result }}
+          FULL_TEST_SAME_REPOSITORY_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        run: python -m ci.run_full_test_gate
