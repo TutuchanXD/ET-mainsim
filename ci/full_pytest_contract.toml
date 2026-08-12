@@ -1,0 +1,55 @@
+schema_version = 1
+pytest_version = "9.0.3"
+python_versions = ["3.12", "3.13"]
+expected_collected = 916
+nodeid_sha256 = "2f96bed96a2984b42975159fdfd08f6305e1a951c97de8856b731214def31b36"
+allowed_skips = [
+  "tests/test_galaxy_delivery_notebooks.py::test_galaxy_delivery_notebook_is_a_read_only_raw_coverage_v2_consumer",
+  "tests/test_galaxy_delivery_notebooks.py::test_galaxy_campaign_summary_notebook_only_consumes_atomic_raw_coverage_summary",
+]
+test_files = [
+  "tests/test_aster_saturation_validation.py",
+  "tests/test_ci_workflow.py",
+  "tests/test_cli.py",
+  "tests/test_config.py",
+  "tests/test_coverage_aware_stamp_analysis.py",
+  "tests/test_evaluate_main_rd_benchmark.py",
+  "tests/test_export_last90_truth_tables.py",
+  "tests/test_full_frame_workflow.py",
+  "tests/test_galaxy_campaign_qc.py",
+  "tests/test_galaxy_delivery_notebooks.py",
+  "tests/test_galaxy_delivery_provenance_audit.py",
+  "tests/test_galaxy_lightcurves.py",
+  "tests/test_galaxy_pr_asset_readiness.py",
+  "tests/test_galaxy_stamp_production.py",
+  "tests/test_independent_stamp_production.py",
+  "tests/test_legacy_app_workflow.py",
+  "tests/test_manifest.py",
+  "tests/test_notebook_report_assets.py",
+  "tests/test_presets.py",
+  "tests/test_provenance.py",
+  "tests/test_raw_coverage_campaign_summary.py",
+  "tests/test_raw_coverage_policy.py",
+  "tests/test_reference_photometry.py",
+  "tests/test_science_production_cli.py",
+  "tests/test_science_stamp_production.py",
+  "tests/test_scope_artifacts.py",
+  "tests/test_selection_schemas.py",
+  "tests/test_shared_exposure_workflow.py",
+  "tests/test_slurm_template.py",
+  "tests/test_source_variability_validation.py",
+  "tests/test_staged_stamp_delivery.py",
+  "tests/test_stamp_delivery_bundle.py",
+  "tests/test_stamp_inputs.py",
+  "tests/test_stamp_science_analysis.py",
+  "tests/test_stamp_science_inputs.py",
+  "tests/test_stamp_science_photometry.py",
+  "tests/test_stamp_workflow.py",
+  "tests/test_standard_stamp_analysis.py",
+  "tests/test_thermal_benchmark.py",
+  "tests/test_time_shards.py",
+]
+
+[dependencies]
+et_coordinate_commit = "f9cec8038b021c9540a026b94e876dc3240071d1"
+photsim7_commit = "250b6bcbd3a79e3bb775a2e0cdf584b3f552185c"
