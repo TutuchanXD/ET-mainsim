@@ -11,7 +11,7 @@ requires-python = ">=3.12,<3.14"
 authors = [{name = "ET simulation maintainers"}]
 dependencies = [
   "astropy>=6",
-  "et-coord>=0.1.1,<0.2",
+  "et-coord>=0.1.2,<0.2",
   "h5py>=3.15,<4",
   "matplotlib>=3.10,<4",
   "numpy>=1.26",
@@ -23,6 +23,11 @@ dependencies = [
 test = [
   "pandas>=2.2,<3",
   "pytest==9.0.3",
+]
+release = [
+  "build==1.5.0",
+  "setuptools==80.9.0",
+  "wheel==0.45.1",
 ]
 
 [project.scripts]

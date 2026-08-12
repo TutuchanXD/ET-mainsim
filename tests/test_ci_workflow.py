@@ -124,6 +124,7 @@ def test_lightweight_job_bootstraps_the_ci_contract_verifier() -> None:
     block = _job_block(_workflow_text(_CI_WORKFLOW_PATH), "package-boundary")
 
     assert "python -m ci.verify_full_test_workflow" in block
+    assert "et-mainsim --version" in block
     assert (_ROOT / "ci" / "verify_full_test_workflow.py").is_file()
     assert (_ROOT / "ci" / "run_full_pytest.py").is_file()
 

@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
+from et_mainsim import __version__
 from et_mainsim.config import RunConfig
 from et_mainsim.presets import (
     canonical_preset_name,
@@ -19,6 +20,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="et-mainsim",
         description="ET-mainsim reference workflows powered by Photsim7.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

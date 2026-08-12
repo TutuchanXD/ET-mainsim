@@ -1,0 +1,44 @@
+name: Release artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-artifacts-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  build-release:
+    name: build-release
+    if: github.ref == 'refs/tags/v0.1.0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact release ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install frozen release tools
+        run: python -m pip install "build==1.5.0" "setuptools==80.9.0" "wheel==0.45.1"
+      - name: Build and validate exact tagged artifacts
+        run: python -m ci.build_release --output release-output --require-tag
+      - name: Upload validated release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: et-mainsim-v0.1.0-release
+          path: release-output/artifacts
+          if-no-files-found: error
+          retention-days: 30
