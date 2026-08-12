@@ -82,7 +82,7 @@ def test_photsim7_stamp_centering_matches_formal_nearest_integer_policy() -> Non
 def test_project_requires_semantic_registry_identity_release() -> None:
     payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "et-coord>=0.1.1,<0.2" in payload["project"]["dependencies"]
+    assert "et-coord>=0.1.2,<0.2" in payload["project"]["dependencies"]
 
 
 def test_project_declares_matplotlib_for_formal_analysis_figures() -> None:

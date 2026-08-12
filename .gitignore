@@ -5,6 +5,7 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+release-output/
 
 # Local generated simulation products and caches.
 outputs/

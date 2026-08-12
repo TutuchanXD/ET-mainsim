@@ -5,7 +5,6 @@ import sys
 import tomllib
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "ci.yml"
 FULL_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "full-test.yml"
@@ -206,6 +205,17 @@ def verify_workflow_text(
         "Check out frozen Photsim7 release",
     ):
         _require_checkout_credentials_disabled(full_steps[checkout_name], checkout_name)
+    editable_installs = [
+        line.strip()
+        for line in full_steps[
+            "Install frozen CPU runtime and test dependencies"
+        ].splitlines()
+        if line.strip().startswith("python -m pip install -e")
+    ]
+    _require(
+        editable_installs == ['python -m pip install -e ".[test,release]"'],
+        "full-test must install both the frozen test and release tool extras",
+    )
     versions = contract["python_versions"]
     matrix = ", ".join(f'"{version}"' for version in versions)
     _require(

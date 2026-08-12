@@ -46,5 +46,6 @@ jobs:
       - name: Verify lightweight boundary
         run: |
           python -c "import et_mainsim; assert et_mainsim.__version__ == '0.1.0'"
+          et-mainsim --version
           et-mainsim --help
           python -m compileall -q src

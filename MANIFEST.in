@@ -1,0 +1,14 @@
+include .gitignore
+include MANIFEST.in
+include README.md
+include pyproject.toml
+graft .github
+graft benchmarks
+graft ci
+graft docs
+graft scripts
+graft slurm
+graft src
+graft tests
+graft tools
+global-exclude __pycache__ *.py[cod]
