@@ -186,6 +186,36 @@ def test_stdlib_ci_contract_verifier_accepts_repository() -> None:
             "run: python -m ci.run_full_pytest",
             "run: python -m ci.run_full_pytest; exit 0",
         ),
+        (
+            "ci",
+            "      - name: Check out ET-mainsim\n"
+            "        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0\n"
+            "        with:\n"
+            "          persist-credentials: false",
+            "      - name: Check out ET-mainsim\n"
+            "        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0",
+        ),
+        (
+            "full",
+            "      - name: Check out ET-mainsim\n"
+            "        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0\n"
+            "        with:\n"
+            "          persist-credentials: false",
+            "      - name: Check out ET-mainsim\n"
+            "        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0",
+        ),
+        (
+            "full",
+            "          path: .ci-dependencies/ET-coordinate\n"
+            "          persist-credentials: false",
+            "          path: .ci-dependencies/ET-coordinate",
+        ),
+        (
+            "full",
+            "          ssh-key: ${{ secrets.PHOTSIM7_READ_ONLY_DEPLOY_KEY }}\n"
+            "          persist-credentials: false",
+            "          ssh-key: ${{ secrets.PHOTSIM7_READ_ONLY_DEPLOY_KEY }}",
+        ),
     ],
 )
 def test_stdlib_ci_contract_verifier_rejects_gate_bypasses(

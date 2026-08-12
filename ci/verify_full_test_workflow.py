@@ -74,6 +74,18 @@ def _require_step_contract(
     return blocks
 
 
+def _require_checkout_credentials_disabled(step: str, name: str) -> None:
+    settings = [
+        line.strip()
+        for line in step.splitlines()
+        if line.startswith("          persist-credentials:")
+    ]
+    _require(
+        settings == ["persist-credentials: false"],
+        f"checkout step {name!r} must disable credential persistence",
+    )
+
+
 def _verify_shared_workflow_controls(workflow: str) -> None:
     _require("permissions:\n  contents: read" in workflow, "contents must be read-only")
     _require("cancel-in-progress: true" in workflow, "stale CI runs must be cancelled")
@@ -136,6 +148,9 @@ def verify_workflow_text(
             "Verify lightweight boundary",
         ),
     )
+    _require_checkout_credentials_disabled(
+        package_steps["Check out ET-mainsim"], "package-boundary ET-mainsim"
+    )
     _require(
         [
             line.strip()
@@ -180,6 +195,12 @@ def verify_workflow_text(
             "Upload full-test receipt": "if: always()",
         },
     )
+    for checkout_name in (
+        "Check out ET-mainsim",
+        "Check out frozen ET-coordinate",
+        "Check out frozen Photsim7 release",
+    ):
+        _require_checkout_credentials_disabled(full_steps[checkout_name], checkout_name)
     versions = contract["python_versions"]
     matrix = ", ".join(f'"{version}"' for version in versions)
     _require(
