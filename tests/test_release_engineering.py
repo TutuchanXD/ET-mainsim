@@ -10,6 +10,7 @@ import sys
 import tarfile
 import tempfile
 import tomllib
+import urllib.parse
 import warnings
 import zipfile
 from pathlib import Path
@@ -30,6 +31,36 @@ from ci.build_release import (
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "ci" / "release_contract.toml"
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "release.yml"
+REQUIRED_WORKFLOW_JOBS = [
+    {
+        "name": "full-test-gate",
+        "workflow_path": ".github/workflows/full-test.yml",
+        "job_name": "full-test-gate",
+    },
+    {
+        "name": "package-boundary / py3.12",
+        "workflow_path": ".github/workflows/ci.yml",
+        "job_name": "package-boundary / py3.12",
+    },
+    {
+        "name": "package-boundary / py3.13",
+        "workflow_path": ".github/workflows/ci.yml",
+        "job_name": "package-boundary / py3.13",
+    },
+]
+WORKFLOW_IDS = {
+    ".github/workflows/full-test.yml": 101,
+    ".github/workflows/ci.yml": 102,
+}
+RUN_IDS = {
+    ".github/workflows/full-test.yml": 1001,
+    ".github/workflows/ci.yml": 1002,
+}
+JOB_IDS = {
+    "full-test-gate": 2001,
+    "package-boundary / py3.12": 2002,
+    "package-boundary / py3.13": 2003,
+}
 
 
 def _clean_release_source(tmp_path: Path) -> Path:
@@ -95,22 +126,149 @@ def _annotate_release_tag(source: Path) -> None:
 def _successful_approval(source: Path, contract: dict[str, object]) -> dict[str, object]:
     commit = _git_output(source, "rev-parse", "HEAD")
     return {
-        "schema_id": "et_mainsim.release_approval.v1",
+        "schema_id": "et_mainsim.release_approval.v2",
         "verified": True,
         "repository": contract["repository"],
         "commit": commit,
         "main_commit": _git_output(source, "rev-parse", "refs/remotes/origin/main"),
-        "checks": [
+        "workflow_jobs": [
             {
-                "name": name,
+                "name": requirement["name"],
+                "workflow_id": WORKFLOW_IDS[requirement["workflow_path"]],
+                "workflow_path": requirement["workflow_path"],
+                "run_id": RUN_IDS[requirement["workflow_path"]],
+                "run_attempt": 2,
+                "job_name": requirement["job_name"],
+                "job_id": JOB_IDS[requirement["job_name"]],
+                "job_url": (
+                    "https://github.com/TutuchanXD/ET-mainsim/actions/runs/"
+                    f"{RUN_IDS[requirement['workflow_path']]}/job/"
+                    f"{JOB_IDS[requirement['job_name']]}"
+                ),
+                "event": "push",
+                "head_branch": "main",
                 "conclusion": "success",
                 "head_sha": commit,
-                "run_id": index,
-                "url": f"https://github.example.invalid/checks/{index}",
+                "status": "completed",
             }
-            for index, name in enumerate(contract["required_checks"], start=1)
+            for requirement in REQUIRED_WORKFLOW_JOBS
         ],
     }
+
+
+class _SuccessfulActionsApi:
+    def __init__(self, commit: str, defect: str | None = None) -> None:
+        self.commit = commit
+        self.defect = defect
+        self.calls: list[str] = []
+        self.confirmations: dict[int, int] = {}
+
+    def __call__(self, url: str, token: str) -> dict[str, object]:
+        assert token == "test-token"
+        assert "/check-runs" not in url
+        self.calls.append(url)
+        parsed = urllib.parse.urlparse(url)
+        query = urllib.parse.parse_qs(parsed.query)
+        if query:
+            assert query["per_page"] == ["100"]
+            assert query["page"] == ["1"]
+
+        if parsed.path.endswith("/actions/workflows"):
+            workflows = [
+                {"id": workflow_id, "path": path, "state": "active"}
+                for path, workflow_id in reversed(WORKFLOW_IDS.items())
+            ]
+            if self.defect == "wrong-workflow":
+                workflows[0]["path"] = ".github/workflows/untrusted.yml"
+            return {"total_count": len(workflows), "workflows": workflows}
+
+        for workflow_path, workflow_id in WORKFLOW_IDS.items():
+            if parsed.path.endswith(f"/actions/workflows/{workflow_id}/runs"):
+                assert query["branch"] == ["main"]
+                assert query["event"] == ["push"]
+                assert "status" not in query
+                assert query["head_sha"] == [self.commit]
+                run = {
+                    "id": RUN_IDS[workflow_path],
+                    "workflow_id": workflow_id,
+                    "path": workflow_path,
+                    "run_attempt": 2,
+                    "event": "push",
+                    "head_branch": "main",
+                    "head_sha": self.commit,
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+                if self.defect == "wrong-event" and workflow_id == 101:
+                    run["event"] = "pull_request"
+                elif self.defect == "wrong-branch" and workflow_id == 101:
+                    run["head_branch"] = "feature"
+                elif self.defect == "wrong-sha" and workflow_id == 101:
+                    run["head_sha"] = "f" * 40
+                elif self.defect == "wrong-run-path" and workflow_id == 101:
+                    run["path"] = ".github/workflows/untrusted.yml@main"
+                runs = [run]
+                if self.defect == "ambiguous-run" and workflow_id == 101:
+                    duplicate = {**run, "id": run["id"] + 100}
+                    runs.append(duplicate)
+                return {"total_count": len(runs), "workflow_runs": runs}
+
+        for workflow_path, run_id in RUN_IDS.items():
+            if parsed.path.endswith(f"/actions/runs/{run_id}"):
+                self.confirmations[run_id] = self.confirmations.get(run_id, 0) + 1
+                run_attempt = 2
+                if self.defect == "concurrent-rerun" and run_id == 1001:
+                    run_attempt = 3
+                return {
+                    "id": run_id,
+                    "workflow_id": WORKFLOW_IDS[workflow_path],
+                    "path": workflow_path,
+                    "run_attempt": run_attempt,
+                    "event": "push",
+                    "head_branch": "main",
+                    "head_sha": self.commit,
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+
+        for workflow_path, run_id in RUN_IDS.items():
+            attempt_path = f"/actions/runs/{run_id}/attempts/2/jobs"
+            if parsed.path.endswith(attempt_path):
+                requirements = [
+                    requirement
+                    for requirement in REQUIRED_WORKFLOW_JOBS
+                    if requirement["workflow_path"] == workflow_path
+                ]
+                jobs = [
+                    {
+                        "id": JOB_IDS[requirement["job_name"]],
+                        "run_id": run_id,
+                        "name": requirement["job_name"],
+                        "head_sha": self.commit,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "html_url": (
+                            "https://github.com/TutuchanXD/ET-mainsim/actions/runs/"
+                            f"{run_id}/job/{JOB_IDS[requirement['job_name']]}"
+                        ),
+                    }
+                    for requirement in reversed(requirements)
+                ]
+                if self.defect == "wrong-job" and workflow_path.endswith("full-test.yml"):
+                    jobs[0]["name"] = "spoofed full-test-gate"
+                elif (
+                    self.defect == "failed-job"
+                    and workflow_path.endswith("full-test.yml")
+                ):
+                    jobs[0]["conclusion"] = "failure"
+                elif (
+                    self.defect == "ambiguous-job"
+                    and workflow_path.endswith("full-test.yml")
+                ):
+                    jobs.append({**jobs[0], "id": jobs[0]["id"] + 100})
+                return {"total_count": len(jobs), "jobs": jobs}
+
+        raise AssertionError(f"unexpected GitHub Actions API URL: {url}")
 
 
 def test_release_contract_matches_package_and_cli_version() -> None:
@@ -352,7 +510,21 @@ def test_release_tag_gate_rejects_commit_not_reachable_from_origin_main(
 
 
 @pytest.mark.parametrize(
-    "defect", ["missing", "failed", "wrong-commit", "wrong-check-sha"]
+    "defect",
+    [
+        "missing",
+        "wrong-repository",
+        "wrong-commit",
+        "wrong-main",
+        "wrong-workflow-id",
+        "wrong-workflow",
+        "wrong-event",
+        "wrong-branch",
+        "wrong-sha",
+        "wrong-job",
+        "failed",
+        "wrong-type",
+    ],
 )
 def test_release_approval_rejects_incomplete_or_mismatched_evidence(
     tmp_path: Path,
@@ -364,13 +536,31 @@ def test_release_approval_rejects_incomplete_or_mismatched_evidence(
     provenance = _git_provenance(source, contract["tag"], require_tag=True)
     evidence = _successful_approval(source, contract)
     if defect == "missing":
-        evidence["checks"] = evidence["checks"][:-1]
-    elif defect == "failed":
-        evidence["checks"][0]["conclusion"] = "failure"
+        evidence["workflow_jobs"] = evidence["workflow_jobs"][:-1]
+    elif defect == "wrong-repository":
+        evidence["repository"] = "untrusted/example"
     elif defect == "wrong-commit":
         evidence["commit"] = "0" * 40
+    elif defect == "wrong-main":
+        evidence["main_commit"] = "1" * 40
+    elif defect == "wrong-workflow-id":
+        evidence["workflow_jobs"][1]["workflow_id"] = 999
+    elif defect == "wrong-workflow":
+        evidence["workflow_jobs"][0]["workflow_path"] = (
+            ".github/workflows/untrusted.yml"
+        )
+    elif defect == "wrong-event":
+        evidence["workflow_jobs"][0]["event"] = "pull_request"
+    elif defect == "wrong-branch":
+        evidence["workflow_jobs"][0]["head_branch"] = "feature"
+    elif defect == "wrong-sha":
+        evidence["workflow_jobs"][0]["head_sha"] = "f" * 40
+    elif defect == "wrong-job":
+        evidence["workflow_jobs"][0]["job_name"] = "spoofed full-test-gate"
+    elif defect == "failed":
+        evidence["workflow_jobs"][0]["conclusion"] = "failure"
     else:
-        evidence["checks"][0]["head_sha"] = "f" * 40
+        evidence["workflow_jobs"][0]["run_id"] = True
 
     with pytest.raises(ReleaseContractError):
         release_builder._validate_approval_evidence(
@@ -394,42 +584,127 @@ def test_release_approval_accepts_complete_success_evidence(tmp_path: Path) -> N
     ) == evidence
 
 
-def test_github_check_collection_is_normalized_and_exact_sha(
+def test_github_actions_collection_is_normalized_deterministic_and_rerun_exact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = _clean_release_source(tmp_path)
     contract = load_release_contract(source / "ci" / "release_contract.toml")
     commit = _git_output(source, "rev-parse", "HEAD")
-    required = contract["required_checks"]
-
-    def fake_api(url: str, token: str) -> dict[str, object]:
-        assert f"/commits/{commit}/check-runs" in url
-        assert token == "test-token"
-        return {
-            "check_runs": [
-                {
-                    "id": index,
-                    "name": name,
-                    "head_sha": commit,
-                    "status": "completed",
-                    "conclusion": "success",
-                    "html_url": f"https://github.example.invalid/checks/{index}",
-                }
-                for index, name in reversed(list(enumerate(required, start=1)))
-            ]
-        }
-
+    fake_api = _SuccessfulActionsApi(commit)
     monkeypatch.setattr(release_builder, "_github_api_json", fake_api)
     evidence = release_builder.collect_github_approval_evidence(
         repository=contract["repository"],
         commit=commit,
         main_commit=_git_output(source, "rev-parse", "refs/remotes/origin/main"),
-        required_checks=required,
+        required_checks=contract["required_checks"],
         token="test-token",
     )
 
     assert evidence == _successful_approval(source, contract)
+    assert all("/check-runs" not in url for url in fake_api.calls)
+    assert any("/actions/runs/1001/attempts/2/jobs" in url for url in fake_api.calls)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "wrong-workflow",
+        "wrong-run-path",
+        "wrong-event",
+        "wrong-branch",
+        "wrong-sha",
+        "wrong-job",
+        "failed-job",
+        "ambiguous-run",
+        "ambiguous-job",
+        "concurrent-rerun",
+    ],
+)
+def test_github_actions_collection_rejects_wrong_or_ambiguous_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    defect: str,
+) -> None:
+    source = _clean_release_source(tmp_path)
+    contract = load_release_contract(source / "ci" / "release_contract.toml")
+    commit = _git_output(source, "rev-parse", "HEAD")
+    monkeypatch.setattr(
+        release_builder,
+        "_github_api_json",
+        _SuccessfulActionsApi(commit, defect),
+    )
+
+    with pytest.raises(ReleaseContractError):
+        release_builder.collect_github_approval_evidence(
+            repository=contract["repository"],
+            commit=commit,
+            main_commit=_git_output(source, "rev-parse", "refs/remotes/origin/main"),
+            required_checks=contract["required_checks"],
+            token="test-token",
+        )
+
+
+def test_github_actions_collection_rejects_check_run_only_spoof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _clean_release_source(tmp_path)
+    contract = load_release_contract(source / "ci" / "release_contract.toml")
+    commit = _git_output(source, "rev-parse", "HEAD")
+    calls: list[str] = []
+
+    def spoof_api(url: str, token: str) -> dict[str, object]:
+        calls.append(url)
+        return {
+            "total_count": 0,
+            "workflows": [],
+            "check_runs": [
+                {
+                    "name": "full-test-gate",
+                    "head_sha": commit,
+                    "conclusion": "success",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(release_builder, "_github_api_json", spoof_api)
+    with pytest.raises(ReleaseContractError, match="workflow"):
+        release_builder.collect_github_approval_evidence(
+            repository=contract["repository"],
+            commit=commit,
+            main_commit=_git_output(source, "rev-parse", "refs/remotes/origin/main"),
+            required_checks=contract["required_checks"],
+            token="test-token",
+        )
+    assert calls
+    assert all("/check-runs" not in url for url in calls)
+
+
+@pytest.mark.parametrize("defect", ["missing-total", "early-empty", "overrun"])
+def test_github_actions_pagination_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    defect: str,
+) -> None:
+    def fake_api(url: str, token: str) -> dict[str, object]:
+        page = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["page"]
+        if defect == "missing-total":
+            return {"workflows": []}
+        if page == ["1"]:
+            count = 100 if defect != "overrun" else 2
+            return {
+                "total_count": 101 if defect != "overrun" else 1,
+                "workflows": [{"id": index} for index in range(count)],
+            }
+        return {"total_count": 101, "workflows": []}
+
+    monkeypatch.setattr(release_builder, "_github_api_json", fake_api)
+    with pytest.raises(ReleaseContractError, match="pagination"):
+        release_builder._github_paginated_items(
+            "https://api.github.com/repos/example/repo/actions/workflows",
+            token="test-token",
+            item_key="workflows",
+        )
 
 
 def test_canonical_sdist_ignores_input_gzip_compressor_bytes(tmp_path: Path) -> None:
@@ -520,12 +795,12 @@ def test_release_builder_produces_reproducible_validated_artifacts(
     assert receipt["validation"]["unexpected_wheel_members"] == []
     assert receipt["validation"]["unexpected_sdist_members"] == []
     assert receipt["approval"] == {
-        "schema_id": "et_mainsim.release_approval.v1",
+        "schema_id": "et_mainsim.release_approval.v2",
         "verified": False,
         "repository": "TutuchanXD/ET-mainsim",
         "commit": receipt["source"]["git_commit"],
         "main_commit": None,
-        "checks": [],
+        "workflow_jobs": [],
     }
     assert "required_checks" not in receipt
     assert receipt["archive_codec"] == release_builder.ARCHIVE_CODEC_CONTRACT
@@ -611,23 +886,11 @@ def test_tagged_builder_requires_and_binds_verified_approval(
             approval_evidence=evidence,
         )
 
-    def fake_api(url: str, token: str) -> dict[str, object]:
-        assert token == "test-token"
-        return {
-            "check_runs": [
-                {
-                    "id": check["run_id"],
-                    "name": check["name"],
-                    "head_sha": check["head_sha"],
-                    "status": "completed",
-                    "conclusion": check["conclusion"],
-                    "html_url": check["url"],
-                }
-                for check in evidence["checks"]
-            ]
-        }
-
-    monkeypatch.setattr(release_builder, "_github_api_json", fake_api)
+    monkeypatch.setattr(
+        release_builder,
+        "_github_api_json",
+        _SuccessfulActionsApi(_git_output(source, "rev-parse", "HEAD")),
+    )
 
     receipt = build_release(
         source,
@@ -939,7 +1202,8 @@ def test_release_workflow_is_manual_build_only_and_immutable() -> None:
     assert "push:" not in workflow
     assert "pull_request_target:" not in workflow
     assert "permissions:\n  contents: read" in workflow
-    assert "  checks: read" in workflow
+    assert "  actions: read" in workflow
+    assert "checks: read" not in workflow
     assert 'python-version: "3.12.13"' in workflow
     assert "main:refs/remotes/origin/main" in workflow
     assert "--collect-approval-evidence" in workflow
@@ -973,11 +1237,7 @@ def test_release_workflow_is_manual_build_only_and_immutable() -> None:
 def test_release_contract_freezes_manual_release_policy() -> None:
     contract = load_release_contract(CONTRACT_PATH)
 
-    assert contract["required_checks"] == [
-        "full-test-gate",
-        "package-boundary / py3.12",
-        "package-boundary / py3.13",
-    ]
+    assert contract["required_checks"] == REQUIRED_WORKFLOW_JOBS
     assert contract["release_policy"] == [
         "annotated_tag",
         "github_release",

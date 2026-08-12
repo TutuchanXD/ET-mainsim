@@ -18,6 +18,7 @@ import tempfile
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 import venv
 import zipfile
@@ -93,6 +94,43 @@ def load_release_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
         contract["tag"] == f"v{contract['version']}",
         "release tag must be the version prefixed with v",
     )
+    required_checks = contract["required_checks"]
+    _require(
+        isinstance(required_checks, list) and bool(required_checks),
+        "release contract required_checks must be a non-empty list",
+    )
+    check_names: set[str] = set()
+    check_targets: set[tuple[str, str]] = set()
+    for check in required_checks:
+        _require(
+            isinstance(check, dict)
+            and set(check) == {"name", "workflow_path", "job_name"},
+            "release required-check mapping fields are not canonical",
+        )
+        _require(
+            all(isinstance(check[key], str) and bool(check[key]) for key in check),
+            "release required-check mapping values must be non-empty strings",
+        )
+        _require(
+            bool(
+                re.fullmatch(
+                    r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml",
+                    check["workflow_path"],
+                )
+            ),
+            "release required check has an invalid workflow path",
+        )
+        _require(
+            check["name"] not in check_names,
+            "release required check names must be unique",
+        )
+        target = (check["workflow_path"], check["job_name"])
+        _require(
+            target not in check_targets,
+            "release required workflow-job targets must be unique",
+        )
+        check_names.add(check["name"])
+        check_targets.add(target)
     contract["wheel_files"] = contract["files"]["wheel"]
     contract["sdist_files"] = contract["files"]["sdist"]
     return contract
@@ -215,12 +253,78 @@ def _github_api_json(url: str, token: str) -> dict[str, Any]:
     return payload
 
 
+def _positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _github_paginated_items(
+    url: str,
+    *,
+    token: str,
+    item_key: str,
+) -> list[dict[str, Any]]:
+    _require(bool(token), "GITHUB_TOKEN is required to read GitHub Actions")
+    items: list[dict[str, Any]] = []
+    expected_total: int | None = None
+    observed_ids: set[int] = set()
+    page = 1
+    while True:
+        separator = "&" if "?" in url else "?"
+        payload = _github_api_json(
+            f"{url}{separator}per_page=100&page={page}",
+            token,
+        )
+        total = payload.get("total_count")
+        page_items = payload.get(item_key)
+        _require(
+            isinstance(total, int) and not isinstance(total, bool) and total >= 0,
+            f"GitHub {item_key} pagination lacks a valid total_count",
+        )
+        _require(
+            isinstance(page_items, list) and len(page_items) <= 100,
+            f"GitHub {item_key} pagination returned an invalid page",
+        )
+        if expected_total is None:
+            expected_total = total
+        _require(
+            total == expected_total,
+            f"GitHub {item_key} pagination total_count changed",
+        )
+        _require(
+            len(items) + len(page_items) <= expected_total,
+            f"GitHub {item_key} pagination exceeded total_count",
+        )
+        for item in page_items:
+            _require(
+                isinstance(item, dict) and _positive_int(item.get("id")),
+                f"GitHub {item_key} pagination returned an invalid item",
+            )
+            item_id = item["id"]
+            _require(
+                item_id not in observed_ids,
+                f"GitHub {item_key} pagination returned a duplicate id",
+            )
+            observed_ids.add(item_id)
+            items.append(item)
+        if len(items) == expected_total:
+            return items
+        _require(
+            expected_total < 1000,
+            f"GitHub {item_key} pagination reached the filtered search cap",
+        )
+        _require(
+            len(page_items) == 100,
+            f"GitHub {item_key} pagination ended before total_count",
+        )
+        page += 1
+
+
 def collect_github_approval_evidence(
     *,
     repository: str,
     commit: str,
     main_commit: str,
-    required_checks: list[str],
+    required_checks: list[dict[str, str]],
     token: str,
 ) -> dict[str, Any]:
     _require(
@@ -231,54 +335,145 @@ def collect_github_approval_evidence(
         bool(re.fullmatch(r"[0-9a-f]{40}", main_commit)),
         "release main commit must be a full lowercase Git SHA",
     )
-    observed: dict[str, dict[str, Any]] = {}
-    page = 1
-    while True:
-        url = (
-            f"https://api.github.com/repos/{repository}/commits/{commit}/check-runs"
-            f"?filter=latest&per_page=100&page={page}"
+    _require(
+        bool(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)),
+        "release repository is not canonical",
+    )
+    api_root = f"https://api.github.com/repos/{repository}"
+    workflows = _github_paginated_items(
+        f"{api_root}/actions/workflows",
+        token=token,
+        item_key="workflows",
+    )
+    workflow_paths = list(dict.fromkeys(check["workflow_path"] for check in required_checks))
+    workflow_runs: dict[str, dict[str, Any]] = {}
+    workflow_jobs: dict[str, list[dict[str, Any]]] = {}
+    workflow_ids: dict[str, int] = {}
+    for workflow_path in workflow_paths:
+        matching_workflows = [
+            workflow for workflow in workflows if workflow.get("path") == workflow_path
+        ]
+        _require(
+            len(matching_workflows) == 1,
+            f"required workflow path is missing or ambiguous: {workflow_path}",
         )
-        payload = _github_api_json(url, token)
-        check_runs = payload.get("check_runs")
-        _require(isinstance(check_runs, list), "GitHub response lacks check_runs")
-        for run in check_runs:
-            _require(isinstance(run, dict), "GitHub check run must be an object")
-            name = run.get("name")
-            if name not in required_checks:
-                continue
-            _require(name not in observed, f"duplicate required check run: {name}")
-            _require(run.get("head_sha") == commit, f"wrong SHA for check: {name}")
-            _require(run.get("status") == "completed", f"check is incomplete: {name}")
-            _require(run.get("conclusion") == "success", f"check failed: {name}")
-            run_id = run.get("id")
-            url_value = run.get("html_url")
-            _require(
-                isinstance(run_id, int) and not isinstance(run_id, bool) and run_id > 0,
-                f"check lacks a valid run id: {name}",
-            )
-            _require(
-                isinstance(url_value, str) and url_value.startswith("https://"),
-                f"check lacks a valid URL: {name}",
-            )
-            observed[name] = {
-                "name": name,
-                "conclusion": "success",
+        workflow = matching_workflows[0]
+        _require(
+            _positive_int(workflow.get("id")) and workflow.get("state") == "active",
+            f"required workflow is not active: {workflow_path}",
+        )
+        workflow_id = workflow["id"]
+        workflow_ids[workflow_path] = workflow_id
+        query = urllib.parse.urlencode(
+            {
+                "branch": "main",
+                "event": "push",
                 "head_sha": commit,
-                "run_id": run_id,
-                "url": url_value,
+                "exclude_pull_requests": "true",
             }
-        if len(check_runs) < 100:
-            break
-        page += 1
-    missing = [name for name in required_checks if name not in observed]
-    _require(not missing, f"required checks are missing: {missing}")
+        )
+        runs = _github_paginated_items(
+            f"{api_root}/actions/workflows/{workflow_id}/runs?{query}",
+            token=token,
+            item_key="workflow_runs",
+        )
+        for run in runs:
+            _require(
+                run.get("workflow_id") == workflow_id
+                and run.get("path") == workflow_path
+                and run.get("event") == "push"
+                and run.get("head_branch") == "main"
+                and run.get("head_sha") == commit
+                and run.get("status") == "completed"
+                and run.get("conclusion") == "success"
+                and _positive_int(run.get("run_attempt")),
+                f"workflow run provenance is invalid: {workflow_path}",
+            )
+        _require(
+            len(runs) == 1,
+            f"required workflow run is missing or ambiguous: {workflow_path}",
+        )
+        run = runs[0]
+        workflow_runs[workflow_path] = run
+        workflow_jobs[workflow_path] = _github_paginated_items(
+            (
+                f"{api_root}/actions/runs/{run['id']}/attempts/"
+                f"{run['run_attempt']}/jobs"
+            ),
+            token=token,
+            item_key="jobs",
+        )
+        confirmed_run = _github_api_json(
+            f"{api_root}/actions/runs/{run['id']}",
+            token,
+        )
+        _require(
+            all(
+                confirmed_run.get(key) == run.get(key)
+                for key in (
+                    "id",
+                    "workflow_id",
+                    "path",
+                    "run_attempt",
+                    "event",
+                    "head_branch",
+                    "head_sha",
+                    "status",
+                    "conclusion",
+                )
+            ),
+            f"workflow run changed while collecting evidence: {workflow_path}",
+        )
+
+    normalized_jobs = []
+    for requirement in required_checks:
+        workflow_path = requirement["workflow_path"]
+        run = workflow_runs[workflow_path]
+        matches = [
+            job
+            for job in workflow_jobs[workflow_path]
+            if job.get("name") == requirement["job_name"]
+        ]
+        _require(
+            len(matches) == 1,
+            f"required workflow job is missing or ambiguous: {requirement['job_name']}",
+        )
+        job = matches[0]
+        expected_job_url = (
+            f"https://github.com/{repository}/actions/runs/{run['id']}/job/{job['id']}"
+        )
+        _require(
+            job.get("run_id") == run["id"]
+            and job.get("head_sha") == commit
+            and job.get("status") == "completed"
+            and job.get("conclusion") == "success"
+            and job.get("html_url") == expected_job_url,
+            f"workflow job provenance is invalid: {requirement['job_name']}",
+        )
+        normalized_jobs.append(
+            {
+                "name": requirement["name"],
+                "workflow_id": workflow_ids[workflow_path],
+                "workflow_path": workflow_path,
+                "run_id": run["id"],
+                "run_attempt": run["run_attempt"],
+                "job_name": requirement["job_name"],
+                "job_id": job["id"],
+                "job_url": job["html_url"],
+                "event": "push",
+                "head_branch": "main",
+                "head_sha": commit,
+                "status": "completed",
+                "conclusion": "success",
+            }
+        )
     return {
-        "schema_id": "et_mainsim.release_approval.v1",
+        "schema_id": "et_mainsim.release_approval.v2",
         "verified": True,
         "repository": repository,
         "commit": commit,
         "main_commit": main_commit,
-        "checks": [observed[name] for name in required_checks],
+        "workflow_jobs": normalized_jobs,
     }
 
 
@@ -294,11 +489,11 @@ def _validate_approval_evidence(
         "repository",
         "commit",
         "main_commit",
-        "checks",
+        "workflow_jobs",
     }
     _require(set(evidence) == expected_keys, "approval evidence fields are not canonical")
     _require(
-        evidence["schema_id"] == "et_mainsim.release_approval.v1",
+        evidence["schema_id"] == "et_mainsim.release_approval.v2",
         "unsupported release approval evidence schema",
     )
     _require(evidence["verified"] is True, "release approval is not verified")
@@ -315,33 +510,74 @@ def _validate_approval_evidence(
         and evidence["main_commit"] == source["main_commit"],
         "release approval main baseline differs from origin/main",
     )
-    checks = evidence["checks"]
-    _require(isinstance(checks, list), "release approval checks must be a list")
+    workflow_jobs = evidence["workflow_jobs"]
     _require(
-        [check.get("name") for check in checks if isinstance(check, dict)]
-        == contract["required_checks"],
-        "release approval does not contain the exact required checks",
+        isinstance(workflow_jobs, list)
+        and len(workflow_jobs) == len(contract["required_checks"]),
+        "release approval does not contain the exact workflow jobs",
     )
-    check_keys = {"name", "conclusion", "head_sha", "run_id", "url"}
-    for check in checks:
+    job_keys = {
+        "name",
+        "workflow_id",
+        "workflow_path",
+        "run_id",
+        "run_attempt",
+        "job_name",
+        "job_id",
+        "job_url",
+        "event",
+        "head_branch",
+        "head_sha",
+        "status",
+        "conclusion",
+    }
+    workflow_identity: dict[str, tuple[int, int, int]] = {}
+    for job, required in zip(
+        workflow_jobs,
+        contract["required_checks"],
+        strict=True,
+    ):
         _require(
-            isinstance(check, dict) and set(check) == check_keys,
-            "release approval check fields are not canonical",
+            isinstance(job, dict) and set(job) == job_keys,
+            "release approval workflow-job fields are not canonical",
         )
-        _require(check["conclusion"] == "success", f"check failed: {check['name']}")
         _require(
-            check["head_sha"] == source["git_commit"],
-            f"wrong SHA for check: {check['name']}",
+            job["name"] == required["name"]
+            and job["workflow_path"] == required["workflow_path"]
+            and job["job_name"] == required["job_name"],
+            "release approval workflow-job mapping differs from the contract",
         )
         _require(
-            isinstance(check["run_id"], int)
-            and not isinstance(check["run_id"], bool)
-            and check["run_id"] > 0,
-            f"check lacks a valid run id: {check['name']}",
+            all(
+                _positive_int(job[key])
+                for key in ("workflow_id", "run_id", "run_attempt", "job_id")
+            ),
+            f"workflow job lacks a valid numeric identity: {job['name']}",
+        )
+        identity = (job["workflow_id"], job["run_id"], job["run_attempt"])
+        previous_identity = workflow_identity.setdefault(
+            job["workflow_path"],
+            identity,
         )
         _require(
-            isinstance(check["url"], str) and check["url"].startswith("https://"),
-            f"check lacks a valid URL: {check['name']}",
+            identity == previous_identity,
+            f"workflow jobs do not share one run attempt: {job['workflow_path']}",
+        )
+        _require(
+            job["event"] == "push"
+            and job["head_branch"] == "main"
+            and job["head_sha"] == source["git_commit"]
+            and job["status"] == "completed"
+            and job["conclusion"] == "success",
+            f"workflow job is not an exact successful main push: {job['name']}",
+        )
+        _require(
+            job["job_url"]
+            == (
+                f"https://github.com/{contract['repository']}/actions/runs/"
+                f"{job['run_id']}/job/{job['job_id']}"
+            ),
+            f"workflow job URL is not canonical: {job['name']}",
         )
     return json.loads(json.dumps(evidence))
 
@@ -735,12 +971,12 @@ def build_release(
             "verified approval evidence is required for a tagged release",
         )
         approval = {
-            "schema_id": "et_mainsim.release_approval.v1",
+            "schema_id": "et_mainsim.release_approval.v2",
             "verified": False,
             "repository": contract["repository"],
             "commit": source["git_commit"],
             "main_commit": None,
-            "checks": [],
+            "workflow_jobs": [],
         }
     else:
         _require(require_tag, "approval evidence is valid only for a tagged release")

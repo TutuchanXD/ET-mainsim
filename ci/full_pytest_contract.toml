@@ -1,8 +1,8 @@
 schema_version = 1
 pytest_version = "9.0.3"
 python_versions = ["3.12", "3.13"]
-expected_collected = 970
-nodeid_sha256 = "b22b8a32968722dac0681d4598391dcaa7fee2f551e56968a56d39e0e2d2c821"
+expected_collected = 992
+nodeid_sha256 = "623760b67f0dda5df4d7d50e6d28e3c901bcceba9928a7363979ba5239b7cf95"
 allowed_skips = [
   "tests/test_galaxy_delivery_notebooks.py::test_galaxy_delivery_notebook_is_a_read_only_raw_coverage_v2_consumer",
   "tests/test_galaxy_delivery_notebooks.py::test_galaxy_campaign_summary_notebook_only_consumes_atomic_raw_coverage_summary",

@@ -2,17 +2,27 @@ schema_version = 1
 version = "0.1.0"
 tag = "v0.1.0"
 repository = "TutuchanXD/ET-mainsim"
-required_checks = [
-  "full-test-gate",
-  "package-boundary / py3.12",
-  "package-boundary / py3.13",
-]
 release_policy = [
   "annotated_tag",
   "github_release",
   "no_pypi",
   "no_scientific_simulation",
 ]
+
+[[required_checks]]
+name = "full-test-gate"
+workflow_path = ".github/workflows/full-test.yml"
+job_name = "full-test-gate"
+
+[[required_checks]]
+name = "package-boundary / py3.12"
+workflow_path = ".github/workflows/ci.yml"
+job_name = "package-boundary / py3.12"
+
+[[required_checks]]
+name = "package-boundary / py3.13"
+workflow_path = ".github/workflows/ci.yml"
+job_name = "package-boundary / py3.13"
 
 [runtime_dependencies.et_coordinate]
 distribution = "et-coord"
