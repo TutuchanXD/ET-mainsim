@@ -83,3 +83,21 @@ jobs:
           path: ${{ runner.temp }}/full-pytest-receipt-py${{ matrix.python-version }}.json
           if-no-files-found: error
           retention-days: 14
+
+  full-test-gate:
+    name: full-test-gate
+    needs: full-test
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out ET-mainsim
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Evaluate full-test result
+        env:
+          FULL_TEST_EVENT_NAME: ${{ github.event_name }}
+          FULL_TEST_RESULT: ${{ needs.full-test.result }}
+          FULL_TEST_SAME_REPOSITORY_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        run: python -m ci.run_full_test_gate

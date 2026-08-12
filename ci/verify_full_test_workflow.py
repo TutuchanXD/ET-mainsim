@@ -38,6 +38,11 @@ def _job_block(workflow: str, name: str) -> str:
 
 def _step_blocks(job: str) -> list[tuple[str, str]]:
     lines = job.splitlines()
+    step_lines = [line for line in lines if line.startswith("      - ")]
+    _require(
+        all(re.fullmatch(r"      - name: .+", line) for line in step_lines),
+        "every CI step must be named and part of the frozen sequence",
+    )
     starts = [
         (index, match.group(1))
         for index, line in enumerate(lines)
@@ -262,6 +267,43 @@ def verify_workflow_text(
     _require(
         "if-no-files-found: error" in full_steps["Upload full-test receipt"],
         "a missing full-test receipt must fail the job",
+    )
+
+    gate = _job_block(full_workflow, "full-test-gate")
+    gate_header = gate.split("\n    steps:", 1)[0]
+    _require(
+        [line.strip() for line in gate_header.splitlines() if line.startswith("    if:")]
+        == ["if: always()"],
+        "full-test-gate must run even when the private matrix is skipped",
+    )
+    _require("\n    needs: full-test" in gate_header, "full-test-gate must depend on the matrix")
+    _require("\n    environment:" not in gate_header, "full-test-gate must not receive secrets")
+    gate_steps = _require_step_contract(
+        gate,
+        (
+            "Check out ET-mainsim",
+            "Evaluate full-test result",
+        ),
+    )
+    _require_checkout_credentials_disabled(
+        gate_steps["Check out ET-mainsim"], "full-test-gate ET-mainsim"
+    )
+    evaluator = gate_steps["Evaluate full-test result"]
+    for required in (
+        "FULL_TEST_EVENT_NAME: ${{ github.event_name }}",
+        "FULL_TEST_RESULT: ${{ needs.full-test.result }}",
+        "FULL_TEST_SAME_REPOSITORY_PR: ${{ github.event_name == 'pull_request' && "
+        "github.event.pull_request.head.repo.full_name == github.repository }}",
+    ):
+        _require(required in evaluator, "full-test-gate event binding is incomplete")
+    _require(
+        [
+            line.strip()
+            for line in evaluator.splitlines()
+            if line.startswith("        run:")
+        ]
+        == ["run: python -m ci.run_full_test_gate"],
+        "full-test-gate must invoke the controlled evaluator exactly once",
     )
 
 

@@ -75,6 +75,14 @@ def test_ci_runs_unfiltered_full_suite_on_supported_python_versions() -> None:
     assert not re.search(r"pytest[^\n]*\s-m(?:\s|=)", block)
 
 
+def test_full_test_gate_is_always_instantiated_for_branch_protection() -> None:
+    block = _job_block(_workflow_text(_FULL_WORKFLOW_PATH), "full-test-gate")
+
+    assert "needs: full-test" in block
+    assert "if: always()" in block
+    assert "run: python -m ci.run_full_test_gate" in block
+
+
 def test_full_suite_uses_frozen_runtime_dependencies_and_no_science_data() -> None:
     workflow = _workflow_text(_FULL_WORKFLOW_PATH)
     block = _job_block(workflow, "full-test")
@@ -216,6 +224,28 @@ def test_stdlib_ci_contract_verifier_accepts_repository() -> None:
             "          persist-credentials: false",
             "          ssh-key: ${{ secrets.PHOTSIM7_READ_ONLY_DEPLOY_KEY }}",
         ),
+        (
+            "full",
+            "  full-test-gate:\n"
+            "    name: full-test-gate\n"
+            "    needs: full-test\n"
+            "    if: always()",
+            "  full-test-gate:\n"
+            "    name: full-test-gate\n"
+            "    needs: full-test\n"
+            "    if: github.actor == 'nobody'",
+        ),
+        (
+            "full",
+            "run: python -m ci.run_full_test_gate",
+            "run: python -m ci.run_full_test_gate || exit 0",
+        ),
+        (
+            "full",
+            "      - name: Install frozen CPU runtime and test dependencies\n",
+            "      - run: python -c \"print(123)\"\n"
+            "      - name: Install frozen CPU runtime and test dependencies\n",
+        ),
     ],
 )
 def test_stdlib_ci_contract_verifier_rejects_gate_bypasses(
@@ -300,6 +330,59 @@ def test_full_pytest_receipt_treats_xpass_as_forbidden() -> None:
 
     assert report.nodeid in receipt.xfailed
     assert report.nodeid not in receipt.passed
+
+
+def test_full_pytest_receipt_makes_teardown_failure_authoritative() -> None:
+    receipt = _SessionReceipt()
+    nodeid = "tests/test_ci_workflow.py::test_example"
+    receipt.pytest_runtest_logreport(
+        SimpleNamespace(
+            nodeid=nodeid,
+            failed=False,
+            skipped=False,
+            passed=True,
+            when="call",
+        )
+    )
+    receipt.pytest_runtest_logreport(
+        SimpleNamespace(
+            nodeid=nodeid,
+            failed=True,
+            skipped=False,
+            passed=False,
+            when="teardown",
+        )
+    )
+
+    assert nodeid in receipt.failed
+    assert nodeid not in receipt.passed
+
+
+@pytest.mark.parametrize(
+    ("event_name", "same_repository_pr", "full_test_result", "expected"),
+    [
+        ("pull_request", True, "success", True),
+        ("pull_request", True, "skipped", False),
+        ("pull_request", False, "skipped", True),
+        ("pull_request", False, "success", False),
+        ("push", False, "success", True),
+        ("push", False, "failure", False),
+        ("workflow_dispatch", False, "success", True),
+        ("workflow_dispatch", False, "cancelled", False),
+    ],
+)
+def test_full_test_gate_truth_table(
+    event_name: str,
+    same_repository_pr: bool,
+    full_test_result: str,
+    expected: bool,
+) -> None:
+    from ci.run_full_test_gate import full_test_gate_allows
+
+    assert (
+        full_test_gate_allows(event_name, same_repository_pr, full_test_result)
+        is expected
+    )
 
 
 @pytest.mark.parametrize(

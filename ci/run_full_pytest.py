@@ -41,6 +41,8 @@ class _SessionReceipt:
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         if report.failed:
             self.failed.add(report.nodeid)
+            self.passed.discard(report.nodeid)
+            self.skipped.discard(report.nodeid)
         if hasattr(report, "wasxfail"):
             self.xfailed.add(report.nodeid)
             return
