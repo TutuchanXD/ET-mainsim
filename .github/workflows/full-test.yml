@@ -63,7 +63,7 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.7,<3"
           python -m pip install .ci-dependencies/ET-coordinate
           python -m pip install .ci-dependencies/Photsim7
-          python -m pip install -e ".[test]"
+          python -m pip install -e ".[test,release]"
           python -m pip check
       - name: Run complete hermetic test suite
         env:

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
 import os
-import io
 import shutil
 import subprocess
 import sys
@@ -24,7 +24,6 @@ from ci.build_release import (
     validate_artifacts,
     validate_release_source,
 )
-
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "ci" / "release_contract.toml"
@@ -227,13 +226,30 @@ def test_release_builder_produces_reproducible_validated_artifacts(
     assert receipt["validation"]["unexpected_sdist_members"] == []
 
     artifact_root = tmp_path / "release" / "artifacts"
-    assert sorted(path.name for path in artifact_root.iterdir()) == [
-        "SHA256SUMS",
+    primary_names = [
         "et_mainsim-0.1.0-py3-none-any.whl",
         "et_mainsim-0.1.0.tar.gz",
-        "release-provenance.json",
     ]
-    for name, identity in receipt["artifacts"].items():
+    bundle_files = [
+        *primary_names,
+        "release-provenance.json",
+        "SHA256SUMS",
+    ]
+    assert sorted(path.name for path in artifact_root.iterdir()) == sorted(bundle_files)
+    assert "artifacts" not in receipt
+    assert sorted(receipt["primary_artifacts"]) == primary_names
+    assert receipt["bundle_contract"] == {
+        "files": bundle_files,
+        "primary_artifacts": primary_names,
+        "provenance_receipt": "release-provenance.json",
+        "checksum_manifest": {
+            "name": "SHA256SUMS",
+            "algorithm": "sha256",
+            "covers": [*primary_names, "release-provenance.json"],
+            "excludes": ["SHA256SUMS"],
+        },
+    }
+    for name, identity in receipt["primary_artifacts"].items():
         artifact = artifact_root / name
         assert identity == {
             "bytes": artifact.stat().st_size,
@@ -244,7 +260,7 @@ def test_release_builder_produces_reproducible_validated_artifacts(
     assert set(sums.splitlines()) == {
         *(
             f"{identity['sha256']}  {name}"
-            for name, identity in receipt["artifacts"].items()
+            for name, identity in receipt["primary_artifacts"].items()
         ),
         f"{artifact_sha256(provenance)}  release-provenance.json",
     }
@@ -465,6 +481,46 @@ def test_artifact_validator_rejects_path_traversal_members(
         validate_artifacts(wheel, sdist, contract)
 
 
+@pytest.mark.parametrize("archive_kind", ["wheel", "sdist"])
+def test_artifact_validator_rejects_backslash_path_traversal_members(
+    tmp_path: Path,
+    archive_kind: str,
+) -> None:
+    contract = load_release_contract(CONTRACT_PATH)
+    source = _clean_release_source(tmp_path)
+    build_release(source, tmp_path / "release")
+    artifact_root = tmp_path / "release" / "artifacts"
+    wheel = artifact_root / "et_mainsim-0.1.0-py3-none-any.whl"
+    sdist = artifact_root / "et_mainsim-0.1.0.tar.gz"
+
+    if archive_kind == "wheel":
+        tampered_dir = tmp_path / "backslash-traversal-wheel"
+        tampered_dir.mkdir()
+        tampered = tampered_dir / wheel.name
+        shutil.copyfile(wheel, tampered)
+        with zipfile.ZipFile(tampered, "a") as archive:
+            archive.writestr("et_mainsim\\..\\outside", b"traversal")
+        wheel = tampered
+    else:
+        tampered = tmp_path / "backslash-traversal-member.tar.gz"
+        with (
+            tarfile.open(sdist, "r:gz") as original,
+            tarfile.open(tampered, "w:gz") as target,
+        ):
+            for member in original.getmembers():
+                payload = (
+                    original.extractfile(member).read() if member.isfile() else None
+                )
+                target.addfile(member, None if payload is None else io.BytesIO(payload))
+            traversal = tarfile.TarInfo("et_mainsim-0.1.0\\..\\outside")
+            traversal.size = len(b"traversal")
+            target.addfile(traversal, io.BytesIO(b"traversal"))
+        sdist = tampered
+
+    with pytest.raises(ReleaseContractError, match="safe canonical path"):
+        validate_artifacts(wheel, sdist, contract)
+
+
 def test_release_wheel_is_rebuilt_from_the_canonical_sdist(tmp_path: Path) -> None:
     source = _clean_release_source(tmp_path)
     receipt = build_release(source, tmp_path / "release")
@@ -521,6 +577,14 @@ def test_release_workflow_is_manual_build_only_and_immutable() -> None:
     assert "gh release" not in workflow
     assert "contents: write" not in workflow
     assert "persist-credentials: false" in workflow
+    for bundle_path in (
+        "release-output/artifacts/et_mainsim-0.1.0-py3-none-any.whl",
+        "release-output/artifacts/et_mainsim-0.1.0.tar.gz",
+        "release-output/artifacts/release-provenance.json",
+        "release-output/artifacts/SHA256SUMS",
+    ):
+        assert bundle_path in workflow
+    assert "path: release-output/artifacts\n" not in workflow
     refs = [
         line.split("@", 1)[1].split()[0]
         for line in workflow.splitlines()

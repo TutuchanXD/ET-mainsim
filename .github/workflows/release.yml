@@ -39,6 +39,10 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: et-mainsim-v0.1.0-release
-          path: release-output/artifacts
+          path: |
+            release-output/artifacts/et_mainsim-0.1.0-py3-none-any.whl
+            release-output/artifacts/et_mainsim-0.1.0.tar.gz
+            release-output/artifacts/release-provenance.json
+            release-output/artifacts/SHA256SUMS
           if-no-files-found: error
           retention-days: 30

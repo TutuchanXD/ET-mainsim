@@ -18,10 +18,8 @@ import tomllib
 import venv
 import zipfile
 from email.parser import BytesParser
-from pathlib import Path
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
-
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "ci" / "release_contract.toml"
@@ -302,6 +300,7 @@ def _safe_archive_path(name: str, label: str) -> PurePosixPath:
     path = PurePosixPath(stripped)
     _require(
         bool(stripped)
+        and "\\" not in name
         and not path.is_absolute()
         and all(part not in {"", ".", ".."} for part in raw_parts)
         and str(path) == stripped,
@@ -509,9 +508,23 @@ def build_release(
         for source_path in (first_wheel, first_sdist):
             shutil.copyfile(source_path, artifacts_root / source_path.name)
 
-    artifacts = {
+    primary_artifacts = {
         path.name: {"bytes": path.stat().st_size, "sha256": artifact_sha256(path)}
         for path in sorted(artifacts_root.iterdir())
+    }
+    primary_names = list(primary_artifacts)
+    provenance_name = "release-provenance.json"
+    checksum_name = "SHA256SUMS"
+    bundle_contract = {
+        "files": [*primary_names, provenance_name, checksum_name],
+        "primary_artifacts": primary_names,
+        "provenance_receipt": provenance_name,
+        "checksum_manifest": {
+            "name": checksum_name,
+            "algorithm": "sha256",
+            "covers": [*primary_names, provenance_name],
+            "excludes": [checksum_name],
+        },
     }
     receipt = {
         "schema_id": "et_mainsim.release_receipt.v1",
@@ -529,24 +542,25 @@ def build_release(
             "sha256": first_hashes,
         },
         "validation": validation,
-        "artifacts": artifacts,
+        "primary_artifacts": primary_artifacts,
+        "bundle_contract": bundle_contract,
         "required_checks": contract["required_checks"],
         "release_policy": contract["release_policy"],
         "runtime_dependencies": contract["runtime_dependencies"],
     }
-    provenance_path = artifacts_root / "release-provenance.json"
+    provenance_path = artifacts_root / provenance_name
     provenance_path.write_text(
         json.dumps(receipt, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     checksum_identities = {
-        **artifacts,
+        **primary_artifacts,
         provenance_path.name: {
             "bytes": provenance_path.stat().st_size,
             "sha256": artifact_sha256(provenance_path),
         },
     }
-    (artifacts_root / "SHA256SUMS").write_text(
+    (artifacts_root / checksum_name).write_text(
         "".join(
             f"{identity['sha256']}  {name}\n"
             for name, identity in checksum_identities.items()

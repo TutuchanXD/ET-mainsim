@@ -12,8 +12,8 @@ import pytest
 
 from ci.run_full_pytest import (
     FullPytestContractError,
-    _SessionReceipt,
     _runner_error_receipt,
+    _SessionReceipt,
     _validate_environment,
     _validate_session,
 )
@@ -22,7 +22,6 @@ from ci.verify_full_test_workflow import (
     verify_repository,
     verify_workflow_text,
 )
-
 
 _ROOT = Path(__file__).resolve().parents[1]
 _CI_WORKFLOW_PATH = _ROOT / ".github" / "workflows" / "ci.yml"
@@ -104,6 +103,13 @@ def test_full_suite_uses_frozen_runtime_dependencies_and_no_science_data() -> No
     ) in block
 
 
+def test_full_suite_installs_release_tools_for_release_engineering_tests() -> None:
+    block = _job_block(_workflow_text(_FULL_WORKFLOW_PATH), "full-test")
+
+    assert 'python -m pip install -e ".[test,release]"' in block
+    assert 'python -m pip install -e ".[test]"' not in block
+
+
 def test_ci_actions_and_checkout_credentials_are_locked_down() -> None:
     workflow = _workflow_text(_CI_WORKFLOW_PATH) + _workflow_text(
         _FULL_WORKFLOW_PATH
@@ -146,6 +152,11 @@ def test_stdlib_ci_contract_verifier_accepts_repository() -> None:
             "full",
             'python-version: ["3.12", "3.13"]',
             'python-version: ["3.12"]',
+        ),
+        (
+            "full",
+            'python -m pip install -e ".[test,release]"',
+            'python -m pip install -e ".[test]"',
         ),
         (
             "ci",
