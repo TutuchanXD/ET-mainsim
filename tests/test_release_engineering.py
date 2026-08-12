@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import os
@@ -15,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from ci import build_release as release_builder
 from ci.build_release import (
     ReleaseContractError,
     _git_provenance,
@@ -53,12 +55,68 @@ def _clean_release_source(tmp_path: Path) -> Path:
         cwd=source,
         check=True,
     )
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"],
+        cwd=source,
+        check=True,
+    )
     return source
+
+
+def _git_output(source: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=source,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _annotate_release_tag(source: Path) -> None:
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Release Test",
+            "-c",
+            "user.email=release-test@example.invalid",
+            "tag",
+            "-a",
+            "v0.1.0",
+            "-m",
+            "release v0.1.0",
+        ],
+        cwd=source,
+        check=True,
+    )
+
+
+def _successful_approval(source: Path, contract: dict[str, object]) -> dict[str, object]:
+    commit = _git_output(source, "rev-parse", "HEAD")
+    return {
+        "schema_id": "et_mainsim.release_approval.v1",
+        "verified": True,
+        "repository": contract["repository"],
+        "commit": commit,
+        "main_commit": _git_output(source, "rev-parse", "refs/remotes/origin/main"),
+        "checks": [
+            {
+                "name": name,
+                "conclusion": "success",
+                "head_sha": commit,
+                "run_id": index,
+                "url": f"https://github.example.invalid/checks/{index}",
+            }
+            for index, name in enumerate(contract["required_checks"], start=1)
+        ],
+    }
 
 
 def test_release_contract_matches_package_and_cli_version() -> None:
     contract = load_release_contract(CONTRACT_PATH)
 
+    assert contract["repository"] == "TutuchanXD/ET-mainsim"
     assert contract["version"] == "0.1.0"
     assert contract["tag"] == "v0.1.0"
     validate_release_source(ROOT, contract)
@@ -111,7 +169,10 @@ def test_release_source_rejects_version_drift(
         validate_release_source(source, contract)
 
 
-@pytest.mark.parametrize("tag_kind", ["missing", "lightweight", "wrong-commit"])
+@pytest.mark.parametrize(
+    "tag_kind",
+    ["missing", "lightweight", "wrong-commit", "wrong-name", "non-commit"],
+)
 def test_release_tag_gate_rejects_invalid_tag(
     tmp_path: Path,
     tag_kind: str,
@@ -144,6 +205,11 @@ def test_release_tag_gate_rejects_invalid_tag(
             check=True,
         )
         subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/main", "HEAD"],
+            cwd=source,
+            check=True,
+        )
+        subprocess.run(
             [
                 "git",
                 "-c",
@@ -157,6 +223,55 @@ def test_release_tag_gate_rejects_invalid_tag(
                 "wrong release commit",
                 previous,
             ],
+            cwd=source,
+            check=True,
+        )
+    elif tag_kind == "wrong-name":
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Release Test",
+                "-c",
+                "user.email=release-test@example.invalid",
+                "tag",
+                "-a",
+                "embedded-wrong-name",
+                "-m",
+                "wrong embedded tag name",
+            ],
+            cwd=source,
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "update-ref",
+                "refs/tags/v0.1.0",
+                _git_output(source, "rev-parse", "refs/tags/embedded-wrong-name"),
+            ],
+            cwd=source,
+            check=True,
+        )
+    elif tag_kind == "non-commit":
+        tree = _git_output(source, "rev-parse", "HEAD^{tree}")
+        tag_payload = (
+            f"object {tree}\n"
+            "type tree\n"
+            "tag v0.1.0\n"
+            "tagger Release Test <release-test@example.invalid> 1700000000 +0000\n"
+            "\nrelease tag with a tree target\n"
+        )
+        tag_object = subprocess.run(
+            ["git", "mktag"],
+            cwd=source,
+            input=tag_payload,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "update-ref", "refs/tags/v0.1.0", tag_object],
             cwd=source,
             check=True,
         )
@@ -187,6 +302,186 @@ def test_release_tag_gate_accepts_annotated_tag_at_head(tmp_path: Path) -> None:
     provenance = _git_provenance(source, "v0.1.0", require_tag=True)
 
     assert provenance["tag_verified"] is True
+    assert provenance["tag_object"] == _git_output(
+        source, "rev-parse", "refs/tags/v0.1.0"
+    )
+    assert provenance["main_commit"] == _git_output(
+        source, "rev-parse", "refs/remotes/origin/main"
+    )
+
+
+def test_release_tag_gate_rejects_commit_not_reachable_from_origin_main(
+    tmp_path: Path,
+) -> None:
+    source = _clean_release_source(tmp_path)
+    (source / "unmerged.txt").write_text("not on main\n", encoding="utf-8")
+    subprocess.run(["git", "add", "unmerged.txt"], cwd=source, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Release Test",
+            "-c",
+            "user.email=release-test@example.invalid",
+            "commit",
+            "-qm",
+            "unmerged release commit",
+        ],
+        cwd=source,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Release Test",
+            "-c",
+            "user.email=release-test@example.invalid",
+            "tag",
+            "-a",
+            "v0.1.0",
+            "-m",
+            "release v0.1.0",
+        ],
+        cwd=source,
+        check=True,
+    )
+
+    with pytest.raises(ReleaseContractError, match="origin/main"):
+        _git_provenance(source, "v0.1.0", require_tag=True)
+
+
+@pytest.mark.parametrize(
+    "defect", ["missing", "failed", "wrong-commit", "wrong-check-sha"]
+)
+def test_release_approval_rejects_incomplete_or_mismatched_evidence(
+    tmp_path: Path,
+    defect: str,
+) -> None:
+    source = _clean_release_source(tmp_path)
+    contract = load_release_contract(source / "ci" / "release_contract.toml")
+    _annotate_release_tag(source)
+    provenance = _git_provenance(source, contract["tag"], require_tag=True)
+    evidence = _successful_approval(source, contract)
+    if defect == "missing":
+        evidence["checks"] = evidence["checks"][:-1]
+    elif defect == "failed":
+        evidence["checks"][0]["conclusion"] = "failure"
+    elif defect == "wrong-commit":
+        evidence["commit"] = "0" * 40
+    else:
+        evidence["checks"][0]["head_sha"] = "f" * 40
+
+    with pytest.raises(ReleaseContractError):
+        release_builder._validate_approval_evidence(
+            evidence,
+            contract=contract,
+            source=provenance,
+        )
+
+
+def test_release_approval_accepts_complete_success_evidence(tmp_path: Path) -> None:
+    source = _clean_release_source(tmp_path)
+    contract = load_release_contract(source / "ci" / "release_contract.toml")
+    _annotate_release_tag(source)
+    provenance = _git_provenance(source, contract["tag"], require_tag=True)
+    evidence = _successful_approval(source, contract)
+
+    assert release_builder._validate_approval_evidence(
+        evidence,
+        contract=contract,
+        source=provenance,
+    ) == evidence
+
+
+def test_github_check_collection_is_normalized_and_exact_sha(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _clean_release_source(tmp_path)
+    contract = load_release_contract(source / "ci" / "release_contract.toml")
+    commit = _git_output(source, "rev-parse", "HEAD")
+    required = contract["required_checks"]
+
+    def fake_api(url: str, token: str) -> dict[str, object]:
+        assert f"/commits/{commit}/check-runs" in url
+        assert token == "test-token"
+        return {
+            "check_runs": [
+                {
+                    "id": index,
+                    "name": name,
+                    "head_sha": commit,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "html_url": f"https://github.example.invalid/checks/{index}",
+                }
+                for index, name in reversed(list(enumerate(required, start=1)))
+            ]
+        }
+
+    monkeypatch.setattr(release_builder, "_github_api_json", fake_api)
+    evidence = release_builder.collect_github_approval_evidence(
+        repository=contract["repository"],
+        commit=commit,
+        main_commit=_git_output(source, "rev-parse", "refs/remotes/origin/main"),
+        required_checks=required,
+        token="test-token",
+    )
+
+    assert evidence == _successful_approval(source, contract)
+
+
+def test_canonical_sdist_ignores_input_gzip_compressor_bytes(tmp_path: Path) -> None:
+    epoch = 1_700_000_000
+    paths = [tmp_path / f"input-level-{level}.tar.gz" for level in (1, 9)]
+    tar_payload = io.BytesIO()
+    with tarfile.open(fileobj=tar_payload, mode="w") as archive:
+        member = tarfile.TarInfo("et_mainsim-0.1.0/payload.txt")
+        payload = b"canonical release payload\n" * 100
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+    for path, level in zip(paths, (1, 9), strict=True):
+        with path.open("wb") as raw:
+            with gzip.GzipFile(
+                filename="runtime-produced-name",
+                mode="wb",
+                compresslevel=level,
+                fileobj=raw,
+                mtime=epoch + level,
+            ) as compressed:
+                compressed.write(tar_payload.getvalue())
+        release_builder._canonicalize_sdist(path, epoch)
+
+    assert paths[0].read_bytes() == paths[1].read_bytes()
+    assert (paths[0].read_bytes()[10] >> 1) & 0b11 == 0
+    with tarfile.open(paths[0], "r:gz") as archive:
+        assert archive.extractfile("et_mainsim-0.1.0/payload.txt").read() == payload
+
+
+def test_canonical_wheel_ignores_input_zip_compressor_bytes(tmp_path: Path) -> None:
+    epoch = 1_700_000_000
+    paths = [tmp_path / f"input-level-{level}.whl" for level in (1, 9)]
+    payloads = {
+        "et_mainsim/__init__.py": b'__version__ = "0.1.0"\n',
+        "et_mainsim-0.1.0.dist-info/METADATA": b"Name: et-mainsim\nVersion: 0.1.0\n",
+    }
+    for path, level in zip(paths, (1, 9), strict=True):
+        with zipfile.ZipFile(
+            path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=level,
+        ) as archive:
+            for name, payload in reversed(payloads.items()):
+                info = zipfile.ZipInfo(name, (2024, 1, level, 0, 0, 0))
+                archive.writestr(info, payload, compress_type=zipfile.ZIP_DEFLATED)
+        release_builder._canonicalize_wheel(path, epoch)
+
+    assert paths[0].read_bytes() == paths[1].read_bytes()
+    with zipfile.ZipFile(paths[0]) as archive:
+        assert all(info.compress_type == zipfile.ZIP_STORED for info in archive.infolist())
+        assert {name: archive.read(name) for name in archive.namelist()} == payloads
 
 
 def test_release_builder_produces_reproducible_validated_artifacts(
@@ -224,6 +519,16 @@ def test_release_builder_produces_reproducible_validated_artifacts(
     assert receipt["validation"]["cli_version"] == "et-mainsim 0.1.0"
     assert receipt["validation"]["unexpected_wheel_members"] == []
     assert receipt["validation"]["unexpected_sdist_members"] == []
+    assert receipt["approval"] == {
+        "schema_id": "et_mainsim.release_approval.v1",
+        "verified": False,
+        "repository": "TutuchanXD/ET-mainsim",
+        "commit": receipt["source"]["git_commit"],
+        "main_commit": None,
+        "checks": [],
+    }
+    assert "required_checks" not in receipt
+    assert receipt["archive_codec"] == release_builder.ARCHIVE_CODEC_CONTRACT
 
     artifact_root = tmp_path / "release" / "artifacts"
     primary_names = [
@@ -270,6 +575,68 @@ def test_release_builder_produces_reproducible_validated_artifacts(
         )
         == receipt
     )
+
+
+def test_tagged_builder_requires_and_binds_verified_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _clean_release_source(tmp_path)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Release Test",
+            "-c",
+            "user.email=release-test@example.invalid",
+            "tag",
+            "-a",
+            "v0.1.0",
+            "-m",
+            "release v0.1.0",
+        ],
+        cwd=source,
+        check=True,
+    )
+    contract = load_release_contract(source / "ci" / "release_contract.toml")
+    evidence = _successful_approval(source, contract)
+
+    with pytest.raises(ReleaseContractError, match="approval evidence"):
+        build_release(source, tmp_path / "missing-evidence", require_tag=True)
+    with pytest.raises(ReleaseContractError, match="GITHUB_TOKEN"):
+        build_release(
+            source,
+            tmp_path / "unauthenticated-evidence",
+            require_tag=True,
+            approval_evidence=evidence,
+        )
+
+    def fake_api(url: str, token: str) -> dict[str, object]:
+        assert token == "test-token"
+        return {
+            "check_runs": [
+                {
+                    "id": check["run_id"],
+                    "name": check["name"],
+                    "head_sha": check["head_sha"],
+                    "status": "completed",
+                    "conclusion": check["conclusion"],
+                    "html_url": check["url"],
+                }
+                for check in evidence["checks"]
+            ]
+        }
+
+    monkeypatch.setattr(release_builder, "_github_api_json", fake_api)
+
+    receipt = build_release(
+        source,
+        tmp_path / "verified-release",
+        require_tag=True,
+        approval_evidence=evidence,
+        github_token="test-token",
+    )
+    assert receipt["approval"] == evidence
 
 
 def test_artifact_validator_rejects_unexpected_package_members(tmp_path: Path) -> None:
@@ -557,6 +924,9 @@ def test_release_wheel_is_rebuilt_from_the_canonical_sdist(tmp_path: Path) -> No
             text=True,
         )
         rebuilt = next(dist.glob("*.whl"))
+        release_builder._canonicalize_wheel(
+            rebuilt, receipt["source"]["source_date_epoch"]
+        )
         rebuilt_sha256 = artifact_sha256(rebuilt)
 
     assert rebuilt_sha256 == artifact_sha256(wheel)
@@ -569,9 +939,15 @@ def test_release_workflow_is_manual_build_only_and_immutable() -> None:
     assert "push:" not in workflow
     assert "pull_request_target:" not in workflow
     assert "permissions:\n  contents: read" in workflow
-    assert (
-        "python -m ci.build_release --output release-output --require-tag" in workflow
-    )
+    assert "  checks: read" in workflow
+    assert 'python-version: "3.12.13"' in workflow
+    assert "main:refs/remotes/origin/main" in workflow
+    assert "--collect-approval-evidence" in workflow
+    assert "--approval-evidence" in workflow
+    assert "GITHUB_TOKEN: ${{ github.token }}" in workflow
+    assert "python -m ci.build_release" in workflow
+    assert "--output release-output" in workflow
+    assert "--require-tag" in workflow
     assert "github.ref == 'refs/tags/v0.1.0'" in workflow
     assert "twine upload" not in workflow
     assert "gh release" not in workflow

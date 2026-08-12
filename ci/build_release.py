@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import gzip
+import binascii
 import hashlib
 import importlib.metadata
 import io
@@ -10,11 +10,15 @@ import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
+import urllib.error
+import urllib.request
 import venv
 import zipfile
 from email.parser import BytesParser
@@ -23,6 +27,19 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "ci" / "release_contract.toml"
+ARCHIVE_CODEC_CONTRACT = {
+    "sdist": {
+        "format": "tar+gzip",
+        "tar_format": "gnu",
+        "gzip_header": "rfc1952-fixed-v1",
+        "deflate": "stored-blocks",
+    },
+    "wheel": {
+        "format": "zip",
+        "compression": "stored",
+        "method": zipfile.ZIP_STORED,
+    },
+}
 
 
 class ReleaseContractError(RuntimeError):
@@ -63,6 +80,7 @@ def load_release_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
         "schema_version",
         "version",
         "tag",
+        "repository",
         "required_checks",
         "release_policy",
         "runtime_dependencies",
@@ -124,20 +142,208 @@ def _git_provenance(root: Path, tag: str, require_tag: bool) -> dict[str, Any]:
     tree = _run(["git", "rev-parse", "HEAD^{tree}"], cwd=root).stdout.strip()
     epoch_text = _run(["git", "show", "-s", "--format=%ct", "HEAD"], cwd=root).stdout
     source_date_epoch = int(epoch_text.strip())
+    tag_object = None
+    main_commit = None
     if require_tag:
         tag_type = _run(["git", "cat-file", "-t", f"refs/tags/{tag}"], cwd=root)
         _require(tag_type.stdout.strip() == "tag", f"{tag} must be an annotated tag")
-        tagged_commit = _run(
-            ["git", "rev-list", "-n", "1", f"refs/tags/{tag}"], cwd=root
+        tag_object = _run(
+            ["git", "rev-parse", f"refs/tags/{tag}"], cwd=root
         ).stdout.strip()
-        _require(tagged_commit == commit, f"{tag} does not identify HEAD")
+        tag_payload = _run(["git", "cat-file", "-p", tag_object], cwd=root).stdout
+        headers = {}
+        for line in tag_payload.split("\n\n", 1)[0].splitlines():
+            key, separator, value = line.partition(" ")
+            if separator:
+                headers[key] = value
+        _require(headers.get("tag") == tag, f"{tag} tag object has the wrong name")
+        _require(
+            headers.get("type") == "commit",
+            f"{tag} tag object must target a commit",
+        )
+        _require(
+            headers.get("object") == commit,
+            f"{tag} tag object does not directly target HEAD",
+        )
+        peeled_commit = _run(
+            ["git", "rev-parse", f"refs/tags/{tag}^{{commit}}"], cwd=root
+        ).stdout.strip()
+        _require(peeled_commit == commit, f"{tag} does not peel to HEAD")
+
+        main_commit = _run(
+            ["git", "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"],
+            cwd=root,
+        ).stdout.strip()
+        reachability = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", commit, main_commit],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        _require(
+            reachability.returncode == 0,
+            "release commit is not reachable from origin/main",
+        )
     return {
         "git_commit": commit,
         "git_tree": tree,
         "source_date_epoch": source_date_epoch,
         "dirty": False,
         "tag_verified": require_tag,
+        "tag_object": tag_object,
+        "main_commit": main_commit,
     }
+
+
+def _github_api_json(url: str, token: str) -> dict[str, Any]:
+    _require(bool(token), "GITHUB_TOKEN is required to verify release checks")
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+            payload = json.load(response)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+        raise ReleaseContractError(f"GitHub checks request failed: {exc}") from exc
+    _require(isinstance(payload, dict), "GitHub checks response must be an object")
+    return payload
+
+
+def collect_github_approval_evidence(
+    *,
+    repository: str,
+    commit: str,
+    main_commit: str,
+    required_checks: list[str],
+    token: str,
+) -> dict[str, Any]:
+    _require(
+        bool(re.fullmatch(r"[0-9a-f]{40}", commit)),
+        "release approval commit must be a full lowercase Git SHA",
+    )
+    _require(
+        bool(re.fullmatch(r"[0-9a-f]{40}", main_commit)),
+        "release main commit must be a full lowercase Git SHA",
+    )
+    observed: dict[str, dict[str, Any]] = {}
+    page = 1
+    while True:
+        url = (
+            f"https://api.github.com/repos/{repository}/commits/{commit}/check-runs"
+            f"?filter=latest&per_page=100&page={page}"
+        )
+        payload = _github_api_json(url, token)
+        check_runs = payload.get("check_runs")
+        _require(isinstance(check_runs, list), "GitHub response lacks check_runs")
+        for run in check_runs:
+            _require(isinstance(run, dict), "GitHub check run must be an object")
+            name = run.get("name")
+            if name not in required_checks:
+                continue
+            _require(name not in observed, f"duplicate required check run: {name}")
+            _require(run.get("head_sha") == commit, f"wrong SHA for check: {name}")
+            _require(run.get("status") == "completed", f"check is incomplete: {name}")
+            _require(run.get("conclusion") == "success", f"check failed: {name}")
+            run_id = run.get("id")
+            url_value = run.get("html_url")
+            _require(
+                isinstance(run_id, int) and not isinstance(run_id, bool) and run_id > 0,
+                f"check lacks a valid run id: {name}",
+            )
+            _require(
+                isinstance(url_value, str) and url_value.startswith("https://"),
+                f"check lacks a valid URL: {name}",
+            )
+            observed[name] = {
+                "name": name,
+                "conclusion": "success",
+                "head_sha": commit,
+                "run_id": run_id,
+                "url": url_value,
+            }
+        if len(check_runs) < 100:
+            break
+        page += 1
+    missing = [name for name in required_checks if name not in observed]
+    _require(not missing, f"required checks are missing: {missing}")
+    return {
+        "schema_id": "et_mainsim.release_approval.v1",
+        "verified": True,
+        "repository": repository,
+        "commit": commit,
+        "main_commit": main_commit,
+        "checks": [observed[name] for name in required_checks],
+    }
+
+
+def _validate_approval_evidence(
+    evidence: dict[str, Any],
+    *,
+    contract: dict[str, Any],
+    source: dict[str, Any],
+) -> dict[str, Any]:
+    expected_keys = {
+        "schema_id",
+        "verified",
+        "repository",
+        "commit",
+        "main_commit",
+        "checks",
+    }
+    _require(set(evidence) == expected_keys, "approval evidence fields are not canonical")
+    _require(
+        evidence["schema_id"] == "et_mainsim.release_approval.v1",
+        "unsupported release approval evidence schema",
+    )
+    _require(evidence["verified"] is True, "release approval is not verified")
+    _require(
+        evidence["repository"] == contract["repository"],
+        "release approval repository differs from the contract",
+    )
+    _require(
+        evidence["commit"] == source["git_commit"],
+        "release approval commit differs from HEAD",
+    )
+    _require(
+        source["main_commit"] is not None
+        and evidence["main_commit"] == source["main_commit"],
+        "release approval main baseline differs from origin/main",
+    )
+    checks = evidence["checks"]
+    _require(isinstance(checks, list), "release approval checks must be a list")
+    _require(
+        [check.get("name") for check in checks if isinstance(check, dict)]
+        == contract["required_checks"],
+        "release approval does not contain the exact required checks",
+    )
+    check_keys = {"name", "conclusion", "head_sha", "run_id", "url"}
+    for check in checks:
+        _require(
+            isinstance(check, dict) and set(check) == check_keys,
+            "release approval check fields are not canonical",
+        )
+        _require(check["conclusion"] == "success", f"check failed: {check['name']}")
+        _require(
+            check["head_sha"] == source["git_commit"],
+            f"wrong SHA for check: {check['name']}",
+        )
+        _require(
+            isinstance(check["run_id"], int)
+            and not isinstance(check["run_id"], bool)
+            and check["run_id"] > 0,
+            f"check lacks a valid run id: {check['name']}",
+        )
+        _require(
+            isinstance(check["url"], str) and check["url"].startswith("https://"),
+            f"check lacks a valid URL: {check['name']}",
+        )
+    return json.loads(json.dumps(evidence))
 
 
 def _validate_build_tools(contract: dict[str, Any]) -> dict[str, str]:
@@ -203,15 +409,67 @@ def _canonicalize_sdist(path: Path, source_date_epoch: int) -> None:
                 None if payload is None else io.BytesIO(payload),
             )
 
-    with path.open("wb") as raw:
-        with gzip.GzipFile(
-            filename="",
-            mode="wb",
-            compresslevel=9,
-            fileobj=raw,
-            mtime=source_date_epoch,
-        ) as compressed:
-            compressed.write(tar_buffer.getvalue())
+    payload = tar_buffer.getvalue()
+    path.write_bytes(_deterministic_stored_gzip(payload, source_date_epoch))
+
+
+def _deterministic_stored_gzip(payload: bytes, source_date_epoch: int) -> bytes:
+    _require(
+        0 <= source_date_epoch <= 0xFFFFFFFF,
+        "SOURCE_DATE_EPOCH is outside the gzip timestamp range",
+    )
+    deflate = bytearray()
+    chunks = [payload[offset : offset + 0xFFFF] for offset in range(0, len(payload), 0xFFFF)]
+    if not chunks:
+        chunks = [b""]
+    for index, chunk in enumerate(chunks):
+        final = index == len(chunks) - 1
+        size = len(chunk)
+        deflate.append(1 if final else 0)
+        deflate.extend(struct.pack("<HH", size, size ^ 0xFFFF))
+        deflate.extend(chunk)
+    header = b"\x1f\x8b\x08\x00" + struct.pack("<I", source_date_epoch) + b"\x00\xff"
+    trailer = struct.pack(
+        "<II",
+        binascii.crc32(payload) & 0xFFFFFFFF,
+        len(payload) & 0xFFFFFFFF,
+    )
+    return header + bytes(deflate) + trailer
+
+
+def _canonicalize_wheel(path: Path, source_date_epoch: int) -> None:
+    members: list[tuple[zipfile.ZipInfo, bytes]] = []
+    with zipfile.ZipFile(path) as source:
+        for info in source.infolist():
+            members.append((info, source.read(info.filename)))
+
+    timestamp = time.gmtime(source_date_epoch)[:6]
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False
+    ) as stream:
+        temporary = Path(stream.name)
+    try:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as target:
+            for original, payload in sorted(members, key=lambda item: item[0].filename):
+                canonical = zipfile.ZipInfo(original.filename, timestamp)
+                canonical.compress_type = zipfile.ZIP_STORED
+                canonical.create_system = 3
+                canonical.create_version = 20
+                canonical.extract_version = 20
+                canonical.extra = b""
+                canonical.comment = b""
+                executable = bool((original.external_attr >> 16) & 0o111)
+                if original.is_dir():
+                    mode = 0o40755
+                    canonical.external_attr = (mode << 16) | 0x10
+                else:
+                    mode = 0o100755 if executable else 0o100644
+                    canonical.external_attr = mode << 16
+                target.writestr(canonical, payload)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _build_once(
@@ -274,6 +532,7 @@ def _build_once(
     )
     wheels = list(distributions.glob("*.whl"))
     _require(len(wheels) == 1, "build produced an unexpected wheel set")
+    _canonicalize_wheel(wheels[0], source_date_epoch)
     return wheels[0], sdists[0]
 
 
@@ -463,11 +722,56 @@ def build_release(
     output: Path | None = None,
     *,
     require_tag: bool = False,
+    approval_evidence: dict[str, Any] | Path | None = None,
+    github_token: str | None = None,
 ) -> dict[str, Any]:
     root = root.resolve()
     contract = load_release_contract(root / "ci" / "release_contract.toml")
     validate_release_source(root, contract)
     source = _git_provenance(root, contract["tag"], require_tag)
+    if approval_evidence is None:
+        _require(
+            not require_tag,
+            "verified approval evidence is required for a tagged release",
+        )
+        approval = {
+            "schema_id": "et_mainsim.release_approval.v1",
+            "verified": False,
+            "repository": contract["repository"],
+            "commit": source["git_commit"],
+            "main_commit": None,
+            "checks": [],
+        }
+    else:
+        _require(require_tag, "approval evidence is valid only for a tagged release")
+        if isinstance(approval_evidence, Path):
+            evidence_payload = json.loads(approval_evidence.read_text(encoding="utf-8"))
+        else:
+            evidence_payload = approval_evidence
+        _require(
+            isinstance(evidence_payload, dict),
+            "release approval evidence must be a JSON object",
+        )
+        approval = _validate_approval_evidence(
+            evidence_payload,
+            contract=contract,
+            source=source,
+        )
+        _require(
+            bool(github_token),
+            "GITHUB_TOKEN is required to authenticate approval evidence",
+        )
+        observed_approval = collect_github_approval_evidence(
+            repository=contract["repository"],
+            commit=source["git_commit"],
+            main_commit=source["main_commit"],
+            required_checks=contract["required_checks"],
+            token=github_token,
+        )
+        _require(
+            approval == observed_approval,
+            "approval evidence differs from live GitHub check runs",
+        )
     build_tools = _validate_build_tools(contract)
     output = (root / "release-output" if output is None else output).resolve()
     _require(output != root, "release output cannot replace the source root")
@@ -541,10 +845,11 @@ def build_release(
             "byte_identical": True,
             "sha256": first_hashes,
         },
+        "archive_codec": ARCHIVE_CODEC_CONTRACT,
         "validation": validation,
         "primary_artifacts": primary_artifacts,
         "bundle_contract": bundle_contract,
-        "required_checks": contract["required_checks"],
+        "approval": approval,
         "release_policy": contract["release_policy"],
         "runtime_dependencies": contract["runtime_dependencies"],
     }
@@ -576,14 +881,44 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path, default=Path("release-output"))
     parser.add_argument("--require-tag", action="store_true")
+    parser.add_argument("--approval-evidence", type=Path)
+    parser.add_argument("--collect-approval-evidence", type=Path)
+    parser.add_argument("--github-repository")
+    parser.add_argument("--github-commit")
+    parser.add_argument("--main-commit")
     return parser
 
 
 def main() -> int:
     arguments = _parser().parse_args()
     try:
+        if arguments.collect_approval_evidence is not None:
+            contract = load_release_contract(CONTRACT_PATH)
+            _require(
+                arguments.github_repository == contract["repository"],
+                "GitHub repository differs from the release contract",
+            )
+            _require(arguments.github_commit is not None, "GitHub commit is required")
+            _require(arguments.main_commit is not None, "main commit is required")
+            evidence = collect_github_approval_evidence(
+                repository=arguments.github_repository,
+                commit=arguments.github_commit,
+                main_commit=arguments.main_commit,
+                required_checks=contract["required_checks"],
+                token=os.environ.get("GITHUB_TOKEN", ""),
+            )
+            arguments.collect_approval_evidence.write_text(
+                json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            print(json.dumps(evidence, indent=2, sort_keys=True))
+            return 0
         receipt = build_release(
-            ROOT, arguments.output, require_tag=arguments.require_tag
+            ROOT,
+            arguments.output,
+            require_tag=arguments.require_tag,
+            approval_evidence=arguments.approval_evidence,
+            github_token=os.environ.get("GITHUB_TOKEN"),
         )
     except (
         OSError,

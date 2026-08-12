@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: read
+  checks: read
 
 concurrency:
   group: release-artifacts-${{ github.ref }}
@@ -28,13 +29,30 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.13"
           cache: pip
           cache-dependency-path: pyproject.toml
       - name: Install frozen release tools
         run: python -m pip install "build==1.5.0" "setuptools==80.9.0" "wheel==0.45.1"
+      - name: Fetch immutable main baseline
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
+      - name: Collect exact-commit required-check evidence
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python -m ci.build_release
+          --collect-approval-evidence "${RUNNER_TEMP}/release-approval.json"
+          --github-repository "${GITHUB_REPOSITORY}"
+          --github-commit "$(git rev-parse HEAD)"
+          --main-commit "$(git rev-parse refs/remotes/origin/main)"
       - name: Build and validate exact tagged artifacts
-        run: python -m ci.build_release --output release-output --require-tag
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python -m ci.build_release
+          --output release-output
+          --require-tag
+          --approval-evidence "${RUNNER_TEMP}/release-approval.json"
       - name: Upload validated release bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
