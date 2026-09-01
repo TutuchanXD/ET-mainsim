@@ -946,16 +946,16 @@ def _write_test_psf_bundle(data_root: Path) -> str:
 
 def _complete_full_frame_selection_api(api):
     from photsim7.dynamic_effects import EffectTimeseries, build_frame_timing
-    from photsim7.jitter_bank import (
+    from photsim7.effects.jitter_bank import (
         CANONICAL_JITTER_BANK_EVIDENCE_ID,
         CANONICAL_JITTER_BANK_LOGICAL_ID,
         NATIVE_JITTER_BANK_LOADER_ID,
     )
-    from photsim7.jitter_bank_authority import (
+    from photsim7.effects.jitter_bank_authority import (
         CANONICAL_JITTER_BANK_MANIFEST_SHA256,
         CANONICAL_JITTER_BANK_SHA256,
     )
-    from photsim7.jitter_selection_truth import JitterModelSelector
+    from photsim7.effects.jitter_selection_truth import JitterModelSelector
 
     original_build_services = api.build_full_frame_services
 
@@ -1001,7 +1001,8 @@ def _complete_full_frame_selection_api(api):
 def _selection_ready_worker_request(tmp_path, *, n_frames: int = 2):
     from et_mainsim.config import ExecutionConfig
     from et_mainsim.workflows.full_frame import WorkerRequest, _science_api
-    from photsim7.catalog_sources import PreparedStarCatalog, StarCatalogCache
+    from photsim7.catalogs.cache import StarCatalogCache
+    from photsim7.catalogs.sources import PreparedStarCatalog
     from photsim7.geometry_truth import reference_field_nonphysical_declaration
     from photsim7.spec_factories import make_et_main_detector_spec
     from photsim7.specs import (
@@ -1149,7 +1150,8 @@ def test_tiny_cpu_worker_writes_readable_photsim7_artifacts(
         frame_completion,
         run_worker,
     )
-    from photsim7.catalog_sources import PreparedStarCatalog, StarCatalogCache
+    from photsim7.catalogs.cache import StarCatalogCache
+    from photsim7.catalogs.sources import PreparedStarCatalog
     from photsim7.frame_products import read_frame_product_schema
     from photsim7.geometry_truth import reference_field_nonphysical_declaration
     from photsim7.spec_factories import make_et_main_detector_spec
@@ -2611,16 +2613,16 @@ def test_full_frame_completion_rejects_self_consistent_identity_transplant(
 ) -> None:
     from et_mainsim.workflows.full_frame import frame_is_complete, run_worker
     from photsim7.full_frame_pipeline import _selection_truth_metadata
-    from photsim7.jitter_bank import (
+    from photsim7.effects.jitter_bank import (
         CANONICAL_JITTER_BANK_EVIDENCE_ID,
         CANONICAL_JITTER_BANK_LOGICAL_ID,
         NATIVE_JITTER_BANK_LOADER_ID,
     )
-    from photsim7.jitter_bank_authority import (
+    from photsim7.effects.jitter_bank_authority import (
         CANONICAL_JITTER_BANK_MANIFEST_SHA256,
         CANONICAL_JITTER_BANK_SHA256,
     )
-    from photsim7.jitter_selection_truth import JitterModelSelector
+    from photsim7.effects.jitter_selection_truth import JitterModelSelector
     from photsim7.selection_artifacts import (
         CadenceSelectionTruth,
         read_cadence_selection_truth,

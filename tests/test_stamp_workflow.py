@@ -109,7 +109,7 @@ def _variable_table_plan(tmp_path, *, target_body=None, curve_body=None):
 
 
 def _fake_table_api():
-    from photsim7.catalog_sources import PreparedStarCatalog
+    from photsim7.catalogs.sources import PreparedStarCatalog
     from photsim7.source_variability import SourceVariability
 
     return SimpleNamespace(
@@ -284,7 +284,7 @@ def test_catalog_stamp_preflight_allows_cache_without_query_assets(tmp_path) -> 
 
 
 def test_table_stamp_inputs_are_independent_catalogs_without_query(tmp_path) -> None:
-    from photsim7.catalog_sources import PreparedStarCatalog
+    from photsim7.catalogs.sources import PreparedStarCatalog
     from et_mainsim.workflows.stamp import prepare_stamp_inputs
 
     plan = _table_plan(tmp_path)
@@ -742,7 +742,7 @@ def test_table_target_spec_rejects_observed_psf_hash_mismatch(
 
 
 def test_catalog_stamp_inputs_select_requested_targets_from_one_shared_scene(tmp_path) -> None:
-    from photsim7.catalog_sources import PreparedStarCatalog
+    from photsim7.catalogs.sources import PreparedStarCatalog
     from et_mainsim.presets import load_preset
     from et_mainsim.workflows.stamp import build_run_plan, prepare_stamp_inputs
 
@@ -910,16 +910,16 @@ def _stamp_artifact_snapshot(target_dir):
 
 def _complete_selection_api(api):
     from photsim7.dynamic_effects import EffectTimeseries, build_frame_timing
-    from photsim7.jitter_bank import (
+    from photsim7.effects.jitter_bank import (
         CANONICAL_JITTER_BANK_EVIDENCE_ID,
         CANONICAL_JITTER_BANK_LOGICAL_ID,
         NATIVE_JITTER_BANK_LOADER_ID,
     )
-    from photsim7.jitter_bank_authority import (
+    from photsim7.effects.jitter_bank_authority import (
         CANONICAL_JITTER_BANK_MANIFEST_SHA256,
         CANONICAL_JITTER_BANK_SHA256,
     )
-    from photsim7.jitter_selection_truth import JitterModelSelector
+    from photsim7.effects.jitter_selection_truth import JitterModelSelector
 
     original_build_services = api.build_stamp_services
 

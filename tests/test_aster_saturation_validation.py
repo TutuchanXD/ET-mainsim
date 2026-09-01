@@ -180,7 +180,7 @@ def test_aster_g6_worker_uses_paired_rng_and_formal_delivery_contract(
 ) -> None:
     import et_mainsim.aster_saturation_validation as validation
     import et_mainsim.workflows.stamp as stamp_workflow
-    from photsim7.catalog_sources import PreparedStarCatalog
+    from photsim7.catalogs.sources import PreparedStarCatalog
     from photsim7.source_variability import SourceVariability
 
     source_dat, source_log, variability = _write_aster_inputs(tmp_path)

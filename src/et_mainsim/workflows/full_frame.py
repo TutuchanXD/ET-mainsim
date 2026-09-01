@@ -179,7 +179,8 @@ def _science_api() -> SimpleNamespace:
         SharedExposureShardWriter,
         partial_shard_path,
     )
-    from photsim7.catalog_sources import PreparedStarCatalog, StarCatalogCache
+    from photsim7.catalogs.cache import StarCatalogCache
+    from photsim7.catalogs.sources import PreparedStarCatalog
     from photsim7.data_registry import DataRegistry
     from photsim7.full_frame_artifacts import (
         FullFrameArtifactOptions,
