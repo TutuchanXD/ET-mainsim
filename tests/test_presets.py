@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
@@ -15,6 +16,56 @@ TESS_TEMPERATURE_PROFILE = "thermal/TESS/tess_temperatures_241209.pkl"
 ET_THERMAL_MOTION_TABLE = (
     "thermal/ET/et_lens_temperature_to_centroid_motion_df_241209.pkl"
 )
+TRANSITIONAL_PHOTSIM7_MODULES = frozenset(
+    {
+        "photsim7.background",
+        "photsim7.catalog_sources",
+        "photsim7.common_imports",
+        "photsim7.config_schema",
+        "photsim7.dashboard",
+        "photsim7.data_generators",
+        "photsim7.data_retrieval",
+        "photsim7.detector_response_effects",
+        "photsim7.dynamic_effect_models",
+        "photsim7.jitter_bank",
+        "photsim7.jitter_bank_authority",
+        "photsim7.jitter_selection_truth",
+        "photsim7.kepler_utils",
+        "photsim7.lc_processing",
+        "photsim7.mapping",
+        "photsim7.misc_interp",
+        "photsim7.plot",
+        "photsim7.power_spectrum",
+        "photsim7.psf_bundle_paths",
+        "photsim7.ray_cluster",
+        "photsim7.report",
+        "photsim7.single_cadence_effects",
+        "photsim7.survey_settings",
+        "photsim7.transit",
+        "photsim7.variants",
+    }
+)
+
+
+def _direct_photsim7_imports(path: Path) -> tuple[tuple[int, str], ...]:
+    tree = ast.parse(path.read_bytes(), filename=str(path))
+    imports: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend(
+                (node.lineno, alias.name)
+                for alias in node.names
+                if alias.name == "photsim7" or alias.name.startswith("photsim7.")
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            if node.module == "photsim7":
+                imports.extend(
+                    (node.lineno, f"photsim7.{alias.name}")
+                    for alias in node.names
+                )
+            elif node.module.startswith("photsim7."):
+                imports.append((node.lineno, node.module))
+    return tuple(imports)
 
 
 def _assert_temperature_driven_production_dynamics(spec) -> None:
@@ -98,6 +149,17 @@ def test_project_declares_torch_for_formal_analysis_apertures() -> None:
 
 
 def test_required_photsim7_runtime_capabilities_are_importable() -> None:
+    unexpected: list[tuple[str, int, str]] = []
+    for source_root in ("scripts", "src", "tests", "tools"):
+        for path in sorted((REPO_ROOT / source_root).rglob("*.py")):
+            for lineno, module in _direct_photsim7_imports(path):
+                head = ".".join(module.split(".")[:2])
+                if module == "photsim7.*" or head in TRANSITIONAL_PHOTSIM7_MODULES:
+                    unexpected.append(
+                        (str(path.relative_to(REPO_ROOT)), lineno, module)
+                    )
+    assert unexpected == []
+
     from et_mainsim.workflows.full_frame import _science_api
 
     api = _science_api()

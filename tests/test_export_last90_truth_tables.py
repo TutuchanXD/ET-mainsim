@@ -65,8 +65,9 @@ def _write_minimal_run(tmp_path: Path) -> Path:
 
 
 def _write_package_timeline_run(tmp_path: Path, *, max_stars: int | None = None) -> Path:
-    from photsim7.catalog_sources import PreparedStarCatalog, StarCatalogCache
-    from photsim7.dynamic_effect_models import build_frame_timing
+    from photsim7.catalogs.cache import StarCatalogCache
+    from photsim7.catalogs.sources import PreparedStarCatalog
+    from photsim7.effects.models import build_frame_timing
     from photsim7.dynamic_effects import (
         EffectComponent,
         EffectSourceGeometry,

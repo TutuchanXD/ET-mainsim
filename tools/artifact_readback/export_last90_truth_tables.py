@@ -166,7 +166,7 @@ def _package_effect_timeseries(
     spec,
     catalog,
 ):
-    from photsim7.dynamic_effect_models import build_frame_timing
+    from photsim7.effects.models import build_frame_timing
     from photsim7.dynamic_effects import (
         EffectComponent,
         EffectSourceGeometry,
@@ -238,7 +238,7 @@ def _package_effect_timeseries(
 def _select_package_catalog(catalog, max_stars: int | None):
     if max_stars is None:
         return catalog
-    from photsim7.catalog_sources import PreparedStarCatalog
+    from photsim7.catalogs.sources import PreparedStarCatalog
     from photsim7.photometry import normalize_magnitude_input
 
     max_stars = int(max_stars)
@@ -272,7 +272,7 @@ def load_run_context(run_dir: Path | str) -> RunContext:
     effect_timeseries = None
     effect_schema_id = None
     if "simulation_spec" in run_config:
-        from photsim7.catalog_sources import StarCatalogCache
+        from photsim7.catalogs.cache import StarCatalogCache
         from photsim7.simulation_services import build_star_table_from_catalog
         from photsim7.specs import SimulationSpec
 

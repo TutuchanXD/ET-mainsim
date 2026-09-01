@@ -246,7 +246,8 @@ class StampWorkerRequest:
 
 def _science_api() -> SimpleNamespace:
     from photsim7.artifacts import ItemStatus, StampShardReader, StampShardWriter
-    from photsim7.catalog_sources import PreparedStarCatalog, StarCatalogCache
+    from photsim7.catalogs.cache import StarCatalogCache
+    from photsim7.catalogs.sources import PreparedStarCatalog
     from photsim7.data_registry import DataRegistry
     from photsim7.simulation_services import (
         build_catalog_from_spec,
@@ -254,7 +255,7 @@ def _science_api() -> SimpleNamespace:
     )
     from photsim7.source_variability import SourceVariability
     from photsim7.psf.model import load_psf_bundle
-    from photsim7.psf_bundle_paths import resolve_psf_bundle_filename
+    from photsim7.psf.paths import resolve_psf_bundle_filename
     from photsim7.stamp_pipeline import run_stamp_coadd
     from photsim7.stamp_products import write_stamp_product_schema
     from photsim7.selection_artifacts import (
@@ -610,7 +611,7 @@ def _psf_bundle_asset_identity(plan: StampRunPlan) -> dict[str, Any]:
             "stamp table input requires a deterministic ET PSF bundle; "
             "kp_N randomly reselects backing interpolants and is not supported"
         )
-    from photsim7.psf_bundle_paths import resolve_psf_bundle_filename
+    from photsim7.psf.paths import resolve_psf_bundle_filename
 
     bundle_path = Path(
         resolve_psf_bundle_filename(bundle_name, plan.paths.data_root)
