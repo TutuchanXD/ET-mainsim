@@ -161,6 +161,21 @@ def test_stdlib_ci_contract_verifier_accepts_repository() -> None:
     with pytest.raises(WorkflowContractError):
         verify_workflow_text(ci_workflow, heredoc_workflow, project, contract)
 
+    shell_override_workflow = _workflow_text(_FULL_WORKFLOW_PATH).replace(
+        "      - name: Install frozen CPU runtime and test dependencies\n"
+        "        run: |",
+        "      - name: Install frozen CPU runtime and test dependencies\n"
+        "        shell: 'true {0}'\n"
+        "        run: |",
+    )
+    with pytest.raises(WorkflowContractError):
+        verify_workflow_text(
+            ci_workflow,
+            shell_override_workflow,
+            project,
+            contract,
+        )
+
 
 @pytest.mark.parametrize(
     ("workflow_name", "before", "after"),

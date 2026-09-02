@@ -226,6 +226,21 @@ def verify_workflow_text(
     ):
         _require_checkout_credentials_disabled(full_steps[checkout_name], checkout_name)
     install_step_name = "Install frozen CPU runtime and test dependencies"
+    expected_install_step = (
+        "      - name: Install frozen CPU runtime and test dependencies\n"
+        "        run: |\n"
+        "          python -m pip install --upgrade pip\n"
+        "          python -m pip install --index-url "
+        "https://download.pytorch.org/whl/cpu \"torch>=2.7,<3\"\n"
+        "          python -m pip install .ci-dependencies/ET-coordinate\n"
+        "          python -m pip install \".ci-dependencies/Photsim7[gpu]\"\n"
+        "          python -m pip install -e \".[test,release]\"\n"
+        "          python -m pip check"
+    )
+    _require(
+        full_steps[install_step_name] == expected_install_step,
+        "full-test dependency installation step differs from the frozen YAML block",
+    )
     install_commands = _executable_run_lines(
         full_steps[install_step_name],
         install_step_name,
