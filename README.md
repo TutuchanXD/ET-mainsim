@@ -20,7 +20,7 @@ existing `etbase` environment:
 
 ```bash
 conda activate etbase
-python -m pip install -e /home/cxgao/ET/Photsim7
+python -m pip install -e '/home/cxgao/ET/Photsim7[gpu]'
 python -m pip install -e /home/cxgao/ET/et_focalplane
 python -m pip install -e /home/cxgao/ET/ET-mainsim
 ```
@@ -29,9 +29,10 @@ Coordinate-table stamp inputs require `et-coord>=0.1.2`, the first release
 containing the semantic focal-plane registry owner-attestation API used by the
 maintained Galaxy producer.
 
-The v0.1.0 release runtime is validated against ET-coordinate commit
-`f9cec8038b021c9540a026b94e876dc3240071d1` (version 0.1.2) and Photsim7 commit
-`250b6bcbd3a79e3bb775a2e0cdf584b3f552185c` (version 0.2.5). Install those exact
+The current full-test and release-engineering contracts are validated against
+ET-coordinate commit `f9cec8038b021c9540a026b94e876dc3240071d1`
+(version 0.1.2) and Photsim7 commit
+`f722a9f65bcadcc798c1e8c6fa785d780ca3d8df` (version 0.4.0). Install those exact
 dependency snapshots before installing the ET-mainsim wheel with `--no-deps`,
 then run `python -m pip check`.
 

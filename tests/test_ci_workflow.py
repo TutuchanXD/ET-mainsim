@@ -89,7 +89,7 @@ def test_full_suite_uses_frozen_runtime_dependencies_and_no_science_data() -> No
     assert "repository: TutuchanXD/ET-coordinate" in block
     assert "ref: f9cec8038b021c9540a026b94e876dc3240071d1" in block
     assert "repository: TutuchanXD/Photsim7" in block
-    assert "ref: d085a012b2e4765f16751c32af2212dbb1b60d19" in block
+    assert "ref: f722a9f65bcadcc798c1e8c6fa785d780ca3d8df" in block
     assert "ssh-key: ${{ secrets.PHOTSIM7_READ_ONLY_DEPLOY_KEY }}" in block
     assert "ET_DATA_DIR: ${{ runner.temp }}/et-mainsim-ci-missing-data" in block
     assert "pull_request:" in workflow
@@ -106,6 +106,7 @@ def test_full_suite_uses_frozen_runtime_dependencies_and_no_science_data() -> No
 def test_full_suite_installs_release_tools_for_release_engineering_tests() -> None:
     block = _job_block(_workflow_text(_FULL_WORKFLOW_PATH), "full-test")
 
+    assert 'python -m pip install ".ci-dependencies/Photsim7[gpu]"' in block
     assert 'python -m pip install -e ".[test,release]"' in block
     assert 'python -m pip install -e ".[test]"' not in block
 

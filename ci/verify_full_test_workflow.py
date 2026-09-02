@@ -216,6 +216,11 @@ def verify_workflow_text(
         editable_installs == ['python -m pip install -e ".[test,release]"'],
         "full-test must install both the frozen test and release tool extras",
     )
+    _require(
+        'python -m pip install ".ci-dependencies/Photsim7[gpu]"'
+        in full_steps["Install frozen CPU runtime and test dependencies"],
+        "full-test must install the frozen Photsim7 GPU extra",
+    )
     versions = contract["python_versions"]
     matrix = ", ".join(f'"{version}"' for version in versions)
     _require(
