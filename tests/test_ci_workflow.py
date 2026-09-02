@@ -139,6 +139,19 @@ def test_lightweight_job_bootstraps_the_ci_contract_verifier() -> None:
 def test_stdlib_ci_contract_verifier_accepts_repository() -> None:
     verify_repository()
 
+    ci_workflow = _workflow_text(_CI_WORKFLOW_PATH)
+    full_workflow = _workflow_text(_FULL_WORKFLOW_PATH).replace(
+        'python -m pip install ".ci-dependencies/Photsim7[gpu]"',
+        "python -m pip install .ci-dependencies/Photsim7 "
+        '# python -m pip install ".ci-dependencies/Photsim7[gpu]"',
+    )
+    with (_ROOT / "pyproject.toml").open("rb") as stream:
+        project = tomllib.load(stream)["project"]
+    with (_ROOT / "ci" / "full_pytest_contract.toml").open("rb") as stream:
+        contract = tomllib.load(stream)
+    with pytest.raises(WorkflowContractError):
+        verify_workflow_text(ci_workflow, full_workflow, project, contract)
+
 
 @pytest.mark.parametrize(
     ("workflow_name", "before", "after"),

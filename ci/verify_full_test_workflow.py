@@ -90,6 +90,26 @@ def _require_checkout_credentials_disabled(step: str, name: str) -> None:
     )
 
 
+def _executable_run_lines(step: str, name: str) -> list[str]:
+    lines = step.splitlines()
+    run_positions = [
+        index for index, line in enumerate(lines) if line.startswith("        run:")
+    ]
+    _require(
+        len(run_positions) == 1 and lines[run_positions[0]] == "        run: |",
+        f"step {name!r} must use one literal multiline run block",
+    )
+    commands = []
+    for line in lines[run_positions[0] + 1 :]:
+        if not line.startswith("          "):
+            break
+        command = line[10:].strip()
+        if command and not command.startswith("#"):
+            commands.append(command)
+    _require(commands, f"step {name!r} must contain executable commands")
+    return commands
+
+
 def _verify_shared_workflow_controls(workflow: str) -> None:
     _require("permissions:\n  contents: read" in workflow, "contents must be read-only")
     _require("cancel-in-progress: true" in workflow, "stale CI runs must be cancelled")
@@ -205,12 +225,15 @@ def verify_workflow_text(
         "Check out frozen Photsim7 release",
     ):
         _require_checkout_credentials_disabled(full_steps[checkout_name], checkout_name)
+    install_step_name = "Install frozen CPU runtime and test dependencies"
+    install_commands = _executable_run_lines(
+        full_steps[install_step_name],
+        install_step_name,
+    )
     editable_installs = [
-        line.strip()
-        for line in full_steps[
-            "Install frozen CPU runtime and test dependencies"
-        ].splitlines()
-        if line.strip().startswith("python -m pip install -e")
+        command
+        for command in install_commands
+        if command.startswith("python -m pip install -e")
     ]
     _require(
         editable_installs == ['python -m pip install -e ".[test,release]"'],
@@ -218,7 +241,7 @@ def verify_workflow_text(
     )
     _require(
         'python -m pip install ".ci-dependencies/Photsim7[gpu]"'
-        in full_steps["Install frozen CPU runtime and test dependencies"],
+        in install_commands,
         "full-test must install the frozen Photsim7 GPU extra",
     )
     versions = contract["python_versions"]
