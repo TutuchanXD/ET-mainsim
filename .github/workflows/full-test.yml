@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: TutuchanXD/Photsim7
-          ref: d085a012b2e4765f16751c32af2212dbb1b60d19
+          ref: f722a9f65bcadcc798c1e8c6fa785d780ca3d8df
           path: .ci-dependencies/Photsim7
           ssh-key: ${{ secrets.PHOTSIM7_READ_ONLY_DEPLOY_KEY }}
           persist-credentials: false
@@ -62,7 +62,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.7,<3"
           python -m pip install .ci-dependencies/ET-coordinate
-          python -m pip install .ci-dependencies/Photsim7
+          python -m pip install ".ci-dependencies/Photsim7[gpu]"
           python -m pip install -e ".[test,release]"
           python -m pip check
       - name: Run complete hermetic test suite

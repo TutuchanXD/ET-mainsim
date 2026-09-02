@@ -89,7 +89,7 @@ def test_full_suite_uses_frozen_runtime_dependencies_and_no_science_data() -> No
     assert "repository: TutuchanXD/ET-coordinate" in block
     assert "ref: f9cec8038b021c9540a026b94e876dc3240071d1" in block
     assert "repository: TutuchanXD/Photsim7" in block
-    assert "ref: d085a012b2e4765f16751c32af2212dbb1b60d19" in block
+    assert "ref: f722a9f65bcadcc798c1e8c6fa785d780ca3d8df" in block
     assert "ssh-key: ${{ secrets.PHOTSIM7_READ_ONLY_DEPLOY_KEY }}" in block
     assert "ET_DATA_DIR: ${{ runner.temp }}/et-mainsim-ci-missing-data" in block
     assert "pull_request:" in workflow
@@ -106,6 +106,7 @@ def test_full_suite_uses_frozen_runtime_dependencies_and_no_science_data() -> No
 def test_full_suite_installs_release_tools_for_release_engineering_tests() -> None:
     block = _job_block(_workflow_text(_FULL_WORKFLOW_PATH), "full-test")
 
+    assert 'python -m pip install ".ci-dependencies/Photsim7[gpu]"' in block
     assert 'python -m pip install -e ".[test,release]"' in block
     assert 'python -m pip install -e ".[test]"' not in block
 
@@ -137,6 +138,43 @@ def test_lightweight_job_bootstraps_the_ci_contract_verifier() -> None:
 
 def test_stdlib_ci_contract_verifier_accepts_repository() -> None:
     verify_repository()
+
+    ci_workflow = _workflow_text(_CI_WORKFLOW_PATH)
+    full_workflow = _workflow_text(_FULL_WORKFLOW_PATH).replace(
+        'python -m pip install ".ci-dependencies/Photsim7[gpu]"',
+        "python -m pip install .ci-dependencies/Photsim7 "
+        '# python -m pip install ".ci-dependencies/Photsim7[gpu]"',
+    )
+    with (_ROOT / "pyproject.toml").open("rb") as stream:
+        project = tomllib.load(stream)["project"]
+    with (_ROOT / "ci" / "full_pytest_contract.toml").open("rb") as stream:
+        contract = tomllib.load(stream)
+    with pytest.raises(WorkflowContractError):
+        verify_workflow_text(ci_workflow, full_workflow, project, contract)
+
+    heredoc_workflow = _workflow_text(_FULL_WORKFLOW_PATH).replace(
+        'python -m pip install ".ci-dependencies/Photsim7[gpu]"',
+        "cat <<'EOF' >/dev/null\n"
+        '          python -m pip install ".ci-dependencies/Photsim7[gpu]"\n'
+        "          EOF",
+    )
+    with pytest.raises(WorkflowContractError):
+        verify_workflow_text(ci_workflow, heredoc_workflow, project, contract)
+
+    shell_override_workflow = _workflow_text(_FULL_WORKFLOW_PATH).replace(
+        "      - name: Install frozen CPU runtime and test dependencies\n"
+        "        run: |",
+        "      - name: Install frozen CPU runtime and test dependencies\n"
+        "        shell: 'true {0}'\n"
+        "        run: |",
+    )
+    with pytest.raises(WorkflowContractError):
+        verify_workflow_text(
+            ci_workflow,
+            shell_override_workflow,
+            project,
+            contract,
+        )
 
 
 @pytest.mark.parametrize(
