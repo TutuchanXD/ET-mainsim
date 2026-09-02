@@ -1270,6 +1270,14 @@ def test_release_contract_reuses_full_test_runtime_dependency_identity() -> None
         dependencies = tomllib.load(stream)["project"]["dependencies"]
     assert "et-coord>=0.1.2,<0.2" in dependencies
 
+    checklist = (ROOT / "docs" / "devs" / "v0.1.0_release_checklist.md").read_text(
+        encoding="utf-8"
+    )
+    photsim7 = contract["runtime_dependencies"]["photsim7"]
+    assert photsim7["commit"] in checklist
+    assert f"({photsim7['version']})" in checklist
+    assert "Photsim7[gpu]" in checklist
+
     galaxy_runtime = (
         ROOT / "src" / "et_mainsim" / "galaxy_stamp_production.py"
     ).read_text(encoding="utf-8")
