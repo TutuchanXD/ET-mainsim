@@ -230,6 +230,19 @@ def verify_workflow_text(
         full_steps[install_step_name],
         install_step_name,
     )
+    _require(
+        install_commands
+        == [
+            "python -m pip install --upgrade pip",
+            "python -m pip install --index-url "
+            'https://download.pytorch.org/whl/cpu "torch>=2.7,<3"',
+            "python -m pip install .ci-dependencies/ET-coordinate",
+            'python -m pip install ".ci-dependencies/Photsim7[gpu]"',
+            'python -m pip install -e ".[test,release]"',
+            "python -m pip check",
+        ],
+        "full-test dependency installation commands differ from the frozen sequence",
+    )
     editable_installs = [
         command
         for command in install_commands

@@ -152,6 +152,15 @@ def test_stdlib_ci_contract_verifier_accepts_repository() -> None:
     with pytest.raises(WorkflowContractError):
         verify_workflow_text(ci_workflow, full_workflow, project, contract)
 
+    heredoc_workflow = _workflow_text(_FULL_WORKFLOW_PATH).replace(
+        'python -m pip install ".ci-dependencies/Photsim7[gpu]"',
+        "cat <<'EOF' >/dev/null\n"
+        '          python -m pip install ".ci-dependencies/Photsim7[gpu]"\n'
+        "          EOF",
+    )
+    with pytest.raises(WorkflowContractError):
+        verify_workflow_text(ci_workflow, heredoc_workflow, project, contract)
+
 
 @pytest.mark.parametrize(
     ("workflow_name", "before", "after"),
