@@ -89,7 +89,7 @@ def test_full_suite_uses_frozen_runtime_dependencies_and_no_science_data() -> No
     assert "repository: TutuchanXD/ET-coordinate" in block
     assert "ref: f9cec8038b021c9540a026b94e876dc3240071d1" in block
     assert "repository: TutuchanXD/Photsim7" in block
-    assert "ref: f722a9f65bcadcc798c1e8c6fa785d780ca3d8df" in block
+    assert "ref: e29336d46d6380f6c8a72a8638fd3acec1d0c049" in block
     assert "ssh-key: ${{ secrets.PHOTSIM7_READ_ONLY_DEPLOY_KEY }}" in block
     assert "ET_DATA_DIR: ${{ runner.temp }}/et-mainsim-ci-missing-data" in block
     assert "pull_request:" in workflow
