@@ -32,9 +32,14 @@ maintained Galaxy producer.
 The current full-test and release-engineering contracts are validated against
 ET-coordinate commit `f9cec8038b021c9540a026b94e876dc3240071d1`
 (version 0.1.2) and Photsim7 commit
-`f722a9f65bcadcc798c1e8c6fa785d780ca3d8df` (version 0.4.0). Install those exact
+`e29336d46d6380f6c8a72a8638fd3acec1d0c049` (version 0.5.0). Install those exact
 dependency snapshots before installing the ET-mainsim wheel with `--no-deps`,
 then run `python -m pip check`.
+
+The maintained runtime requires `photsim7[gpu]>=0.5.0,<0.6`. Its imports use
+canonical or retained public APIs and do not require the 16 top-level facades
+removed in Photsim7 0.5.0. The GPU extra supplies the Torch/Kornia backend for
+both CPU and CUDA execution; CUDA availability is checked separately at runtime.
 
 The package import is lightweight and does not initialize Torch, Ray, CUDA,
 catalogs, or external assets.

@@ -33,8 +33,8 @@ version = "0.1.2"
 [runtime_dependencies.photsim7]
 distribution = "photsim7"
 repository = "TutuchanXD/Photsim7"
-commit = "f722a9f65bcadcc798c1e8c6fa785d780ca3d8df"
-version = "0.4.0"
+commit = "e29336d46d6380f6c8a72a8638fd3acec1d0c049"
+version = "0.5.0"
 
 [files]
 wheel = [
