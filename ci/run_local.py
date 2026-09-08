@@ -50,7 +50,7 @@ def dependency(name: str, sha: str, work: Path, env):
         run(['git', '-C', target, 'fetch', '--depth=1', url, sha], env=env)
         run(['git', '-C', target, 'checkout', '--detach', 'FETCH_HEAD'], env=env)
     observed = subprocess.check_output(['git', '-C', target, 'rev-parse', 'HEAD'], text=True).strip()
-    dirty = subprocess.check_output(['git', '-C', target, 'status', '--porcelain', '--untracked-files=no'], text=True)
+    dirty = subprocess.check_output(['git', '-C', target, 'status', '--porcelain', '--untracked-files=all'], text=True)
     if observed != sha or dirty:
         raise ValueError(f'{name} must be a clean checkout of frozen commit {sha}')
     return target

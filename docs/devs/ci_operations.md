@@ -49,7 +49,7 @@ python -m ci.verify_full_test_workflow
 Absolute interpreter paths are supported. Each invocation creates and deletes
 a fresh temporary **CI install-proof environment**; the developer's `etbase`
 is not modified. No system packages or old editable installation are reused.
-The standalone verifier uses CI-only `PyYAML==6.0.3`; smoke/full bootstrap it
+The standalone verifier uses CI-only `PyYAML==6.0.3`, declared in `[test]`; smoke/full bootstrap it
 automatically. Local full needs authorized ordinary Git SSH access to the
 private Photsim7 repository; it never creates, stores, or asks for a deploy key.
 Hosted checkouts continue to use the existing read-only deploy key.

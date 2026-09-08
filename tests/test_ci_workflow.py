@@ -55,6 +55,7 @@ def test_project_declares_pytest_test_extra() -> None:
     assert project["optional-dependencies"]["test"] == [
         "pandas>=2.2,<3",
         "pytest==9.0.3",
+        "PyYAML==6.0.3",
     ]
 
 
@@ -86,6 +87,37 @@ def test_local_full_entry_uses_frozen_dependencies_and_receipt_runner() -> None:
     assert env['ET_DATA_DIR'] == '/isolated/missing-data'
     assert env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] == '1'
     assert env['CUDA_VISIBLE_DEVICES'] == ''
+
+
+def test_smoke_wrapper_cannot_be_bypassed_with_ci_python():
+    import os
+    import subprocess
+    result = subprocess.run([str(_ROOT / 'scripts/ci/smoke.sh'), '--help'],
+                            env={**os.environ, 'CI_PYTHON': '/bin/true'},
+                            capture_output=True, text=True, check=True)
+    assert '--python' in result.stdout
+
+
+def test_test_extra_declares_yaml_parser():
+    with (_ROOT / 'pyproject.toml').open('rb') as stream:
+        project = tomllib.load(stream)['project']
+    assert 'PyYAML==6.0.3' in project['optional-dependencies']['test']
+
+
+def test_frozen_dependency_rejects_untracked_source_inputs(tmp_path, monkeypatch):
+    from ci import run_local
+    import subprocess
+    root = tmp_path / 'repo'
+    target = root / '.ci-dependencies/Photsim7'
+    target.mkdir(parents=True)
+    subprocess.run(['git', 'init', '-q', target], check=True)
+    subprocess.run(['git', '-C', target, '-c', 'user.name=CI Test', '-c',
+                    'user.email=test@example.invalid', 'commit', '--allow-empty', '-qm', 'fixture'], check=True)
+    sha = subprocess.check_output(['git', '-C', target, 'rev-parse', 'HEAD'], text=True).strip()
+    (target / 'unexpected_module.py').write_text('VALUE = 1\n')
+    monkeypatch.setattr(run_local, 'ROOT', root)
+    with pytest.raises(ValueError, match='clean checkout'):
+        run_local.dependency('Photsim7', sha, tmp_path, {})
 
 
 def test_ci_runs_unfiltered_full_suite_on_supported_python_versions() -> None:

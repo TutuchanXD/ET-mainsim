@@ -75,7 +75,7 @@ def _steps(job, actions, commands):
 
 
 def verify_workflow_text(ci_workflow, full_workflow, project, contract):
-    _require(project.get("optional-dependencies", {}).get("test") == ["pandas>=2.2,<3", "pytest==9.0.3"], "frozen test dependencies")
+    _require(project.get("optional-dependencies", {}).get("test") == ["pandas>=2.2,<3", "pytest==9.0.3", "PyYAML==6.0.3"], "frozen test dependencies")
     ci, full = _load(ci_workflow), _load(full_workflow)
     _require(set(ci["jobs"]) == {"package-boundary"}, "smoke job inventory")
     _require(set(full["jobs"]) == {"full-test", "full-test-gate"}, "full job inventory")
