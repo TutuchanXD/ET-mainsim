@@ -58,6 +58,36 @@ def test_project_declares_pytest_test_extra() -> None:
     ]
 
 
+def test_public_repository_rejects_persistent_self_hosted_runners() -> None:
+    with (_ROOT / 'pyproject.toml').open('rb') as stream:
+        project = tomllib.load(stream)['project']
+    with (_ROOT / 'ci/full_pytest_contract.toml').open('rb') as stream:
+        contract = tomllib.load(stream)
+    for target in ('ci', 'full'):
+        ci_text = _workflow_text(_CI_WORKFLOW_PATH)
+        full_text = _workflow_text(_FULL_WORKFLOW_PATH)
+        if target == 'ci':
+            ci_text = ci_text.replace('ubuntu-24.04', '[self-hosted, linux, x64]')
+        else:
+            full_text = full_text.replace('ubuntu-24.04', '[self-hosted, linux, x64]')
+        with pytest.raises(WorkflowContractError):
+            verify_workflow_text(ci_text, full_text, project, contract)
+
+
+def test_local_full_entry_uses_frozen_dependencies_and_receipt_runner() -> None:
+    from ci.run_local import install_plan, hermetic_environment
+    commands = install_plan(Path('/python'), Path('/repo'), Path('/coordinate'), Path('/photsim'))
+    assert any('https://download.pytorch.org/whl/cpu' in command for command in commands)
+    assert commands[-1][-2:] == ['pip', 'check']
+    assert any('/photsim[gpu]' in command for command in commands)
+    assert any('/repo[test,release]' in command for command in commands)
+    env = hermetic_environment(Path('/isolated'), {'PYTEST_ADDOPTS': '-k subset', 'ET_DATA_DIR': '/science'})
+    assert env['PYTEST_ADDOPTS'] == ''
+    assert env['ET_DATA_DIR'] == '/isolated/missing-data'
+    assert env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] == '1'
+    assert env['CUDA_VISIBLE_DEVICES'] == ''
+
+
 def test_ci_runs_unfiltered_full_suite_on_supported_python_versions() -> None:
     block = _job_block(_workflow_text(_FULL_WORKFLOW_PATH), "full-test")
 
@@ -65,7 +95,7 @@ def test_ci_runs_unfiltered_full_suite_on_supported_python_versions() -> None:
         r'python-version:\s*\["3\.12",\s*"3\.13"\]',
         block,
     )
-    assert "python -m ci.run_full_pytest" in block
+    assert "./scripts/ci/full.sh" in block
     assert "python -m pytest" not in block
     assert not re.search(
         r"(?:^|\s)(?:-k|--ignore|--deselect|--collect-only)(?:\s|=)",
@@ -104,11 +134,16 @@ def test_full_suite_uses_frozen_runtime_dependencies_and_no_science_data() -> No
 
 
 def test_full_suite_installs_release_tools_for_release_engineering_tests() -> None:
-    block = _job_block(_workflow_text(_FULL_WORKFLOW_PATH), "full-test")
-
-    assert 'python -m pip install ".ci-dependencies/Photsim7[gpu]"' in block
-    assert 'python -m pip install -e ".[test,release]"' in block
-    assert 'python -m pip install -e ".[test]"' not in block
+    from ci.run_local import install_plan
+    commands = install_plan(Path('/python'), Path('/repo'), Path('/coordinate'), Path('/photsim'))
+    assert commands == [
+        ['/python', '-m', 'pip', 'install', '--upgrade', 'pip'],
+        ['/python', '-m', 'pip', 'install', '--index-url', 'https://download.pytorch.org/whl/cpu', 'torch>=2.7,<3'],
+        ['/python', '-m', 'pip', 'install', '/coordinate'],
+        ['/python', '-m', 'pip', 'install', '/photsim[gpu]'],
+        ['/python', '-m', 'pip', 'install', '-e', '/repo[test,release]'],
+        ['/python', '-m', 'pip', 'check'],
+    ]
 
 
 def test_ci_actions_and_checkout_credentials_are_locked_down() -> None:
@@ -130,51 +165,33 @@ def test_ci_actions_and_checkout_credentials_are_locked_down() -> None:
 def test_lightweight_job_bootstraps_the_ci_contract_verifier() -> None:
     block = _job_block(_workflow_text(_CI_WORKFLOW_PATH), "package-boundary")
 
-    assert "python -m ci.verify_full_test_workflow" in block
-    assert "et-mainsim --version" in block
+    assert "./scripts/ci/smoke.sh" in block
+    source = (_ROOT / 'ci/run_local.py').read_text()
+    assert "'ci.verify_full_test_workflow'" in source
+    assert "'--version'" in source and "'--help'" in source
     assert (_ROOT / "ci" / "verify_full_test_workflow.py").is_file()
     assert (_ROOT / "ci" / "run_full_pytest.py").is_file()
 
 
 def test_stdlib_ci_contract_verifier_accepts_repository() -> None:
     verify_repository()
-
     ci_workflow = _workflow_text(_CI_WORKFLOW_PATH)
-    full_workflow = _workflow_text(_FULL_WORKFLOW_PATH).replace(
-        'python -m pip install ".ci-dependencies/Photsim7[gpu]"',
-        "python -m pip install .ci-dependencies/Photsim7 "
-        '# python -m pip install ".ci-dependencies/Photsim7[gpu]"',
-    )
+    full_workflow = _workflow_text(_FULL_WORKFLOW_PATH)
     with (_ROOT / "pyproject.toml").open("rb") as stream:
         project = tomllib.load(stream)["project"]
-    with (_ROOT / "ci" / "full_pytest_contract.toml").open("rb") as stream:
+    with (_ROOT / "ci/full_pytest_contract.toml").open("rb") as stream:
         contract = tomllib.load(stream)
-    with pytest.raises(WorkflowContractError):
-        verify_workflow_text(ci_workflow, full_workflow, project, contract)
-
-    heredoc_workflow = _workflow_text(_FULL_WORKFLOW_PATH).replace(
-        'python -m pip install ".ci-dependencies/Photsim7[gpu]"',
-        "cat <<'EOF' >/dev/null\n"
-        '          python -m pip install ".ci-dependencies/Photsim7[gpu]"\n'
-        "          EOF",
-    )
-    with pytest.raises(WorkflowContractError):
-        verify_workflow_text(ci_workflow, heredoc_workflow, project, contract)
-
-    shell_override_workflow = _workflow_text(_FULL_WORKFLOW_PATH).replace(
-        "      - name: Install frozen CPU runtime and test dependencies\n"
-        "        run: |",
-        "      - name: Install frozen CPU runtime and test dependencies\n"
-        "        shell: 'true {0}'\n"
-        "        run: |",
-    )
-    with pytest.raises(WorkflowContractError):
-        verify_workflow_text(
-            ci_workflow,
-            shell_override_workflow,
-            project,
-            contract,
-        )
+    # Comments/reformatting are not architecture; executable substitutions are.
+    verify_workflow_text(ci_workflow + "\n# harmless comment\n", full_workflow, project, contract)
+    for replacement in (
+        "run: echo skipped # ./scripts/ci/full.sh",
+        "run: |\n          cat <<'EOF'\n          ./scripts/ci/full.sh\n          EOF",
+        "shell: 'true {0}'\n        run: ./scripts/ci/full.sh",
+    ):
+        changed = full_workflow.replace("run: ./scripts/ci/full.sh", replacement)
+        assert changed != full_workflow
+        with pytest.raises(WorkflowContractError):
+            verify_workflow_text(ci_workflow, changed, project, contract)
 
 
 @pytest.mark.parametrize(
@@ -182,7 +199,7 @@ def test_stdlib_ci_contract_verifier_accepts_repository() -> None:
     [
         (
             "full",
-            "run: python -m ci.run_full_pytest",
+            "run: ./scripts/ci/full.sh",
             "run: python -m pytest -q",
         ),
         ("full", "timeout-minutes: 30", "continue-on-error: true"),
@@ -193,13 +210,13 @@ def test_stdlib_ci_contract_verifier_accepts_repository() -> None:
         ),
         (
             "full",
-            'python -m pip install -e ".[test,release]"',
-            'python -m pip install -e ".[test]"',
+            'run: ./scripts/ci/full.sh',
+            'run: ./scripts/ci/full.sh --skip-release-tools',
         ),
         (
             "ci",
-            "- name: Verify full-test CI contract\n        run:",
-            "- name: Verify full-test CI contract\n        if: ${{ false }}\n        run:",
+            "- name: Verify full-test CI contract and package boundary\n        run:",
+            "- name: Verify full-test CI contract and package boundary\n        if: ${{ false }}\n        run:",
         ),
         (
             "full",
@@ -236,13 +253,13 @@ def test_stdlib_ci_contract_verifier_accepts_repository() -> None:
         ),
         (
             "full",
-            "run: python -m ci.run_full_pytest",
-            "run: python -m ci.run_full_pytest || exit 0",
+            "run: ./scripts/ci/full.sh",
+            "run: ./scripts/ci/full.sh || exit 0",
         ),
         (
             "full",
-            "run: python -m ci.run_full_pytest",
-            "run: python -m ci.run_full_pytest; exit 0",
+            "run: ./scripts/ci/full.sh",
+            "run: ./scripts/ci/full.sh; exit 0",
         ),
         (
             "ci",
@@ -292,9 +309,9 @@ def test_stdlib_ci_contract_verifier_accepts_repository() -> None:
         ),
         (
             "full",
-            "      - name: Install frozen CPU runtime and test dependencies\n",
+            "      - name: Run complete hermetic test suite\n",
             "      - run: python -c \"print(123)\"\n"
-            "      - name: Install frozen CPU runtime and test dependencies\n",
+            "      - name: Run complete hermetic test suite\n",
         ),
     ],
 )
@@ -306,8 +323,10 @@ def test_stdlib_ci_contract_verifier_rejects_gate_bypasses(
     ci_workflow = _workflow_text(_CI_WORKFLOW_PATH)
     full_workflow = _workflow_text(_FULL_WORKFLOW_PATH)
     if workflow_name == "ci":
+        assert before in ci_workflow
         ci_workflow = ci_workflow.replace(before, after)
     else:
+        assert before in full_workflow
         full_workflow = full_workflow.replace(before, after)
     with (_ROOT / "pyproject.toml").open("rb") as stream:
         project = tomllib.load(stream)["project"]

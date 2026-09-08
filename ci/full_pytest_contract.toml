@@ -1,8 +1,9 @@
 schema_version = 1
 pytest_version = "9.0.3"
 python_versions = ["3.12", "3.13"]
-expected_collected = 992
-nodeid_sha256 = "623760b67f0dda5df4d7d50e6d28e3c901bcceba9928a7363979ba5239b7cf95"
+# CI-only additions and updated workflow mutation node IDs; scientific inventory unchanged.
+expected_collected = 994
+nodeid_sha256 = "6b85141d9d3a75f735b77abdd3ae37e5c96d5e7f03f1ed05c21b09b5cde5d06c"
 allowed_skips = [
   "tests/test_galaxy_delivery_notebooks.py::test_galaxy_delivery_notebook_is_a_read_only_raw_coverage_v2_consumer",
   "tests/test_galaxy_delivery_notebooks.py::test_galaxy_campaign_summary_notebook_only_consumes_atomic_raw_coverage_summary",

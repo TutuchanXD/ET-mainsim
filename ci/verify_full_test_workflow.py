@@ -1,3 +1,7 @@
+"""Validate CI security and execution invariants, not incidental YAML layout.
+
+PyYAML is installed by the canonical CI bootstrap (not a runtime dependency).
+"""
 from __future__ import annotations
 
 import re
@@ -5,392 +9,135 @@ import sys
 import tomllib
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
-CI_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "ci.yml"
-FULL_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "full-test.yml"
-CONTRACT_PATH = ROOT / "ci" / "full_pytest_contract.toml"
+CI_WORKFLOW_PATH = ROOT / ".github/workflows/ci.yml"
+FULL_WORKFLOW_PATH = ROOT / ".github/workflows/full-test.yml"
+CONTRACT_PATH = ROOT / "ci/full_pytest_contract.toml"
+TRUST = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
+ENVIRONMENT = "${{ github.event_name == 'pull_request' && 'full-test-pr-review' || 'full-test-private-dependency' }}"
 
 
 class WorkflowContractError(RuntimeError):
     pass
 
 
-def _require(condition: bool, message: str) -> None:
-    if not condition:
+def _require(value, message):
+    if not value:
         raise WorkflowContractError(message)
 
 
-def _job_block(workflow: str, name: str) -> str:
-    lines = workflow.splitlines()
-    marker = f"  {name}:"
+class UniqueLoader(yaml.BaseLoader):
+    def construct_mapping(self, node, deep=False):
+        keys = [self.construct_object(key, deep=deep) for key, _ in node.value]
+        _require(len(keys) == len(set(keys)), "duplicate YAML keys")
+        return super().construct_mapping(node, deep=deep)
+
+
+def _load(text):
     try:
-        start = lines.index(marker)
-    except ValueError as exc:
-        raise WorkflowContractError(f"CI workflow is missing the {name!r} job") from exc
-    end = len(lines)
-    for index in range(start + 1, len(lines)):
-        if re.fullmatch(r"  [A-Za-z0-9_-]+:", lines[index]):
-            end = index
-            break
-    return "\n".join(lines[start:end])
+        workflow = yaml.load(text, Loader=UniqueLoader)
+        _require(set(workflow["on"]) == {"pull_request", "push", "workflow_dispatch"}, "trusted event set")
+        _require(workflow["on"]["push"] == {"branches": ["main"]}, "main push boundary")
+        _require(workflow["on"]["pull_request"] == "" and workflow["on"]["workflow_dispatch"] == "", "unfiltered PR and dispatch")
+        _require(workflow["permissions"] == {"contents": "read"}, "read-only token")
+        _require(workflow["concurrency"]["cancel-in-progress"] == "true", "cancel stale runs")
+        _require("defaults" not in workflow, "no shell/environment overrides")
+        _require("continue-on-error" not in text and "|| true" not in text, "failure masking")
+        for job in workflow["jobs"].values():
+            _require(job["runs-on"] == "ubuntu-24.04", "public repository must use standard hosted VMs")
+            _require("permissions" not in job and "defaults" not in job, "no job permission/shell overrides")
+            for step in job["steps"]:
+                _require("name" in step and "shell" not in step, "named steps, no shell overrides")
+                _require(not ({"working-directory", "continue-on-error"} & step.keys()), "no execution overrides")
+                if "uses" in step:
+                    action, sha = step["uses"].rsplit("@", 1)
+                    _require(re.fullmatch("[0-9a-f]{40}", sha), "immutable action SHA")
+                    if action == "actions/checkout":
+                        _require(step["with"].get("persist-credentials") == "false", "credential-free checkout")
+        return workflow
+    except (KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+        raise WorkflowContractError("invalid workflow structure") from exc
 
 
-def _step_blocks(job: str) -> list[tuple[str, str]]:
-    lines = job.splitlines()
-    step_lines = [line for line in lines if line.startswith("      - ")]
-    _require(
-        all(re.fullmatch(r"      - name: .+", line) for line in step_lines),
-        "every CI step must be named and part of the frozen sequence",
-    )
-    starts = [
-        (index, match.group(1))
-        for index, line in enumerate(lines)
-        if (match := re.fullmatch(r"      - name: (.+)", line))
-    ]
-    steps = []
-    for position, (start, name) in enumerate(starts):
-        end = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
-        steps.append((name, "\n".join(lines[start:end])))
+def _steps(job, actions, commands):
+    steps = job["steps"]
+    _require([s.get("uses", "").split("@")[0] for s in steps if "uses" in s] == actions, "action sequence")
+    _require([s["run"] for s in steps if "run" in s] == commands, "canonical unfiltered commands")
+    _require(len(steps) == len(actions) + len(commands), "unexpected executable step")
+    for step in steps:
+        if step.get("uses", "").startswith("actions/upload-artifact@"):
+            _require(step.get("if") == "always()", "receipt upload even on failure")
+        else:
+            _require("if" not in step, "critical steps must not be skipped")
     return steps
 
 
-def _require_step_contract(
-    job: str,
-    expected_names: tuple[str, ...],
-    allowed_conditions: dict[str, str] | None = None,
-) -> dict[str, str]:
-    steps = _step_blocks(job)
-    names = tuple(name for name, _block in steps)
-    _require(names == expected_names, "CI job steps differ from the frozen sequence")
-    blocks = dict(steps)
-    allowed_conditions = allowed_conditions or {}
-    for name, block in steps:
-        conditions = [
-            line.strip()
-            for line in block.splitlines()
-            if line.startswith("        if:")
-        ]
-        expected = allowed_conditions.get(name)
-        if expected is None:
-            _require(not conditions, f"critical step {name!r} must be unconditional")
-        else:
-            _require(conditions == [expected], f"step {name!r} has an unsafe condition")
-    return blocks
+def verify_workflow_text(ci_workflow, full_workflow, project, contract):
+    _require(project.get("optional-dependencies", {}).get("test") == ["pandas>=2.2,<3", "pytest==9.0.3"], "frozen test dependencies")
+    ci, full = _load(ci_workflow), _load(full_workflow)
+    _require(set(ci["jobs"]) == {"package-boundary"}, "smoke job inventory")
+    _require(set(full["jobs"]) == {"full-test", "full-test-gate"}, "full job inventory")
+    package = ci["jobs"]["package-boundary"]
+    _require(package["name"] == "package-boundary / py${{ matrix.python-version }}" and "if" not in package, "required smoke check")
+    _require(package["strategy"]["matrix"] == {"python-version": contract["python_versions"]}, "dual Python smoke")
+    _require(package["strategy"]["fail-fast"] == "false", "complete smoke matrix")
+    smoke_steps = _steps(package, ["actions/checkout", "actions/setup-python"], ["./scripts/ci/smoke.sh"])
+    _require(smoke_steps[0]["with"] == {"persist-credentials": "false"}, "event checkout")
+    _require(smoke_steps[1]["with"]["python-version"] == "${{ matrix.python-version }}", "smoke interpreter")
+    job = full["jobs"]["full-test"]
+    _require(job["name"] == "full-test / py${{ matrix.python-version }}", "full check names")
+    _require(job.get("if") == TRUST, "fork boundary")
+    _require(job.get("environment") == {"name": ENVIRONMENT}, "reviewed private-dependency environments")
+    _require(job["strategy"]["matrix"] == {"python-version": contract["python_versions"]}, "full Python matrix")
+    _require(job["strategy"]["fail-fast"] == "false", "complete full matrix")
+    steps = _steps(job, ["actions/checkout"]*3 + ["actions/setup-python", "actions/upload-artifact"], ["./scripts/ci/full.sh"])
+    _require(steps[0]["with"] == {"persist-credentials": "false"}, "trusted event ref")
+    for step, name, key in [(steps[1], "ET-coordinate", "et_coordinate_commit"), (steps[2], "Photsim7", "photsim7_commit")]:
+        settings = {"repository": f"TutuchanXD/{name}", "ref": contract["dependencies"][key],
+                    "path": f".ci-dependencies/{name}", "persist-credentials": "false"}
+        if name == "Photsim7":
+            settings["ssh-key"] = "${{ secrets.PHOTSIM7_READ_ONLY_DEPLOY_KEY }}"
+        _require(step["with"] == settings, "frozen dependency / read-only deploy key")
+    _require(steps[3]["with"]["python-version"] == "${{ matrix.python-version }}", "full interpreter")
+    _require(steps[4].get("env") == {
+        "CUDA_VISIBLE_DEVICES": "",
+        "ET_DATA_DIR": "${{ runner.temp }}/et-mainsim-ci-missing-data",
+        "FULL_PYTEST_RECEIPT": "${{ runner.temp }}/full-pytest-receipt-py${{ matrix.python-version }}.json",
+        "MPLBACKEND": "Agg", "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTEST_ADDOPTS": "",
+    }, "hermetic execution and receipt binding")
+    _require(steps[5]["with"] == {
+        "name": "full-pytest-receipt-py${{ matrix.python-version }}",
+        "path": "${{ runner.temp }}/full-pytest-receipt-py${{ matrix.python-version }}.json",
+        "if-no-files-found": "error", "retention-days": "14",
+    }, "receipt upload semantics")
+    gate = full["jobs"]["full-test-gate"]
+    _require(gate["name"] == "full-test-gate" and gate.get("if") == "always()" and gate.get("needs") == "full-test", "always instantiated required gate")
+    _require("environment" not in gate, "gate cannot receive private secrets")
+    gate_steps = _steps(gate, ["actions/checkout"], ["python -m ci.run_full_test_gate"])
+    _require(gate_steps[0]["with"] == {"persist-credentials": "false"}, "gate event checkout")
+    _require(gate_steps[1].get("env") == {
+        "FULL_TEST_EVENT_NAME": "${{ github.event_name }}",
+        "FULL_TEST_RESULT": "${{ needs.full-test.result }}",
+        "FULL_TEST_SAME_REPOSITORY_PR": "${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}",
+    }, "gate event result bindings")
 
 
-def _require_checkout_credentials_disabled(step: str, name: str) -> None:
-    settings = [
-        line.strip()
-        for line in step.splitlines()
-        if line.startswith("          persist-credentials:")
-    ]
-    _require(
-        settings == ["persist-credentials: false"],
-        f"checkout step {name!r} must disable credential persistence",
-    )
-
-
-def _executable_run_lines(step: str, name: str) -> list[str]:
-    lines = step.splitlines()
-    run_positions = [
-        index for index, line in enumerate(lines) if line.startswith("        run:")
-    ]
-    _require(
-        len(run_positions) == 1 and lines[run_positions[0]] == "        run: |",
-        f"step {name!r} must use one literal multiline run block",
-    )
-    commands = []
-    for line in lines[run_positions[0] + 1 :]:
-        if not line.startswith("          "):
-            break
-        command = line[10:].strip()
-        if command and not command.startswith("#"):
-            commands.append(command)
-    _require(commands, f"step {name!r} must contain executable commands")
-    return commands
-
-
-def _verify_shared_workflow_controls(workflow: str) -> None:
-    _require("permissions:\n  contents: read" in workflow, "contents must be read-only")
-    _require("cancel-in-progress: true" in workflow, "stale CI runs must be cancelled")
-    _require("continue-on-error" not in workflow, "CI must not tolerate step failures")
-    _require("|| true" not in workflow, "CI commands must not mask failures")
-
-    action_refs = re.findall(
-        r"^\s+(?:-\s+)?uses:\s+\S+@(\S+?)(?:\s+#.*)?$",
-        workflow,
-        re.MULTILINE,
-    )
-    _require(bool(action_refs), "CI must use explicit actions")
-    _require(
-        all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in action_refs),
-        "every GitHub Action must be pinned to an immutable commit",
-    )
-
-
-def _require_frozen_triggers(workflow: str) -> None:
-    trigger_block = workflow.split("\non:\n", 1)
-    _require(len(trigger_block) == 2, "workflow must declare its triggers once")
-    actual = trigger_block[1].split("\npermissions:\n", 1)
-    _require(len(actual) == 2, "workflow trigger block is malformed")
-    _require(
-        actual[0]
-        == "  pull_request:\n"
-        "  push:\n"
-        "    branches: [main]\n"
-        "  workflow_dispatch:\n",
-        "workflow triggers differ from the frozen trusted event set",
-    )
-
-
-def verify_workflow_text(
-    ci_workflow: str,
-    full_workflow: str,
-    project: dict,
-    contract: dict,
-) -> None:
-    test_dependencies = project.get("optional-dependencies", {}).get("test")
-    _require(
-        test_dependencies == ["pandas>=2.2,<3", "pytest==9.0.3"],
-        "project.test must freeze the direct test dependencies",
-    )
-
-    _verify_shared_workflow_controls(ci_workflow)
-    _verify_shared_workflow_controls(full_workflow)
-    _require_frozen_triggers(ci_workflow)
-    _require_frozen_triggers(full_workflow)
-
-    package = _job_block(ci_workflow, "package-boundary")
-    _require("\n    if:" not in package, "package-boundary must not be skipped")
-    package_steps = _require_step_contract(
-        package,
-        (
-            "Check out ET-mainsim",
-            "Set up Python",
-            "Verify full-test CI contract",
-            "Build package without private integration dependency",
-            "Verify lightweight boundary",
-        ),
-    )
-    _require_checkout_credentials_disabled(
-        package_steps["Check out ET-mainsim"], "package-boundary ET-mainsim"
-    )
-    _require(
-        [
-            line.strip()
-            for line in package_steps["Verify full-test CI contract"].splitlines()
-            if line.startswith("        run:")
-        ]
-        == ["run: python -m ci.verify_full_test_workflow"],
-        "package-boundary must bootstrap the full-test contract verifier",
-    )
-
-    full = _job_block(full_workflow, "full-test")
-    job_header = full.split("\n    steps:", 1)[0]
-    job_conditions = [
-        line.strip() for line in job_header.splitlines() if line.startswith("    if:")
-    ]
-    _require(
-        job_conditions
-        == [
-            "if: github.event_name != 'pull_request' || "
-            "github.event.pull_request.head.repo.full_name == github.repository"
-        ],
-        "full-test must skip untrusted fork pull requests",
-    )
-    _require(
-        "environment:\n      name: ${{ github.event_name == 'pull_request' && "
-        "'full-test-pr-review' || 'full-test-private-dependency' }}"
-        in job_header,
-        "full-test must select the reviewed PR or main-only environment",
-    )
-    full_steps = _require_step_contract(
-        full,
-        (
-            "Check out ET-mainsim",
-            "Check out frozen ET-coordinate",
-            "Check out frozen Photsim7 release",
-            "Set up Python",
-            "Install frozen CPU runtime and test dependencies",
-            "Run complete hermetic test suite",
-            "Upload full-test receipt",
-        ),
-        {
-            "Upload full-test receipt": "if: always()",
-        },
-    )
-    for checkout_name in (
-        "Check out ET-mainsim",
-        "Check out frozen ET-coordinate",
-        "Check out frozen Photsim7 release",
-    ):
-        _require_checkout_credentials_disabled(full_steps[checkout_name], checkout_name)
-    install_step_name = "Install frozen CPU runtime and test dependencies"
-    expected_install_step = (
-        "      - name: Install frozen CPU runtime and test dependencies\n"
-        "        run: |\n"
-        "          python -m pip install --upgrade pip\n"
-        "          python -m pip install --index-url "
-        "https://download.pytorch.org/whl/cpu \"torch>=2.7,<3\"\n"
-        "          python -m pip install .ci-dependencies/ET-coordinate\n"
-        "          python -m pip install \".ci-dependencies/Photsim7[gpu]\"\n"
-        "          python -m pip install -e \".[test,release]\"\n"
-        "          python -m pip check"
-    )
-    _require(
-        full_steps[install_step_name] == expected_install_step,
-        "full-test dependency installation step differs from the frozen YAML block",
-    )
-    install_commands = _executable_run_lines(
-        full_steps[install_step_name],
-        install_step_name,
-    )
-    _require(
-        install_commands
-        == [
-            "python -m pip install --upgrade pip",
-            "python -m pip install --index-url "
-            'https://download.pytorch.org/whl/cpu "torch>=2.7,<3"',
-            "python -m pip install .ci-dependencies/ET-coordinate",
-            'python -m pip install ".ci-dependencies/Photsim7[gpu]"',
-            'python -m pip install -e ".[test,release]"',
-            "python -m pip check",
-        ],
-        "full-test dependency installation commands differ from the frozen sequence",
-    )
-    editable_installs = [
-        command
-        for command in install_commands
-        if command.startswith("python -m pip install -e")
-    ]
-    _require(
-        editable_installs == ['python -m pip install -e ".[test,release]"'],
-        "full-test must install both the frozen test and release tool extras",
-    )
-    _require(
-        'python -m pip install ".ci-dependencies/Photsim7[gpu]"'
-        in install_commands,
-        "full-test must install the frozen Photsim7 GPU extra",
-    )
-    versions = contract["python_versions"]
-    matrix = ", ".join(f'"{version}"' for version in versions)
-    _require(
-        f"python-version: [{matrix}]" in full,
-        "full-test must cover every supported Python version",
-    )
-    _require(
-        [
-            line.strip()
-            for line in full_steps["Run complete hermetic test suite"].splitlines()
-            if line.startswith("        run:")
-        ]
-        == ["run: python -m ci.run_full_pytest"],
-        "full-test must invoke the controlled pytest runner exactly once",
-    )
-    _require(
-        "\n          ref:" not in full_steps["Check out ET-mainsim"],
-        "ET-mainsim must be checked out from the trusted event ref",
-    )
-    _require("python -m pytest" not in full, "workflow must not bypass the runner")
-    _require(
-        "PYTEST_ADDOPTS: \"\"" in full,
-        "ambient pytest options must be disabled",
-    )
-    _require(
-        "PYTEST_DISABLE_PLUGIN_AUTOLOAD: \"1\"" in full,
-        "third-party pytest plugin autoload must be disabled",
-    )
-    for selector in (" -k ", "--ignore", "--deselect", "--collect-only"):
-        _require(selector not in full, f"full-test must not filter tests with {selector!r}")
-
-    dependencies = contract["dependencies"]
-    for repository, key in (
-        ("TutuchanXD/ET-coordinate", "et_coordinate_commit"),
-        ("TutuchanXD/Photsim7", "photsim7_commit"),
-    ):
-        _require(f"repository: {repository}" in full, f"missing checkout for {repository}")
-        _require(
-            f"ref: {dependencies[key]}" in full,
-            f"{repository} must be checked out at its frozen commit",
-        )
-    _require(
-        "ssh-key: ${{ secrets.PHOTSIM7_READ_ONLY_DEPLOY_KEY }}" in full,
-        "the private dependency must use the read-only deploy key",
-    )
-    _require(
-        "ET_DATA_DIR: ${{ runner.temp }}/et-mainsim-ci-missing-data" in full,
-        "the full suite must prove it does not require scientific data assets",
-    )
-    _require(
-        "CUDA_VISIBLE_DEVICES: \"\"" in full,
-        "the full suite must stay on the CPU path",
-    )
-    _require("python -m pip check" in full, "installed dependencies must be checked")
-    _require(
-        "actions/upload-artifact@" in full and "if: always()" in full,
-        "the test receipt must be uploaded even after a failure",
-    )
-    _require(
-        "if-no-files-found: error" in full_steps["Upload full-test receipt"],
-        "a missing full-test receipt must fail the job",
-    )
-
-    gate = _job_block(full_workflow, "full-test-gate")
-    gate_header = gate.split("\n    steps:", 1)[0]
-    _require(
-        [line.strip() for line in gate_header.splitlines() if line.startswith("    if:")]
-        == ["if: always()"],
-        "full-test-gate must run even when the private matrix is skipped",
-    )
-    _require("\n    needs: full-test" in gate_header, "full-test-gate must depend on the matrix")
-    _require("\n    environment:" not in gate_header, "full-test-gate must not receive secrets")
-    gate_steps = _require_step_contract(
-        gate,
-        (
-            "Check out ET-mainsim",
-            "Evaluate full-test result",
-        ),
-    )
-    _require_checkout_credentials_disabled(
-        gate_steps["Check out ET-mainsim"], "full-test-gate ET-mainsim"
-    )
-    evaluator = gate_steps["Evaluate full-test result"]
-    for required in (
-        "FULL_TEST_EVENT_NAME: ${{ github.event_name }}",
-        "FULL_TEST_RESULT: ${{ needs.full-test.result }}",
-        "FULL_TEST_SAME_REPOSITORY_PR: ${{ github.event_name == 'pull_request' && "
-        "github.event.pull_request.head.repo.full_name == github.repository }}",
-    ):
-        _require(required in evaluator, "full-test-gate event binding is incomplete")
-    _require(
-        [
-            line.strip()
-            for line in evaluator.splitlines()
-            if line.startswith("        run:")
-        ]
-        == ["run: python -m ci.run_full_test_gate"],
-        "full-test-gate must invoke the controlled evaluator exactly once",
-    )
-
-
-def verify_repository(root: Path = ROOT) -> None:
-    ci_workflow = (root / ".github" / "workflows" / "ci.yml").read_text(
-        encoding="utf-8"
-    )
-    full_workflow = (root / ".github" / "workflows" / "full-test.yml").read_text(
-        encoding="utf-8"
-    )
+def verify_repository(root=ROOT):
     with (root / "pyproject.toml").open("rb") as stream:
         project = tomllib.load(stream)["project"]
-    with (root / "ci" / "full_pytest_contract.toml").open("rb") as stream:
+    with (root / "ci/full_pytest_contract.toml").open("rb") as stream:
         contract = tomllib.load(stream)
-    verify_workflow_text(ci_workflow, full_workflow, project, contract)
+    verify_workflow_text((root / ".github/workflows/ci.yml").read_text(),
+                         (root / ".github/workflows/full-test.yml").read_text(), project, contract)
 
 
-def main() -> int:
+def main():
     try:
         verify_repository()
-    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError, WorkflowContractError) as exc:
+    except (OSError, KeyError, TypeError, WorkflowContractError) as exc:
         print(f"full-test CI contract rejected: {exc}", file=sys.stderr)
         return 1
     print("full-test CI contract verified")
