@@ -23,6 +23,7 @@ dependencies = [
 test = [
   "pandas>=2.2,<3",
   "pytest==9.0.3",
+  "PyYAML==6.0.3",
 ]
 release = [
   "build==1.5.0",

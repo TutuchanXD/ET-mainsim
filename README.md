@@ -44,6 +44,18 @@ both CPU and CUDA execution; CUDA availability is checked separately at runtime.
 The package import is lightweight and does not initialize Torch, Ray, CUDA,
 catalogs, or external assets.
 
+### CI and local verification
+
+With `etbase` activated, `./scripts/ci/smoke.sh` and `./scripts/ci/full.sh`
+invoke the same isolated CI bootstrap as GitHub Actions. Use `--python
+python3.13` for the other supported interpreter. Full verification installs
+the frozen dependency snapshots and runs the complete receipt-checked suite;
+it does not modify the developer environment.
+
+ET-mainsim is public; persistent self-hosted runners are intentionally not attached to the repository.
+See [CI operations](docs/devs/ci_operations.md) for the hosted security model,
+private-dependency review boundary, local commands, and unchanged required checks.
+
 ### Developer: continuous time-shard planning
 
 The generic `et-stamp` CLI still uses its historical target-worker model, but
