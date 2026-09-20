@@ -10,5 +10,6 @@ graft scripts
 graft slurm
 graft src
 graft tests
+graft validation
 graft tools
 global-exclude __pycache__ *.py[cod]

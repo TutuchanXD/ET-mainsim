@@ -33,8 +33,8 @@ version = "0.1.2"
 [runtime_dependencies.photsim7]
 distribution = "photsim7"
 repository = "TutuchanXD/Photsim7"
-commit = "e29336d46d6380f6c8a72a8638fd3acec1d0c049"
-version = "0.5.0"
+commit = "869a2d5b92916ff6b0470cc6c271aca6a6f05ac8"
+version = "0.5.1"
 
 [files]
 wheel = [
@@ -50,6 +50,7 @@ wheel = [
   "et_mainsim/galaxy_stamp_production.py",
   "et_mainsim/independent_stamp_production.py",
   "et_mainsim/manifest.py",
+  "et_mainsim/inputs.py",
   "et_mainsim/notebook_report_assets.py",
   "et_mainsim/presets/__init__.py",
   "et_mainsim/presets/et_full_frame_production.run.toml",
@@ -120,6 +121,8 @@ sdist = [
   "docs/assets/source-variability-validation.png",
   "docs/continuous_time_shards.md",
   "docs/devs/ci_operations.md",
+  "docs/devs/configurable_inputs_rng_integration_plan_zh.md",
+  "docs/configurable_inputs_zh.md",
   "docs/devs/et_mainsim_four_pr_maintenance_plan.md",
   "docs/devs/v0.1.0_release_checklist.md",
   "docs/examples/et_full_frame_shared_exposure.run.toml",
@@ -175,6 +178,7 @@ sdist = [
   "src/et_mainsim/galaxy_stamp_production.py",
   "src/et_mainsim/independent_stamp_production.py",
   "src/et_mainsim/manifest.py",
+  "src/et_mainsim/inputs.py",
   "src/et_mainsim/notebook_report_assets.py",
   "src/et_mainsim/presets/__init__.py",
   "src/et_mainsim/presets/et_full_frame_production.run.toml",
@@ -228,6 +232,9 @@ sdist = [
   "tests/test_independent_stamp_production.py",
   "tests/test_legacy_app_workflow.py",
   "tests/test_manifest.py",
+  "tests/test_shared_exposure_scheduling.py",
+  "tests/test_run_input_identity.py",
+  "tests/test_configurable_inputs.py",
   "tests/test_notebook_report_assets.py",
   "tests/test_presets.py",
   "tests/test_provenance.py",
@@ -252,6 +259,7 @@ sdist = [
   "tests/test_standard_stamp_analysis.py",
   "tests/test_thermal_benchmark.py",
   "tests/test_time_shards.py",
+  "validation/test_s3_real_assets.py",
   "tools/artifact_readback/README.md",
   "tools/artifact_readback/export_last90_truth_tables.py",
 ]

@@ -18,7 +18,18 @@ _TRANSITIONS = {
     "completed": frozenset(),
 }
 _NON_IDENTITY_EXECUTION_FIELDS = frozenset(
-    {"resume", "overwrite", "force_catalog_cache", "progress"}
+    {
+        "resume",
+        "overwrite",
+        "force_catalog_cache",
+        "progress",
+        "workers_per_device",
+        "gpu_ids",
+        "ray_actor_count",
+        "ray_num_cpus",
+        "ray_num_gpus",
+        "backend",
+    }
 )
 
 
@@ -36,6 +47,18 @@ def _execution_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
         for name, value in payload.items()
         if name not in _NON_IDENTITY_EXECUTION_FIELDS
     }
+
+
+def _scientific_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
+    result = deepcopy(dict(payload))
+    for field in (
+        "warp_frame_batch_size",
+        "image_gen_batch_size",
+        "image_proc_batch_size",
+    ):
+        result.get("psf", {}).pop(field, None)
+    result.get("dynamic_effects", {}).get("psd_motion", {}).pop("chunk_size", None)
+    return result
 
 
 def _json_default(value: Any) -> Any:
@@ -107,6 +130,7 @@ class RunManifestStore:
         provenance: Mapping[str, Any],
         workload: Mapping[str, Any] | None = None,
         artifacts: Mapping[str, Any] | None = None,
+        input_identity: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if self.path.exists():
             raise FileExistsError(f"Run manifest already exists: {self.path}")
@@ -130,6 +154,7 @@ class RunManifestStore:
             "workload": deepcopy(dict(workload or {})),
             "frame_plan": deepcopy(dict(frame_plan)),
             "provenance": deepcopy(dict(provenance)),
+            "input_identity": deepcopy(input_identity),
             "catalog": None,
             "artifacts": deepcopy(dict(artifacts or {})),
             "completion": None,
@@ -147,13 +172,45 @@ class RunManifestStore:
         simulation_spec: Mapping[str, Any],
         execution: Mapping[str, Any],
         workload: Mapping[str, Any] | None = None,
+        input_identity: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = self.load()
+        previous_inputs = payload.get("input_identity")
+        catalog_stage = (payload.get("completion") or {}).get("catalog_only") is True
+
+        def catalog_inputs(value):
+            result = deepcopy(dict(value))
+            result.pop("assets", None)
+            if isinstance(result.get("runtime"), Mapping):
+                result["runtime"].pop("rendering", None)
+            return result
+
+        promoting_catalog = (
+            catalog_stage
+            and isinstance(previous_inputs, Mapping)
+            and previous_inputs.get("assets") == {}
+            and isinstance(input_identity, Mapping)
+            and catalog_inputs(previous_inputs) == catalog_inputs(input_identity)
+        )
+        if previous_inputs != input_identity and not promoting_catalog:
+            raise ManifestIdentityError(
+                "Existing run input identity conflicts or lacks evidence; use a new run id"
+            )
         if payload["workflow"] != workflow or payload["run_id"] != run_id:
             raise ManifestIdentityError("Existing run workflow or run id conflicts")
-        if payload["simulation_spec"] != dict(simulation_spec):
+        previous_spec = _scientific_identity(payload["simulation_spec"])
+        current_spec = _scientific_identity(simulation_spec)
+        previous_execution = _execution_identity(payload["execution"])
+        current_execution = _execution_identity(execution)
+        if promoting_catalog:
+            for value in (previous_spec, current_spec):
+                value.get("psf", {}).pop("compute_device", None)
+            for value in (previous_execution, current_execution):
+                value.pop("device", None)
+                value.pop("preview_count", None)
+        if previous_spec != current_spec:
             raise ManifestIdentityError("Existing run scientific spec conflicts")
-        if _execution_identity(payload["execution"]) != _execution_identity(execution):
+        if previous_execution != current_execution:
             raise ManifestIdentityError("Existing run execution identity conflicts")
         if payload.get("workload", {}) != dict(workload or {}):
             raise ManifestIdentityError("Existing run workload identity conflicts")
@@ -189,15 +246,21 @@ class RunManifestStore:
         self,
         *,
         control: Mapping[str, Any] | None = None,
+        recover_running: bool = False,
+        input_identity: Mapping[str, Any] | None = None,
+        simulation_spec: Mapping[str, Any] | None = None,
+        execution: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = self.load()
         previous_status = str(payload["status"])
-        if previous_status == "running":
+        if previous_status == "running" and not recover_running:
             raise ValueError("Run is already running")
-        if previous_status not in {"planned", "completed", "failed"}:
+        if previous_status not in {"planned", "completed", "failed", "running"}:
             raise ValueError(f"Cannot start an attempt from {previous_status!r}")
         now = _utc_now()
         attempts = payload.setdefault("attempts", [])
+        if previous_status == "running" and attempts:
+            attempts[-1].update(status="interrupted", ended_at=now)
         attempts.append(
             {
                 "number": len(attempts) + 1,
@@ -215,6 +278,15 @@ class RunManifestStore:
         payload["timestamps"]["completed_at"] = None
         payload["timestamps"]["failed_at"] = None
         payload["timestamps"]["updated_at"] = now
+        # A staged run must never expose "running" with the old catalog-only
+        # baseline: a crash before a second write would prevent recovery.
+        for name, value in (
+            ("input_identity", input_identity),
+            ("simulation_spec", simulation_spec),
+            ("execution", execution),
+        ):
+            if value is not None:
+                payload[name] = deepcopy(dict(value))
         _atomic_write_json(self.path, payload)
         return payload
 

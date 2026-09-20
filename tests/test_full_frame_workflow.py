@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from astropy import units as u
+from photsim7.data_registry import DataRegistry
 
 
 def _unavailable_selection_marker(
@@ -434,6 +435,8 @@ def test_six_scope_run_manifest_and_completion_use_scope_products(
     tmp_path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr("et_mainsim.inputs.collect_run_inputs", lambda *args, **kwargs: {"assets": {}})
+    monkeypatch.setattr("et_mainsim.inputs.record_catalog_identity", lambda *args: None)
     from et_mainsim.config import (
         EXECUTION_SCHEMA_ID,
         EXECUTION_SCHEMA_VERSION,
@@ -530,6 +533,8 @@ def test_six_scope_manifest_namespaces_shared_exposure_artifacts(
 ) -> None:
     """The coordinator advertises scope-local crop products, never a sum."""
 
+    monkeypatch.setattr("et_mainsim.inputs.collect_run_inputs", lambda *args, **kwargs: {"assets": {}})
+    monkeypatch.setattr("et_mainsim.inputs.record_catalog_identity", lambda *args: None)
     from et_mainsim.config import (
         EXECUTION_SCHEMA_ID,
         EXECUTION_SCHEMA_VERSION,
@@ -869,7 +874,7 @@ def test_direct_fresh_worker_refuses_existing_shared_bundle_without_parent(
         run_worker(fresh_request, science_api=api)
 
 
-def test_shared_exposure_batches_preserve_rank_stride_order_and_full_hash(
+def test_shared_exposure_batches_preserve_global_frame_order_and_full_hash(
     tmp_path,
 ) -> None:
     from et_mainsim.config import ExecutionConfig, SharedExposureStampsConfig
@@ -877,6 +882,7 @@ def test_shared_exposure_batches_preserve_rank_stride_order_and_full_hash(
         WorkerRequest,
         _canonical_shared_exposure_batch_key,
         _shared_exposure_frame_batches,
+        _assigned_frame_indices,
     )
     from photsim7.spec_factories import make_et_main_detector_spec
 
@@ -897,12 +903,12 @@ def test_shared_exposure_batches_preserve_rank_stride_order_and_full_hash(
         rank=1,
         world_size=2,
     )
-    assigned = request.frame_indices[request.rank :: request.world_size]
+    assigned = _assigned_frame_indices(request)
 
     batches = _shared_exposure_frame_batches(request, assigned)
 
-    assert assigned == (3, 1, 2)
-    assert [batch.frame_ids for batch in batches] == [(3, 1), (2,)]
+    assert assigned == (8, 1)
+    assert [batch.frame_ids for batch in batches] == [(8, 1)]
     for batch in batches:
         payload, content_sha256 = _canonical_shared_exposure_batch_key(
             rank=request.rank,
@@ -912,9 +918,7 @@ def test_shared_exposure_batches_preserve_rank_stride_order_and_full_hash(
             frame_ids=batch.frame_ids,
         )
         assert payload == {
-            "schema_id": "et_mainsim.shared_exposure_worker_batch_key.v1",
-            "rank": 1,
-            "world_size": 2,
+            "schema_id": "et_mainsim.shared_exposure_batch_key.v2",
             "batch_index": batch.batch_index,
             "frames_per_shard": 2,
             "frame_ids": list(batch.frame_ids),
@@ -1112,31 +1116,16 @@ def _enable_shared_exposure(
 
 
 def _shared_final_shard_path(request, *, product_key="final_stamp") -> Path:
-    from et_mainsim.shared_exposure import (
-        read_shared_exposure_target_plan,
-        shared_exposure_product_shard_path,
+    from et_mainsim.shared_exposure import read_shared_exposure_target_plan
+    from et_mainsim.workflows.full_frame import (
+        _assigned_frame_indices, _shared_exposure_frame_batches, _shared_exposure_batch_shard_paths,
     )
-
-    root = request.run_dir / "shared_exposure"
-    plan = read_shared_exposure_target_plan(root / "target_plan.json")
-    legacy_path = shared_exposure_product_shard_path(
-        root / "shards" / f"worker_{request.rank:04d}",
-        plan_content_sha256=plan["content_sha256"],
-        product_key=product_key,
-    )
-    batch_matches = list(
-        legacy_path.parent.parent.parent.glob(
-            f"batch_??????_*/shared-exposure-products/"
-            f"{plan['content_sha256']}/{legacy_path.name}"
-        )
-    )
-    if len(batch_matches) == 1:
-        return batch_matches[0]
-    if batch_matches:
-        raise AssertionError(
-            f"expected one {product_key} shard, found {len(batch_matches)}"
-        )
-    return legacy_path
+    plan = read_shared_exposure_target_plan(request.run_dir / "shared_exposure" / "target_plan.json")
+    batches = _shared_exposure_frame_batches(request, _assigned_frame_indices(request))
+    assert len(batches) == 1
+    return _shared_exposure_batch_shard_paths(
+        batches[0], plan_content_sha256=plan["content_sha256"],
+        product_keys=request.shared_exposure_stamps.product_keys)[product_key]
 
 
 @pytest.mark.parametrize("telescope_count", (1, 6))
@@ -1618,19 +1607,19 @@ def test_exposure_first_two_workers_publish_disjoint_shards_and_resume(
     from photsim7.artifacts import SharedExposureShardReader
 
     base, api = _selection_ready_worker_request(tmp_path, n_frames=4)
-    base = _enable_shared_exposure(base)
+    base = _enable_shared_exposure(base, frames_per_shard=2)
     rank0 = replace(base, rank=0, world_size=2)
     rank1 = replace(base, rank=1, world_size=2)
 
     first0 = run_worker(rank0, science_api=api)
     first1 = run_worker(rank1, science_api=api)
 
-    assert first0.rendered == (0, 2)
-    assert first1.rendered == (1, 3)
+    assert first0.rendered == (0, 1)
+    assert first1.rendered == (2, 3)
     with SharedExposureShardReader(_shared_final_shard_path(rank0)) as reader:
-        assert reader.frame_ids == (0, 2)
+        assert reader.frame_ids == (0, 1)
     with SharedExposureShardReader(_shared_final_shard_path(rank1)) as reader:
-        assert reader.frame_ids == (1, 3)
+        assert reader.frame_ids == (2, 3)
 
     class ForbiddenCache:
         @staticmethod
@@ -1642,9 +1631,9 @@ def test_exposure_first_two_workers_publish_disjoint_shards_and_resume(
     resumed1 = run_worker(rank1, science_api=api)
 
     assert resumed0.rendered == ()
-    assert resumed0.skipped == (0, 2)
+    assert resumed0.skipped == (0, 1)
     assert resumed1.rendered == ()
-    assert resumed1.skipped == (1, 3)
+    assert resumed1.skipped == (2, 3)
 
 
 def test_exposure_first_batch_boundary_is_a_durable_bounded_replay_checkpoint(
@@ -2400,7 +2389,7 @@ def test_full_frame_overwrite_replaces_only_the_shared_bundle_before_workers(
     )
     catalog = api.StarCatalogCache.read(request.catalog_cache)
     fake_api = SimpleNamespace(
-        DataRegistry=lambda **kwargs: object(),
+        DataRegistry=DataRegistry,
         build_catalog_from_spec=lambda *args, **kwargs: catalog,
     )
     run_full_frame(plan, prepare_catalog_only=True, science_api=fake_api)
@@ -2740,7 +2729,9 @@ def test_run_refuses_nonempty_legacy_directory_without_manifest(tmp_path) -> Non
     assert not (plan.run_dir / "run_manifest.json").exists()
 
 
-def test_full_frame_run_identity_requires_current_product_contract(tmp_path) -> None:
+def test_full_frame_run_identity_requires_current_product_contract(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("et_mainsim.inputs.collect_run_inputs", lambda *args, **kwargs: {"assets": {}})
+    monkeypatch.setattr("et_mainsim.inputs.record_catalog_identity", lambda *args: None)
     from et_mainsim.config import RunPaths
     from et_mainsim.manifest import ManifestIdentityError
     from et_mainsim.presets import load_preset
@@ -2769,7 +2760,7 @@ def test_full_frame_run_identity_requires_current_product_contract(tmp_path) -> 
     )
     catalog = SimpleNamespace(n_sources=1, metadata={"source": "test"})
     fake_api = SimpleNamespace(
-        DataRegistry=lambda **kwargs: object(),
+        DataRegistry=DataRegistry,
         build_catalog_from_spec=lambda *args, **kwargs: catalog,
     )
 
@@ -2814,7 +2805,9 @@ def test_full_frame_run_identity_requires_current_product_contract(tmp_path) -> 
             )
 
 
-def test_run_records_worker_failure_in_manifest(tmp_path) -> None:
+def test_run_records_worker_failure_in_manifest(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("et_mainsim.inputs.collect_run_inputs", lambda *args, **kwargs: {"assets": {}})
+    monkeypatch.setattr("et_mainsim.inputs.record_catalog_identity", lambda *args: None)
     from et_mainsim.config import RunPaths
     from et_mainsim.presets import load_preset
     from et_mainsim.workflows.full_frame import build_run_plan, run_full_frame
@@ -2846,15 +2839,11 @@ def test_run_records_worker_failure_in_manifest(tmp_path) -> None:
         def read(path):
             return catalog
 
-    class FakeRegistry:
-        def __init__(self, *, data_root):
-            self.data_root = data_root
-
     def fail_services(*args, **kwargs):
         raise RuntimeError("service construction failed")
 
     fake_api = SimpleNamespace(
-        DataRegistry=FakeRegistry,
+        DataRegistry=DataRegistry,
         StarCatalogCache=FakeCache,
         build_catalog_from_spec=lambda *args, **kwargs: catalog,
         build_full_frame_services=fail_services,

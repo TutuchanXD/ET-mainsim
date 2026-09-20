@@ -9,6 +9,7 @@ import pickle
 import numpy as np
 import pytest
 from astropy import units as u
+from photsim7.data_registry import DataRegistry
 from astropy.table import Table
 
 
@@ -771,7 +772,7 @@ def test_catalog_stamp_inputs_select_requested_targets_from_one_shared_scene(tmp
     )
     api = SimpleNamespace(
         PreparedStarCatalog=PreparedStarCatalog,
-        DataRegistry=lambda **kwargs: object(),
+        DataRegistry=DataRegistry,
         build_catalog_from_spec=lambda *args, **kwargs: catalog,
     )
 
@@ -2098,5 +2099,5 @@ def test_stamp_resume_rejects_changed_psf_bundle_content(tmp_path) -> None:
     )
     bundle_path.write_bytes(bundle_path.read_bytes() + b"changed")
 
-    with pytest.raises(ManifestIdentityError, match="workload"):
+    with pytest.raises(ManifestIdentityError, match="input"):
         run_stamp(plan)

@@ -1,6 +1,6 @@
 {
   "schema_id": "photsim7.simulation_spec",
-  "schema_version": 3,
+  "schema_version": 5,
   "observation": {
     "simulation_name": "ET",
     "observing_start_date": "2024-01-01T00:00:00",
@@ -100,11 +100,10 @@
     "event_library_path": "cosmic_ray/dark_test_10um/event_library_10um.npz",
     "event_library_pixel_size": {"value": 10.0, "unit": "um"},
     "event_rate": {"value": 5.0, "unit": "1 / (s cm2)"},
-    "seed": 0
+    "seed": null
   },
   "psf": {
     "bundle_name": "psf/et/241006/D280mm-focus",
-    "bundle_sha256": "9b01d7d890c1a92829ea7ab52fab349a019417dcff7754888620bd6c99c7f1ec",
     "mode": "full_frame",
     "field_id": "nearest",
     "field_id_policy": "nearest",
@@ -128,11 +127,7 @@
       "tess_xy_amplitude_multiplier": 1.0,
       "split_hz": 0.1,
       "max_frequency_samples": 20000,
-      "chunk_size": 1024,
-      "native_jitter_bank_path": "jitter/et/native/legacy_science_v1_et_attitude_xyz_100x3x300_v1.npy",
-      "native_jitter_bank_manifest_path": "jitter/et/native/legacy_science_v1_et_attitude_xyz_100x3x300_v1.manifest.json",
-      "native_jitter_bank_sha256": "696a986c82902ad18f136f284a30b2ce506998d3e900ea2601a3e6af001cc4d0",
-      "native_jitter_bank_manifest_sha256": "267453c0cc5355f7edfaff76164c56ea38052a866bb967bb124c920394bf7274"
+      "chunk_size": 1024
     },
     "dva": {
       "enabled": true,
@@ -172,7 +167,7 @@
     "save_bias_artifacts": true,
     "save_preview_images": true
   },
-  "rng": {"run_seed": 20260714},
+  "rng": {"run_seed": 20260714, "determinism_mode": "bitwise", "stream_seeds": {}},
   "science_profile": {
     "profile_id": "unclaimed",
     "composition_id": "unclaimed",

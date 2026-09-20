@@ -32,11 +32,11 @@ maintained Galaxy producer.
 The current full-test and release-engineering contracts are validated against
 ET-coordinate commit `f9cec8038b021c9540a026b94e876dc3240071d1`
 (version 0.1.2) and Photsim7 commit
-`e29336d46d6380f6c8a72a8638fd3acec1d0c049` (version 0.5.0). Install those exact
+`869a2d5b92916ff6b0470cc6c271aca6a6f05ac8` (version 0.5.1). Install those exact
 dependency snapshots before installing the ET-mainsim wheel with `--no-deps`,
 then run `python -m pip check`.
 
-The maintained runtime requires `photsim7[gpu]>=0.5.0,<0.6`. Its imports use
+The maintained runtime requires `photsim7[gpu]>=0.5.1,<0.6`. Its imports use
 canonical or retained public APIs and do not require the 16 top-level facades
 removed in Photsim7 0.5.0. The GPU extra supplies the Torch/Kornia backend for
 both CPU and CUDA execution; CUDA availability is checked separately at runtime.
@@ -65,6 +65,14 @@ atomic raw/coadd delivery and a frozen time-plan contract. See
 for the operational product path, and
 [continuous time-shard planning](docs/continuous_time_shards.md) for the
 generic API and future scheduler hook.
+
+## Configurable inputs and reproducibility
+
+`--spec` accepts canonical JSON and parameter workbooks. Scientific values come
+from the ET preset, explicit workbook rows, then explicit CLI overrides.
+Per-stream RNG seeds pass through unchanged. Each run records its effective
+configuration and actual asset contents, and rejects incompatible resumes.
+See [configuration, cache and resume rules](docs/configurable_inputs_zh.md).
 
 ## Quick Start
 
