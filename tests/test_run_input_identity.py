@@ -138,6 +138,16 @@ def test_real_workflow_persists_effective_inputs_and_rejects_edited_psf(
             context.setattr(torch.cuda, "get_device_name", forbidden)
             prepared = run(cuda_plan, prepare_catalog_only=True)
         assert "rendering" not in prepared["input_identity"]["runtime"]
+        # A coordinator can die immediately after its new attempt becomes visible.
+        # Recovery must use the rendering baseline even if no later update ran.
+        with monkeypatch.context() as context:
+
+            def stop_after_attempt(*args, **kwargs):
+                raise SystemExit("coordinator stopped after starting attempt")
+
+            context.setattr(RunManifestStore, "update", stop_after_attempt)
+            with pytest.raises(SystemExit, match="coordinator stopped"):
+                run(plan)
     manifest = run(plan)
     assert manifest["input_identity"]["assets"]["psf.bundle"]["sha256"]
     control = manifest["attempts"][-1]["control"]

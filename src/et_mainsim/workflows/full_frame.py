@@ -4092,6 +4092,9 @@ def run_full_frame(
     try:
         store.start_attempt(
             recover_running=True,
+            input_identity=input_identity,
+            simulation_spec=spec_payload,
+            execution=execution_payload,
             control={
                 "execution": execution_payload,
                 "effective_spec": spec_payload,
@@ -4100,11 +4103,6 @@ def run_full_frame(
                 "force_catalog_cache": (plan.run_config.execution.force_catalog_cache),
                 "progress": plan.run_config.execution.progress,
             },
-        )
-        store.update(
-            input_identity=input_identity,
-            simulation_spec=spec_payload,
-            execution=execution_payload,
         )
         catalog = prepare_catalog(plan, science_api=science_api)
         from et_mainsim.inputs import record_catalog_identity

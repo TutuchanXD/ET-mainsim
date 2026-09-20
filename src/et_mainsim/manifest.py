@@ -247,6 +247,9 @@ class RunManifestStore:
         *,
         control: Mapping[str, Any] | None = None,
         recover_running: bool = False,
+        input_identity: Mapping[str, Any] | None = None,
+        simulation_spec: Mapping[str, Any] | None = None,
+        execution: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = self.load()
         previous_status = str(payload["status"])
@@ -275,6 +278,15 @@ class RunManifestStore:
         payload["timestamps"]["completed_at"] = None
         payload["timestamps"]["failed_at"] = None
         payload["timestamps"]["updated_at"] = now
+        # A staged run must never expose "running" with the old catalog-only
+        # baseline: a crash before a second write would prevent recovery.
+        for name, value in (
+            ("input_identity", input_identity),
+            ("simulation_spec", simulation_spec),
+            ("execution", execution),
+        ):
+            if value is not None:
+                payload[name] = deepcopy(dict(value))
         _atomic_write_json(self.path, payload)
         return payload
 
