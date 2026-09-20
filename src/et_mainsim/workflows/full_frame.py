@@ -2335,6 +2335,7 @@ def _run_multiscope_shared_exposure_worker(
     assigned: tuple[int, ...],
     expected_shape: tuple[int, int],
     started: float,
+    verified_catalog: Any | None = None,
 ) -> WorkerResult:
     """Run the exposure-first crop contract for the frozen six-scope system."""
 
@@ -2615,7 +2616,11 @@ def _run_multiscope_shared_exposure_worker(
         )
         return result
 
-    catalog = api.StarCatalogCache.read(request.catalog_cache)
+    catalog = (
+        verified_catalog
+        if verified_catalog is not None
+        else api.StarCatalogCache.read(request.catalog_cache)
+    )
     catalog = _select_brightest_catalog(catalog, request.execution.max_stars, api)
     registry = api.DataRegistry(data_root=request.data_root)
     services = api.build_multiscope_full_frame_services(
@@ -2760,7 +2765,7 @@ def run_worker(
 ) -> WorkerResult:
     from et_mainsim.inputs import verify_worker_inputs
 
-    verify_worker_inputs(
+    verified_catalog = verify_worker_inputs(
         request.run_dir,
         request.spec,
         request.data_root,
@@ -2782,6 +2787,7 @@ def run_worker(
             assigned=assigned,
             expected_shape=expected_shape,
             started=started,
+            verified_catalog=verified_catalog,
         )
     shared_root = _shared_exposure_root(request.run_dir)
     if (
@@ -3064,7 +3070,11 @@ def run_worker(
         )
         return worker_result
 
-    catalog = api.StarCatalogCache.read(request.catalog_cache)
+    catalog = (
+        verified_catalog
+        if verified_catalog is not None
+        else api.StarCatalogCache.read(request.catalog_cache)
+    )
     catalog = _select_brightest_catalog(
         catalog,
         request.execution.max_stars,

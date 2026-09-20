@@ -96,11 +96,12 @@ def _source_code_identity(package):
 
 def runtime_identity(spec):
     import et_mainsim
+    import et_coord
     import photsim7
     import torch
 
     versions = {}
-    for name in ("numpy", "scipy", "astropy", "torch", "kornia"):
+    for name in ("numpy", "scipy", "astropy", "torch", "kornia", "et-coord"):
         try:
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -113,6 +114,7 @@ def runtime_identity(spec):
         "float_precision": spec.psf.float_precision,
         "photsim7_code": _source_code_identity(photsim7),
         "et_mainsim_code": _source_code_identity(et_mainsim),
+        "et_coordinate_code": _source_code_identity(et_coord),
     }
     if str(spec.psf.compute_device).startswith("cuda"):
         from photsim7._determinism import deterministic_execution
@@ -172,23 +174,49 @@ def verify_worker_inputs(run_dir, spec, data_root, *, catalog_cache=None):
     current = collect_run_inputs(spec, data_root, catalog_cache=catalog_cache)
     if current != recorded:
         raise ManifestIdentityError("Worker input identity changed after planning")
+    catalog = None
     if catalog_cache is not None and manifest.get("catalog_content") is not None:
         from photsim7.catalogs.cache import StarCatalogCache
 
-        if (
-            catalog_identity(StarCatalogCache.read(catalog_cache))
-            != manifest["catalog_content"]
-        ):
+        catalog = StarCatalogCache.read(catalog_cache)
+        if catalog_identity(catalog) != manifest["catalog_content"]:
             raise ManifestIdentityError(
                 "Worker catalog content changed after preparation"
             )
+    return catalog
 
 
 def catalog_identity(catalog):
-    """Scientific arrays, independent of NPZ timestamps and RNG trace headers."""
+    """Scientific arrays and declarations, excluding cache/trace bookkeeping."""
     import numpy as np
 
     digest = hashlib.sha256()
+    metadata = {
+        name: value
+        for name, value in catalog.metadata.items()
+        if name
+        not in {
+            "rng_trace",
+            "catalog_generation_rng_trace",
+            "request_validation",
+            "cache",
+        }
+    }
+    from .manifest import _json_default
+
+    metadata["catalog"] = {
+        "schema_id": catalog.schema_id,
+        "schema_version": catalog.schema_version,
+    }
+    digest.update(
+        json.dumps(
+            metadata,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+            default=_json_default,
+        ).encode()
+    )
     for name, value in sorted(catalog.star_data.items()):
         array = np.asarray(value)
         digest.update(json.dumps([name, array.dtype.str, array.shape]).encode())

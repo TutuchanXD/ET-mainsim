@@ -130,6 +130,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     stamp.add_argument("--save-electron-components", action="store_true")
     stamp.add_argument("--write-batch-size", type=int)
+    stamp.add_argument(
+        "--coadd-size",
+        type=int,
+        help="Number of raw frames per coadd; must divide the observation frame count",
+    )
     stamp.add_argument("--dry-run", action="store_true")
 
     legacy = run_subparsers.add_parser(
@@ -381,6 +386,13 @@ def _run_stamp_command(args) -> int:
     loaded = load_preset(preset_name)
     config = _stamp_config_from_args(args, loaded)
     spec = _spec_from_args(args, loaded)
+    if args.coadd_size is not None:
+        spec = replace(
+            spec,
+            observation=replace(
+                spec.observation, n_raw_frames_per_coadd=args.coadd_size
+            ),
+        )
     config = _user_spec_device(args, config, spec)
     repo_root = Path(
         os.environ.get("ET_MAINSIM_ROOT", Path(__file__).resolve().parents[2])

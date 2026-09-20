@@ -201,3 +201,79 @@ def test_recovery_refuses_workers_left_running_by_a_dead_coordinator(tmp_path):
     with run_lock(tmp_path / "run"):
         with worker_lock(tmp_path / "run"):
             pass
+
+
+def test_catalog_identity_tracks_geometry_and_ignores_only_execution_trace_headers():
+    from et_mainsim.inputs import catalog_identity
+    from photsim7.catalogs.sources import PreparedStarCatalog
+
+    catalog = PreparedStarCatalog(
+        star_data={"x0": [0.0], "y0": [0.0]},
+        metadata={
+            "geometry": {"reference_field_angle_deg": 10.0},
+            "rng_trace": {"run_seed": 1},
+            "request_validation": {"mode": "generated"},
+        },
+    )
+    changed_geometry = catalog.with_metadata(
+        geometry={"reference_field_angle_deg": 12.0}
+    )
+    assert catalog_identity(changed_geometry) != catalog_identity(catalog)
+    read_back = catalog.with_metadata(
+        rng_trace={"run_seed": 2}, request_validation={"mode": "cache_exact"}
+    )
+    assert catalog_identity(read_back) == catalog_identity(catalog)
+
+
+def test_worker_consumes_verified_catalog_snapshot_without_reopening_cache(
+    tmp_path, monkeypatch
+):
+    from test_full_frame_workflow import _selection_ready_worker_request
+    from et_mainsim.workflows.full_frame import run_worker
+
+    request, api = _selection_ready_worker_request(tmp_path)
+    verified_catalog = api.StarCatalogCache.read(request.catalog_cache)
+    monkeypatch.setattr(
+        "et_mainsim.inputs.verify_worker_inputs",
+        lambda *args, **kwargs: verified_catalog,
+    )
+
+    class ChangedCache:
+        @staticmethod
+        def read(path):
+            raise AssertionError("mutable cache was reopened after input verification")
+
+    api.StarCatalogCache = ChangedCache
+    result = run_worker(request, science_api=api)
+    assert result.rendered == request.frame_indices
+
+
+def test_catalog_identity_is_stable_across_cache_serialization(tmp_path):
+    from et_mainsim.inputs import catalog_identity
+    from photsim7.catalogs.sources import PreparedStarCatalog
+    from photsim7.catalogs.cache import StarCatalogCache
+
+    catalog = PreparedStarCatalog(
+        star_data={"x0": [0.0], "y0": [0.0]},
+        metadata={"geometry": {"kind": "explicit"}},
+    )
+    path = tmp_path / "stars.npz"
+    StarCatalogCache.write(path, catalog)
+    assert catalog_identity(StarCatalogCache.read(path)) == catalog_identity(catalog)
+
+
+def test_runtime_identity_detects_focalplane_code_edits_at_the_same_version(
+    tmp_path, monkeypatch
+):
+    import et_coord
+    from et_mainsim.inputs import runtime_identity
+    from et_mainsim.presets import load_preset
+
+    module = tmp_path / "et_coord" / "__init__.py"
+    module.parent.mkdir()
+    module.write_text("projection_revision = 1\n")
+    monkeypatch.setattr(et_coord, "__file__", str(module))
+    spec = load_preset("et-full-frame-smoke").simulation_spec
+    before = runtime_identity(spec)
+    module.write_text("projection_revision = 2\n")
+    assert runtime_identity(spec) != before

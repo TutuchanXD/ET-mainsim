@@ -1,30 +1,34 @@
 # 可配置输入与 RNG：ET-mainsim 配套维护
 
-## S3 实施记录（2026-09-20，进行中）
+## S3 实施记录（2026-09-20）
 
-实现分支：两仓 `feat/configurable-workflow-inputs`；基线 Photsim7
-`17894e6`、ET-mainsim `a605d08`。本阶段用户已授权完整实施及必要仿真，
-可使用 H100 Slurm；生产改动按 Red → Green → Refactor 验证。
+实现分支：两仓 `feat/configurable-workflow-inputs`；起始基线 Photsim7
+`17894e6`、ET-mainsim `a605d08`。配套交付：
+[Photsim7 #171](https://github.com/TutuchanXD/Photsim7/pull/171) 与
+[ET-mainsim #52](https://github.com/TutuchanXD/ET-mainsim/pull/52)。
+最终候选 commit、完整 CI 回执和验收结果记录在 PR 中；先合并上游，再合并应用。
 
-- [x] 新增 Photsim7 `load_simulation_spec`，显式工作簿行覆盖应用预设，完整 JSON 可重放。
-- [x] CLI 接入工作簿、部分执行 TOML；用户科学设备设置与显式执行设备覆盖顺序。
-- [x] 常用全幅/stamp 预设移除历史 PSF/bank 默认摘要与固定 bank；cosmic 默认继承 RNG。
-- [x] 保留未显式覆盖的完整观测时间轴。
-- [x] 自动资产内容身份、有效配置文件、manifest 输入一致性与星表内容检查。
-- [x] 共同曝光存储按固定全局帧组定位，新增 2→3 worker 中断续跑回归。
-- [ ] 完成 worker 输入复核、缓存重建/离线读取、失败恢复和边界检查。
-- [ ] 补齐源代码/API/package/测试清单契约及依赖候选版本。
-- [ ] 完成全套检查、真实工作簿与资产联合验证、CPU/CUDA 验证及 producer 回归。
-- [ ] 更新使用说明、issue/PR 和最终验收记录。
+本阶段已实现工作簿/JSON 入口、明确的覆盖顺序、可变资产预设、有效 RNG 与配置
+导出、资产及星表科学内容一致性检查、原子缓存重建、固定帧组存储、worker 输入
+快照，以及协调进程/存活 worker 锁保护下的中断恢复。星表几何声明和实际使用的
+ET-coordinate 代码也参与运行身份。修改调度或纯批处理大小不会改变科学输入。
 
-当前局部工作流回归 109 passed；全套检查仍在进行，尚不可验收或合并。
-真实 default.xlsx 已成功与全幅和 stamp 生产预设组合解析，未改动工作簿或数据资产。
+生产改动按 Red → Green → Refactor 验证，覆盖全幅、catalog/table stamp、共同
+曝光及依赖的 producer。真实 default.xlsx 与物理 ET focal-plane 几何已在 CPU 和
+H100 上运行小规模重复/续跑/种子验收，五类效应保持开启。联合验收同时修复了
+Photsim7 CUDA coadd 质量掩膜的主机转换问题。
 
-- 日期：2026-09-17。
-- 状态：已确认方向，待实施；本次只发布计划和 issues，不运行仓库测试。
-- 主计划：同工作区 `Photsim7/docs/devs/configurable_inputs_rng_maintenance_plan_zh.md`。
-- 公开总跟踪：[Photsim7 #164](https://github.com/TutuchanXD/Photsim7/issues/164)（含完整计划）。
+默认工作簿无需再次改写：本阶段保留其字节、符号链接和科学参数，数据目录未建立
+Git。当前工作簿定义 500 个 raw 帧；stamp production 的原预设为每 30 帧合帧，
+可显式传 `--coadd-size 10` 得到 50 个 coadd。既有整除要求保持明确校验。
+
+用户于 2026-09-20 授权完整实施及必要仿真，可使用 H100 Slurm。
+2026-09-17 的“不运行测试”只适用于当时的计划/文档交付阶段。
+
+- 主计划：`Photsim7/docs/devs/configurable_inputs_rng_maintenance_plan_zh.md`。
+- 总跟踪：[Photsim7 #164](https://github.com/TutuchanXD/Photsim7/issues/164)。
 - 本仓任务：[ET-mainsim #51](https://github.com/TutuchanXD/ET-mainsim/issues/51)。
+- 使用与迁移：[工作簿、RNG、缓存与续跑](../configurable_inputs_zh.md)。
 
 ## 1. 兼容范围与职责
 
@@ -34,16 +38,16 @@ Photsim7 负责参数模型、科学计算、RNG 和科学产物规则；ET-main
 
 ## 2. 近期 S3 任务
 
-- [ ] 更新实际使用的 smoke/production 等预设，移除默认资产摘要和固定历史 jitter bank。
-- [ ] 支持工作簿/JSON 的统一科学配置入口，经 Photsim7 loader 解析。
-- [ ] 明确 ET 默认值 → 用户配置 → 显式 CLI 的优先级；保留 `--seed` 总种子入口，分项种子经配置完整传递。
-- [ ] 导出最终有效配置；记录实际资产内容、RNG 输入/派生值、科学身份、软件环境、后端和精度。
-- [ ] 用户不填写 SHA256；内容摘要用于缓存失效和同一 run 的一致性，不能变成历史资产准入条件。
-- [ ] 修改完成判定、selection 记录和续跑逻辑，使自定义合法资产可正常完成；不同输入不能混入同一次续跑。
-- [ ] 全幅、catalog/table stamp 及相关 producer 均验证；区分共同曝光裁剪和独立随机场景。
-- [ ] 同输入重复运行、不同调度及中断续跑满足 Photsim7 声明的确定性保证。
-- [ ] 与 Photsim7 联合发布真实 `default.xlsx`，保留用户参数、格式、其他 sheet、符号链接和备份；五类效应显式开启；数据目录不初始化 Git。
-- [ ] 更新依赖约束、CLI/config 示例、运行与迁移说明。
+- [x] 更新实际使用的 smoke/production 等预设，移除默认资产摘要和固定历史 jitter bank。
+- [x] 支持工作簿/JSON 的统一科学配置入口，经 Photsim7 loader 解析。
+- [x] 明确 ET 默认值 → 用户配置 → 显式 CLI 的优先级；保留 `--seed` 总种子入口，分项种子经配置完整传递。
+- [x] 导出最终有效配置；记录实际资产内容、RNG 输入/派生值、科学身份、软件环境、后端和精度。
+- [x] 用户不填写 SHA256；内容摘要用于缓存失效和同一 run 的一致性，不能变成历史资产准入条件。
+- [x] 修改完成判定、selection 记录和续跑逻辑，使自定义合法资产可正常完成；不同输入不能混入同一次续跑。
+- [x] 全幅、catalog/table stamp 及相关 producer 均验证；区分共同曝光裁剪和独立随机场景。
+- [x] 同输入重复运行、不同调度及中断续跑满足 Photsim7 声明的确定性保证。
+- [x] 与 Photsim7 联合验证真实 `default.xlsx`，保留用户参数、格式、其他 sheet、符号链接和备份；五类效应显式开启；数据目录不初始化 Git。
+- [x] 更新依赖约束、CLI/config 示例、运行与迁移说明。
 
 主要触点：`src/et_mainsim/cli.py`、`presets/`、`workflows/full_frame.py`、`workflows/stamp.py`、manifest/provenance/cache/resume 和受维护 producer。
 
@@ -61,7 +65,7 @@ Photsim7 负责参数模型、科学计算、RNG 和科学产物规则；ET-main
 | 工作流 | full-frame、catalog stamp、table stamp 和依赖的 producer 回归通过 |
 | 交付 | 小规模真实资产验收、适用全套检查和所声明后端保证完成 |
 
-未来生产代码修改按 Red → Green → Refactor 实施。本次文档交付不运行仓库测试，不启动 CPU/GPU 仿真或正式 campaign。
+本阶段生产修改按 Red → Green → Refactor 实施；正式 campaign 未启动。
 
 ## 4. 与既有计划的关系
 

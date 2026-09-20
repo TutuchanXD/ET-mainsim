@@ -2219,7 +2219,9 @@ def _render_target(
     }
 
 
-def _worker_inputs(request: StampWorkerRequest, api: Any) -> PreparedStampInputs:
+def _worker_inputs(
+    request: StampWorkerRequest, api: Any, *, catalog=None
+) -> PreparedStampInputs:
     plan = request.plan
     if plan.workload.input_mode == "table":
         return _prepare_table_inputs(
@@ -2229,7 +2231,8 @@ def _worker_inputs(request: StampWorkerRequest, api: Any) -> PreparedStampInputs
             apply_workload_selection=False,
             expected_identities=request.input_identities,
         )
-    catalog = api.StarCatalogCache.read(plan.catalog_cache)
+    if catalog is None:
+        catalog = api.StarCatalogCache.read(plan.catalog_cache)
     return PreparedStampInputs(
         target_ids=request.target_ids,
         catalogs={target_id: catalog for target_id in request.target_ids},
@@ -2251,7 +2254,7 @@ def run_stamp_worker(
 ) -> list[dict[str, Any]]:
     from et_mainsim.inputs import verify_worker_inputs
 
-    verify_worker_inputs(
+    verified_catalog = verify_worker_inputs(
         request.plan.run_dir,
         request.plan.spec,
         request.plan.paths.data_root,
@@ -2262,7 +2265,7 @@ def run_stamp_worker(
         ),
     )
     api = _science_api() if science_api is None else science_api
-    prepared = _worker_inputs(request, api)
+    prepared = _worker_inputs(request, api, catalog=verified_catalog)
     assigned = prepared.target_ids[request.rank :: request.world_size]
     results = [
         _render_target(

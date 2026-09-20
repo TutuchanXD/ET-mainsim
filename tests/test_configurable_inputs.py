@@ -126,3 +126,37 @@ def test_cli_partial_execution_config_inherits_preset_and_explicit_device_wins(
     assert main([*args, "--device", "cpu"]) == 0
     plan = json.loads(capsys.readouterr().out)
     assert plan["simulation_spec"]["psf"]["compute_device"] == "cpu"
+
+
+def test_stamp_workbook_can_explicitly_choose_a_coadd_size_for_500_frames(
+    tmp_path, capsys
+):
+    from et_mainsim.cli import main
+
+    path = tmp_path / "params.xlsx"
+    book = Workbook()
+    book.active.append(["Group", "Parameter", "Value", "Unit"])
+    book.active.append(["Observation", "Workbook Schema Version", 4, None])
+    book.active.append(["Observation", "Observing Duration", 5000, "s"])
+    book.save(path)
+    book.close()
+    assert (
+        main(
+            [
+                "run",
+                "et-stamp",
+                "--preset",
+                "production",
+                "--spec",
+                str(path),
+                "--coadd-size",
+                "10",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["frame_plan"]["raw_frame_count"] == 500
+    assert plan["frame_plan"]["coadd_count"] == 50
+    assert plan["simulation_spec"]["observation"]["n_raw_frames_per_coadd"] == 10
