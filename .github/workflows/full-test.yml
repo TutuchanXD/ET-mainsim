@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: TutuchanXD/Photsim7
-          ref: 85fb89cdd5dc8dc63d744e568c23082ff0f46f82
+          ref: 869a2d5b92916ff6b0470cc6c271aca6a6f05ac8
           path: .ci-dependencies/Photsim7
           ssh-key: ${{ secrets.PHOTSIM7_READ_ONLY_DEPLOY_KEY }}
           persist-credentials: false

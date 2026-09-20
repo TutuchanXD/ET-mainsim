@@ -81,7 +81,7 @@ def test_resume_allows_batch_tuning_without_changing_scientific_inputs(tmp_path)
 
 @pytest.mark.parametrize("workflow", ["full_frame", "stamp"])
 def test_real_workflow_persists_effective_inputs_and_rejects_edited_psf(
-    tmp_path, workflow
+    tmp_path, workflow, monkeypatch
 ):
     from importlib import import_module
     from test_stamp_workflow import _write_test_psf_bundle
@@ -114,6 +114,30 @@ def test_real_workflow_persists_effective_inputs_and_rejects_edited_psf(
         repo_root=tmp_path,
     )
     run = module.run_full_frame if workflow == "full_frame" else module.run_stamp
+    if workflow == "full_frame":
+        import torch
+
+        cuda_plan = replace(
+            plan,
+            spec=replace(plan.spec, psf=replace(plan.spec.psf, compute_device="cuda")),
+            run_config=replace(
+                plan.run_config,
+                execution=replace(
+                    plan.run_config.execution,
+                    device="cuda",
+                    backend="local-subprocess",
+                    gpu_ids=("7",),
+                ),
+            ),
+        )
+        with monkeypatch.context() as context:
+
+            def forbidden(*args, **kwargs):
+                raise AssertionError("catalog-only preparation queried CUDA")
+
+            context.setattr(torch.cuda, "get_device_name", forbidden)
+            prepared = run(cuda_plan, prepare_catalog_only=True)
+        assert "rendering" not in prepared["input_identity"]["runtime"]
     manifest = run(plan)
     assert manifest["input_identity"]["assets"]["psf.bundle"]["sha256"]
     control = manifest["attempts"][-1]["control"]
@@ -277,3 +301,180 @@ def test_runtime_identity_detects_focalplane_code_edits_at_the_same_version(
     before = runtime_identity(spec)
     module.write_text("projection_revision = 2\n")
     assert runtime_identity(spec) != before
+
+
+def test_resume_rejects_preview_change(tmp_path):
+    store = RunManifestStore(tmp_path / "run.json")
+    create(store, execution={"device": "cpu", "preview_count": 0})
+    with pytest.raises(ManifestIdentityError, match="execution"):
+        ensure(store, execution={"device": "cpu", "preview_count": 3})
+
+
+def test_launch_lease_protects_child_before_worker_initialization(tmp_path):
+    import sys
+    from et_mainsim.inputs import launch_worker, run_lock
+
+    run = tmp_path / "run"
+    with run_lock(run):
+        process = launch_worker(
+            [sys.executable, "-c", "import time; time.sleep(30)"], run_dir=run
+        )
+    try:
+        with pytest.raises(RuntimeError, match="workers are still active"):
+            with run_lock(run):
+                pass
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+    with run_lock(run):
+        pass
+
+
+def test_catalog_only_runtime_does_not_probe_cuda(monkeypatch):
+    import torch
+    from et_mainsim.inputs import runtime_identity
+    from et_mainsim.presets import load_preset
+
+    spec = load_preset("et-full-frame-production").simulation_spec
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("catalog-only preparation queried CUDA")
+
+    monkeypatch.setattr(torch.cuda, "get_device_name", forbidden)
+    result = runtime_identity(spec, catalog_only=True)
+    assert "rendering" not in result
+
+
+@pytest.mark.parametrize("mask,selector", [(None, "1"), ("1,3", "3")])
+def test_runtime_uses_selected_gpu_and_matches_worker(
+    tmp_path, monkeypatch, mask, selector
+):
+    import torch
+    from et_mainsim.inputs import runtime_identity
+    from et_mainsim.presets import load_preset
+
+    spec = load_preset("et-full-frame-production").simulation_spec
+    if mask is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", mask)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_name",
+        lambda index=None: ["old GPU", "selected GPU"][index or 0],
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda index=None: [(8, 0), (9, 0)][index or 0],
+    )
+    parent = runtime_identity(spec, gpu_ids=(selector,))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", selector)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_name", lambda index=None: "selected GPU"
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index=None: (9, 0))
+    assert runtime_identity(spec) == parent
+
+
+def test_runtime_rejects_gpu_outside_allocation(monkeypatch):
+    from et_mainsim.inputs import runtime_identity
+    from et_mainsim.presets import load_preset
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    with pytest.raises(ValueError, match="CUDA_VISIBLE_DEVICES"):
+        runtime_identity(
+            load_preset("et-full-frame-production").simulation_spec, gpu_ids=("0",)
+        )
+
+
+def test_catalog_stage_promotes_runtime_but_preserves_scientific_identity(tmp_path):
+    store = RunManifestStore(tmp_path / "run.json")
+    spec = {"rng": {"run_seed": 1}, "psf": {"compute_device": "cpu"}}
+    base = {"assets": {}, "runtime": {"python": "same", "photsim7_code": "same"}}
+    create(store, simulation_spec=spec, input_identity=base)
+    store.start_attempt()
+    store.transition("completed", completion={"catalog_only": True})
+    rendering = {
+        "assets": {"psf": "new"},
+        "runtime": {**base["runtime"], "rendering": {"device": "cuda"}},
+    }
+    new_spec = {**spec, "psf": {"compute_device": "cuda"}}
+    ensure(
+        store,
+        simulation_spec=new_spec,
+        input_identity=rendering,
+        execution={"device": "cuda"},
+    )
+    with pytest.raises(ManifestIdentityError, match="input"):
+        ensure(
+            store,
+            input_identity={
+                **rendering,
+                "runtime": {**rendering["runtime"], "photsim7_code": "changed"},
+            },
+        )
+    with pytest.raises(ManifestIdentityError, match="scientific"):
+        ensure(
+            store,
+            simulation_spec={**new_spec, "rng": {"run_seed": 2}},
+            input_identity=rendering,
+            execution={"device": "cuda"},
+        )
+
+
+def test_forced_cache_refresh_rejects_source_overlap_before_building(tmp_path):
+    from types import SimpleNamespace
+    from et_mainsim.inputs import prepare_catalog_input
+    from photsim7.data_registry import DataRegistry
+    from photsim7.specs import SimulationSpec
+
+    spec = SimulationSpec()
+    source = tmp_path / "source"
+    source.mkdir()
+    spec = replace(
+        spec,
+        catalog=replace(
+            spec.catalog, source_path=str(source), cache_path=str(source / "cache.npz")
+        ),
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("cache refresh started before path validation")
+
+    with pytest.raises(ValueError, match="outside"):
+        prepare_catalog_input(
+            spec,
+            DataRegistry(tmp_path),
+            api=SimpleNamespace(build_catalog_from_spec=forbidden),
+            run_dir=tmp_path / "run",
+            force=True,
+        )
+
+
+def test_runtime_resolves_gpu_uuid_and_rejects_mixed_architecture(monkeypatch):
+    from types import SimpleNamespace
+    import torch
+    from et_mainsim.inputs import runtime_identity
+    from et_mainsim.presets import load_preset
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda index: SimpleNamespace(uuid=f"GPU-{index}abc"),
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_device_name", lambda index: ["older", "newer"][index]
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda index: [(8, 0), (9, 0)][index]
+    )
+    spec = load_preset("et-full-frame-production").simulation_spec
+    assert (
+        runtime_identity(spec, gpu_ids=("GPU-1",))["rendering"]["cuda"]["device_name"]
+        == "newer"
+    )
+    with pytest.raises(ValueError, match="homogeneous"):
+        runtime_identity(spec, gpu_ids=("0", "1"))

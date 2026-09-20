@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from astropy import units as u
+from photsim7.data_registry import DataRegistry
 
 
 def _unavailable_selection_marker(
@@ -2388,7 +2389,7 @@ def test_full_frame_overwrite_replaces_only_the_shared_bundle_before_workers(
     )
     catalog = api.StarCatalogCache.read(request.catalog_cache)
     fake_api = SimpleNamespace(
-        DataRegistry=lambda **kwargs: object(),
+        DataRegistry=DataRegistry,
         build_catalog_from_spec=lambda *args, **kwargs: catalog,
     )
     run_full_frame(plan, prepare_catalog_only=True, science_api=fake_api)
@@ -2759,7 +2760,7 @@ def test_full_frame_run_identity_requires_current_product_contract(tmp_path, mon
     )
     catalog = SimpleNamespace(n_sources=1, metadata={"source": "test"})
     fake_api = SimpleNamespace(
-        DataRegistry=lambda **kwargs: object(),
+        DataRegistry=DataRegistry,
         build_catalog_from_spec=lambda *args, **kwargs: catalog,
     )
 
@@ -2838,15 +2839,11 @@ def test_run_records_worker_failure_in_manifest(tmp_path, monkeypatch) -> None:
         def read(path):
             return catalog
 
-    class FakeRegistry:
-        def __init__(self, *, data_root):
-            self.data_root = data_root
-
     def fail_services(*args, **kwargs):
         raise RuntimeError("service construction failed")
 
     fake_api = SimpleNamespace(
-        DataRegistry=FakeRegistry,
+        DataRegistry=DataRegistry,
         StarCatalogCache=FakeCache,
         build_catalog_from_spec=lambda *args, **kwargs: catalog,
         build_full_frame_services=fail_services,

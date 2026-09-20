@@ -3749,7 +3749,9 @@ def _launch_subprocess_workers(
         environment["PYTHONUNBUFFERED"] = "1"
         if assignment.visible_device is not None:
             environment["CUDA_VISIBLE_DEVICES"] = assignment.visible_device
-        process = subprocess.Popen(
+        from et_mainsim.inputs import launch_worker
+
+        process = launch_worker(
             [
                 sys.executable,
                 "-m",
@@ -3758,6 +3760,7 @@ def _launch_subprocess_workers(
                 "--request",
                 str(request_path),
             ],
+            run_dir=plan.run_dir,
             env=environment,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
@@ -3973,6 +3976,7 @@ def run_full_frame(
         plan.paths.data_root,
         catalog_cache=plan.catalog_cache,
         catalog_only=prepare_catalog_only,
+        gpu_ids=plan.run_config.execution.gpu_ids,
     )
     plan.run_dir.mkdir(parents=True, exist_ok=True)
     execution_payload = _manifest_execution(plan)
@@ -4095,11 +4099,16 @@ def run_full_frame(
                 "overwrite": plan.run_config.execution.overwrite,
                 "force_catalog_cache": (plan.run_config.execution.force_catalog_cache),
                 "progress": plan.run_config.execution.progress,
-            }
+            },
         )
-        store.update(input_identity=input_identity)
+        store.update(
+            input_identity=input_identity,
+            simulation_spec=spec_payload,
+            execution=execution_payload,
+        )
         catalog = prepare_catalog(plan, science_api=science_api)
         from et_mainsim.inputs import record_catalog_identity
+
         record_catalog_identity(store, catalog)
         store.update(
             catalog={

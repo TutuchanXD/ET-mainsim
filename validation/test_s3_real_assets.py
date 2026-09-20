@@ -80,7 +80,11 @@ def _plan(tmp_path, workflow, run_id, *, table=False, readout_seed=23):
             preset.run_config.execution,
             device=device,
             backend="local-subprocess" if device == "cuda" else "in-process",
-            gpu_ids=("0",) if device == "cuda" else (),
+            gpu_ids=(
+                (os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0],)
+                if device == "cuda"
+                else ()
+            ),
             preview_count=0,
         ),
     )
@@ -177,7 +181,27 @@ def test_real_workbook_effects_repeat_resume_and_seed_control(
 ):
     module, plan = _plan(tmp_path, workflow, "first", table=table)
     run = module.run_full_frame if workflow == "full_frame" else module.run_stamp
+    if workflow == "full_frame":
+        cpu_plan = replace(
+            plan,
+            spec=replace(plan.spec, psf=replace(plan.spec.psf, compute_device="cpu")),
+            run_config=replace(
+                plan.run_config,
+                execution=replace(
+                    plan.run_config.execution,
+                    device="cpu",
+                    backend="in-process",
+                    gpu_ids=(),
+                ),
+            ),
+        )
+        prepared = run(cpu_plan, prepare_catalog_only=True)
+        assert "rendering" not in prepared["input_identity"]["runtime"]
     first = run(plan)
+    assert (
+        first["simulation_spec"]["psf"]["compute_device"]
+        == plan.spec.psf.compute_device
+    )
     assert first["status"] == "completed"
     a = _arrays(plan, workflow)
     assert len(a) == 4

@@ -9,6 +9,7 @@ import pickle
 import numpy as np
 import pytest
 from astropy import units as u
+from photsim7.data_registry import DataRegistry
 from astropy.table import Table
 
 
@@ -771,7 +772,7 @@ def test_catalog_stamp_inputs_select_requested_targets_from_one_shared_scene(tmp
     )
     api = SimpleNamespace(
         PreparedStarCatalog=PreparedStarCatalog,
-        DataRegistry=lambda **kwargs: object(),
+        DataRegistry=DataRegistry,
         build_catalog_from_spec=lambda *args, **kwargs: catalog,
     )
 

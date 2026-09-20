@@ -29,6 +29,28 @@ def worker_lock(run_dir):
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
+def launch_worker(command, *, run_dir, **kwargs):
+    """Hold a shared lease from before exec until the child exits.
+
+    Closing the parent's duplicate must not explicitly unlock the shared open
+    file description inherited by the child.
+    """
+    import fcntl
+    import os
+    import subprocess
+
+    run_dir = Path(run_dir)
+    path = run_dir.parent / ".run_locks" / f"{run_dir.name}.workers"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        inherited = tuple(kwargs.pop("pass_fds", ())) + (descriptor,)
+        return subprocess.Popen(command, pass_fds=inherited, **kwargs)
+    finally:
+        os.close(descriptor)
+
+
 @contextmanager
 def run_lock(run_dir):
     """Single coordinator per run; the OS releases the lock on process exit."""
@@ -94,49 +116,101 @@ def _source_code_identity(package):
     return digest.hexdigest()
 
 
-def runtime_identity(spec):
+def runtime_identity(spec, *, catalog_only=False, gpu_ids=()):
     import et_mainsim
     import et_coord
     import photsim7
-    import torch
 
-    versions = {}
-    for name in ("numpy", "scipy", "astropy", "torch", "kornia", "et-coord"):
-        try:
-            versions[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            versions[name] = None
+    def versions(names):
+        result = {}
+        for name in names:
+            try:
+                result[name] = importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                result[name] = None
+        return result
+
     result = {
         "python": platform.python_version(),
         "machine": platform.machine(),
-        "packages": versions,
-        "device": spec.psf.compute_device,
-        "float_precision": spec.psf.float_precision,
+        "packages": versions(("numpy", "scipy", "astropy", "et-coord")),
         "photsim7_code": _source_code_identity(photsim7),
         "et_mainsim_code": _source_code_identity(et_mainsim),
         "et_coordinate_code": _source_code_identity(et_coord),
     }
+    if catalog_only:
+        return result
+    rendering = {
+        "device": spec.psf.compute_device,
+        "float_precision": spec.psf.float_precision,
+        "packages": versions(("torch", "kornia")),
+    }
     if str(spec.psf.compute_device).startswith("cuda"):
+        import os
+        import torch
         from photsim7._determinism import deterministic_execution
 
-        with deterministic_execution(spec.rng.determinism_mode):
-            result["cuda"] = {
-                "toolkit": torch.version.cuda,
-                "device_name": torch.cuda.get_device_name(),
-                "capability": list(torch.cuda.get_device_capability()),
-            }
+        mask = os.environ.get("CUDA_VISIBLE_DEVICES")
+        visible = None if mask is None else [item.strip() for item in mask.split(",")]
+        indices = []
+        for selector in gpu_ids:
+            if visible is not None:
+                if selector not in visible:
+                    raise ValueError(
+                        f"GPU {selector!r} is outside CUDA_VISIBLE_DEVICES={mask!r}"
+                    )
+                indices.append(visible.index(selector))
+            elif str(selector).isdigit():
+                indices.append(int(selector))
+            else:
+                matches = [
+                    index
+                    for index in range(torch.cuda.device_count())
+                    if str(
+                        getattr(torch.cuda.get_device_properties(index), "uuid", "")
+                    ).startswith(str(selector))
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        f"GPU selector {selector!r} does not identify one visible CUDA device"
+                    )
+                indices.append(matches[0])
+        if not indices:
+            indices = [torch.device(spec.psf.compute_device).index or 0]
+        with deterministic_execution(spec.rng.determinism_mode, device="cuda"):
+            devices = [
+                {
+                    "toolkit": torch.version.cuda,
+                    "device_name": torch.cuda.get_device_name(index),
+                    "capability": list(torch.cuda.get_device_capability(index)),
+                }
+                for index in indices
+            ]
+        if any(device != devices[0] for device in devices[1:]):
+            raise ValueError(
+                "One resumable run requires homogeneous selected CUDA devices"
+            )
+        rendering["cuda"] = devices[0]
+    result["rendering"] = rendering
     return result
 
 
-def collect_run_inputs(spec, data_root, *, catalog_cache=None, catalog_only=False):
+def collect_run_inputs(
+    spec, data_root, *, catalog_cache=None, catalog_only=False, gpu_ids=()
+):
     from photsim7.data_registry import DataRegistry
-    from photsim7.input_identity import content_identity, simulation_asset_identity
+    from photsim7.input_identity import (
+        content_identity,
+        simulation_asset_identity,
+        validate_catalog_cache_location,
+    )
 
     registry = DataRegistry(data_root)
+    validate_catalog_cache_location(spec, registry)
     result = {
         "schema_version": 1,
         "assets": {} if catalog_only else simulation_asset_identity(spec, registry),
-        "runtime": runtime_identity(spec),
+        "runtime": runtime_identity(spec, catalog_only=catalog_only, gpu_ids=gpu_ids),
     }
     source = spec.catalog.source_path
     if source:
@@ -244,6 +318,9 @@ def prepare_catalog_input(spec, registry, *, api, run_dir, force=False):
     import tempfile
     from photsim7.catalogs.cache import CatalogRequestMismatchError, StarCatalogCache
 
+    from photsim7.input_identity import validate_catalog_cache_location
+
+    validate_catalog_cache_location(spec, registry)
     if not force:
         try:
             return api.build_catalog_from_spec(spec, data_registry=registry)

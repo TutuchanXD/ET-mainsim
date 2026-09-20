@@ -160,3 +160,60 @@ def test_stamp_workbook_can_explicitly_choose_a_coadd_size_for_500_frames(
     assert plan["frame_plan"]["raw_frame_count"] == 500
     assert plan["frame_plan"]["coadd_count"] == 50
     assert plan["simulation_spec"]["observation"]["n_raw_frames_per_coadd"] == 10
+
+
+@pytest.mark.parametrize("workflow", ["et-full-frame", "et-stamp"])
+def test_cli_completes_partial_cuda_config_before_validation(
+    tmp_path, capsys, workflow
+):
+    from et_mainsim.cli import main
+
+    config = tmp_path / "run.toml"
+    config.write_text('[execution]\ndevice = "cuda"\n')
+    assert (
+        main(
+            [
+                "run",
+                workflow,
+                "--preset",
+                "smoke",
+                "--config",
+                str(config),
+                "--backend",
+                "local-subprocess",
+                "--gpus",
+                "1",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    execution = json.loads(capsys.readouterr().out)["execution"]
+    assert execution["device"] == "cuda"
+    assert execution["gpu_ids"] == ["1"]
+
+
+def test_cli_completes_partial_table_workload_before_validation(tmp_path, capsys):
+    from et_mainsim.cli import main
+
+    config = tmp_path / "run.toml"
+    config.write_text('[workload]\ninput_mode = "table"\n')
+    table = tmp_path / "stars.csv"
+    table.write_text("source_id,gaia_g_mag,ra_deg,dec_deg\n1,12,300,50\n")
+    assert (
+        main(
+            [
+                "run",
+                "et-stamp",
+                "--preset",
+                "smoke",
+                "--config",
+                str(config),
+                "--input-table",
+                str(table),
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["workload"]["input_mode"] == "table"

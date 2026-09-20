@@ -122,7 +122,9 @@ def _parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
-    stamp.add_argument("--save-raw", action=argparse.BooleanOptionalAction, default=None)
+    stamp.add_argument(
+        "--save-raw", action=argparse.BooleanOptionalAction, default=None
+    )
     stamp.add_argument(
         "--save-coadd",
         action=argparse.BooleanOptionalAction,
@@ -195,35 +197,31 @@ def _json_print(payload) -> None:
     )
 
 
-def _run_config_from_args(args, loaded, *, workflow: str) -> RunConfig:
-    args.config_device_explicit = False
-    if args.config is None:
-        config = loaded.run_config
-    else:
+def _run_config_from_args(
+    args, loaded, *, workflow: str, spec=None, workload_updates=None
+) -> RunConfig:
+    def overlay(base, updates):
+        result = dict(base)
+        for key, value in updates.items():
+            result[key] = (
+                overlay(result[key], value)
+                if isinstance(value, dict) and isinstance(result.get(key), dict)
+                else value
+            )
+        return result
+
+    payload = loaded.run_config.to_dict()
+    source = payload.pop("source", None)
+    user = {}
+    if args.config is not None:
         import tomllib
 
         user = tomllib.loads(args.config.read_text(encoding="utf-8"))
-        args.config_device_explicit = "device" in user.get("execution", {})
-
-        def overlay(base, updates):
-            result = dict(base)
-            for key, value in updates.items():
-                result[key] = (
-                    overlay(result[key], value)
-                    if isinstance(value, dict) and isinstance(result.get(key), dict)
-                    else value
-                )
-            return result
-
-        base = loaded.run_config.to_dict()
-        base.pop("source", None)
-        config = RunConfig.from_mapping(
-            overlay(base, user), source=str(args.config.resolve())
-        )
-    if config.workflow != workflow:
-        raise ValueError(
-            f"Run config workflow must be {workflow!r}, got {config.workflow!r}"
-        )
+        payload = overlay(payload, user)
+        source = str(args.config.resolve())
+    args.config_device_explicit = "device" in user.get("execution", {})
+    if spec is not None and args.spec is not None and not args.config_device_explicit:
+        payload["execution"]["device"] = spec.psf.compute_device
 
     path_updates = {}
     for argument, field_name in (
@@ -235,7 +233,7 @@ def _run_config_from_args(args, loaded, *, workflow: str) -> RunConfig:
     ):
         if argument is not None:
             path_updates[field_name] = str(argument)
-    paths = replace(config.paths, **path_updates) if path_updates else config.paths
+    payload["paths"].update(path_updates)
 
     execution_updates = {}
     if args.backend is not None:
@@ -270,17 +268,17 @@ def _run_config_from_args(args, loaded, *, workflow: str) -> RunConfig:
         execution_updates["ray_num_cpus"] = args.ray_num_cpus
     if getattr(args, "ray_num_gpus", None) is not None:
         execution_updates["ray_num_gpus"] = args.ray_num_gpus
-    execution = (
-        replace(config.execution, **execution_updates)
-        if execution_updates
-        else config.execution
-    )
-    return replace(
-        config,
-        run_id=config.run_id if args.run_id is None else args.run_id,
-        paths=paths,
-        execution=execution,
-    )
+    payload["execution"].update(execution_updates)
+    if workload_updates:
+        payload["workload"].update(workload_updates)
+    if args.run_id is not None:
+        payload["run_id"] = args.run_id
+    config = RunConfig.from_mapping(payload, source=source)
+    if config.workflow != workflow:
+        raise ValueError(
+            f"Run config workflow must be {workflow!r}, got {config.workflow!r}"
+        )
+    return config
 
 
 def _spec_from_args(args, loaded):
@@ -291,26 +289,13 @@ def _spec_from_args(args, loaded):
     return load_simulation_spec(args.spec, base=loaded.simulation_spec)
 
 
-def _user_spec_device(args, config, spec):
-    if (
-        args.spec is not None
-        and args.device is None
-        and not args.config_device_explicit
-    ):
-        return replace(
-            config, execution=replace(config.execution, device=spec.psf.compute_device)
-        )
-    return config
-
-
 def _run_full_frame_command(args) -> int:
     from et_mainsim.workflows.full_frame import build_run_plan, run_full_frame
 
     preset_name = canonical_preset_name("et-full-frame", args.preset)
     loaded = load_preset(preset_name)
-    config = _run_config_from_args(args, loaded, workflow="et-full-frame")
     spec = _spec_from_args(args, loaded)
-    config = _user_spec_device(args, config, spec)
+    config = _run_config_from_args(args, loaded, workflow="et-full-frame", spec=spec)
     repo_root = Path(
         os.environ.get("ET_MAINSIM_ROOT", Path(__file__).resolve().parents[2])
     )
@@ -342,9 +327,7 @@ def _run_full_frame_command(args) -> int:
     return 0
 
 
-def _stamp_config_from_args(args, loaded) -> RunConfig:
-    config = _run_config_from_args(args, loaded, workflow="et-stamp")
-    workload = config.workload
+def _stamp_config_from_args(args, loaded, *, spec=None) -> RunConfig:
     updates = {}
     if args.input_table is not None:
         updates.update(
@@ -374,9 +357,9 @@ def _stamp_config_from_args(args, loaded) -> RunConfig:
         updates["save_electron_components"] = True
     if args.write_batch_size is not None:
         updates["write_batch_size"] = args.write_batch_size
-    if updates:
-        workload = replace(workload, **updates)
-    return replace(config, workload=workload)
+    return _run_config_from_args(
+        args, loaded, workflow="et-stamp", spec=spec, workload_updates=updates
+    )
 
 
 def _run_stamp_command(args) -> int:
@@ -384,8 +367,8 @@ def _run_stamp_command(args) -> int:
 
     preset_name = canonical_preset_name("et-stamp", args.preset)
     loaded = load_preset(preset_name)
-    config = _stamp_config_from_args(args, loaded)
     spec = _spec_from_args(args, loaded)
+    config = _stamp_config_from_args(args, loaded, spec=spec)
     if args.coadd_size is not None:
         spec = replace(
             spec,
@@ -393,7 +376,6 @@ def _run_stamp_command(args) -> int:
                 spec.observation, n_raw_frames_per_coadd=args.coadd_size
             ),
         )
-    config = _user_spec_device(args, config, spec)
     repo_root = Path(
         os.environ.get("ET_MAINSIM_ROOT", Path(__file__).resolve().parents[2])
     )
@@ -422,7 +404,6 @@ def _run_stamp_command(args) -> int:
 
 
 def _legacy_config_from_args(args, loaded) -> RunConfig:
-    config = _run_config_from_args(args, loaded, workflow="legacy-sim")
     updates = {}
     for argument, field_name in (
         (args.run_count, "run_count"),
@@ -433,8 +414,9 @@ def _legacy_config_from_args(args, loaded) -> RunConfig:
     ):
         if argument is not None:
             updates[field_name] = argument
-    workload = replace(config.workload, **updates) if updates else config.workload
-    return replace(config, workload=workload)
+    return _run_config_from_args(
+        args, loaded, workflow="legacy-sim", workload_updates=updates
+    )
 
 
 def _run_legacy_command(args) -> int:

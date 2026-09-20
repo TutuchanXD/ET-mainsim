@@ -2341,7 +2341,9 @@ def _launch_subprocess_workers(
         )
         if assignment.visible_device is not None:
             environment["CUDA_VISIBLE_DEVICES"] = assignment.visible_device
-        process = subprocess.Popen(
+        from et_mainsim.inputs import launch_worker
+
+        process = launch_worker(
             [
                 sys.executable,
                 "-m",
@@ -2350,6 +2352,7 @@ def _launch_subprocess_workers(
                 "--request",
                 str(request_path),
             ],
+            run_dir=plan.run_dir,
             env=environment,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
@@ -2450,10 +2453,20 @@ def run_stamp(
     *,
     science_api: Any | None = None,
 ) -> dict[str, Any]:
-    from et_mainsim.inputs import collect_run_inputs, effective_spec, persist_effective_spec
+    from et_mainsim.inputs import (
+        collect_run_inputs,
+        effective_spec,
+        persist_effective_spec,
+    )
+
     plan = replace(plan, spec=effective_spec(plan.spec, plan.paths.data_root))
     preflight(plan)
-    input_identity = collect_run_inputs(plan.spec, plan.paths.data_root, catalog_cache=plan.catalog_cache)
+    input_identity = collect_run_inputs(
+        plan.spec,
+        plan.paths.data_root,
+        catalog_cache=plan.catalog_cache,
+        gpu_ids=plan.run_config.execution.gpu_ids,
+    )
     api = _science_api() if science_api is None else science_api
     store = RunManifestStore(plan.run_dir / "run_manifest.json")
     if (

@@ -29,7 +29,6 @@ _NON_IDENTITY_EXECUTION_FIELDS = frozenset(
         "ray_num_cpus",
         "ray_num_gpus",
         "backend",
-        "preview_count",
     }
 )
 
@@ -178,25 +177,40 @@ class RunManifestStore:
         payload = self.load()
         previous_inputs = payload.get("input_identity")
         catalog_stage = (payload.get("completion") or {}).get("catalog_only") is True
-        may_add_render_assets = (
+
+        def catalog_inputs(value):
+            result = deepcopy(dict(value))
+            result.pop("assets", None)
+            if isinstance(result.get("runtime"), Mapping):
+                result["runtime"].pop("rendering", None)
+            return result
+
+        promoting_catalog = (
             catalog_stage
             and isinstance(previous_inputs, Mapping)
             and previous_inputs.get("assets") == {}
             and isinstance(input_identity, Mapping)
-            and {k: v for k, v in previous_inputs.items() if k != "assets"}
-            == {k: v for k, v in input_identity.items() if k != "assets"}
+            and catalog_inputs(previous_inputs) == catalog_inputs(input_identity)
         )
-        if previous_inputs != input_identity and not may_add_render_assets:
+        if previous_inputs != input_identity and not promoting_catalog:
             raise ManifestIdentityError(
                 "Existing run input identity conflicts or lacks evidence; use a new run id"
             )
         if payload["workflow"] != workflow or payload["run_id"] != run_id:
             raise ManifestIdentityError("Existing run workflow or run id conflicts")
-        if _scientific_identity(payload["simulation_spec"]) != _scientific_identity(
-            simulation_spec
-        ):
+        previous_spec = _scientific_identity(payload["simulation_spec"])
+        current_spec = _scientific_identity(simulation_spec)
+        previous_execution = _execution_identity(payload["execution"])
+        current_execution = _execution_identity(execution)
+        if promoting_catalog:
+            for value in (previous_spec, current_spec):
+                value.get("psf", {}).pop("compute_device", None)
+            for value in (previous_execution, current_execution):
+                value.pop("device", None)
+                value.pop("preview_count", None)
+        if previous_spec != current_spec:
             raise ManifestIdentityError("Existing run scientific spec conflicts")
-        if _execution_identity(payload["execution"]) != _execution_identity(execution):
+        if previous_execution != current_execution:
             raise ManifestIdentityError("Existing run execution identity conflicts")
         if payload.get("workload", {}) != dict(workload or {}):
             raise ManifestIdentityError("Existing run workload identity conflicts")
