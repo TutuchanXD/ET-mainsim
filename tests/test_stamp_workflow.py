@@ -2098,5 +2098,5 @@ def test_stamp_resume_rejects_changed_psf_bundle_content(tmp_path) -> None:
     )
     bundle_path.write_bytes(bundle_path.read_bytes() + b"changed")
 
-    with pytest.raises(ManifestIdentityError, match="workload"):
+    with pytest.raises(ManifestIdentityError, match="input"):
         run_stamp(plan)

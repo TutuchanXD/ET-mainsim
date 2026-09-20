@@ -191,12 +191,29 @@ def _json_print(payload) -> None:
 
 
 def _run_config_from_args(args, loaded, *, workflow: str) -> RunConfig:
+    args.config_device_explicit = False
     if args.config is None:
         config = loaded.run_config
     else:
-        config = RunConfig.from_toml(
-            args.config.read_text(encoding="utf-8"),
-            source=str(args.config.resolve()),
+        import tomllib
+
+        user = tomllib.loads(args.config.read_text(encoding="utf-8"))
+        args.config_device_explicit = "device" in user.get("execution", {})
+
+        def overlay(base, updates):
+            result = dict(base)
+            for key, value in updates.items():
+                result[key] = (
+                    overlay(result[key], value)
+                    if isinstance(value, dict) and isinstance(result.get(key), dict)
+                    else value
+                )
+            return result
+
+        base = loaded.run_config.to_dict()
+        base.pop("source", None)
+        config = RunConfig.from_mapping(
+            overlay(base, user), source=str(args.config.resolve())
         )
     if config.workflow != workflow:
         raise ValueError(
@@ -264,9 +281,21 @@ def _run_config_from_args(args, loaded, *, workflow: str) -> RunConfig:
 def _spec_from_args(args, loaded):
     if args.spec is None:
         return loaded.simulation_spec
-    from photsim7.specs import SimulationSpec
+    from photsim7.specs import load_simulation_spec
 
-    return SimulationSpec.from_json(args.spec.read_text(encoding="utf-8"))
+    return load_simulation_spec(args.spec, base=loaded.simulation_spec)
+
+
+def _user_spec_device(args, config, spec):
+    if (
+        args.spec is not None
+        and args.device is None
+        and not args.config_device_explicit
+    ):
+        return replace(
+            config, execution=replace(config.execution, device=spec.psf.compute_device)
+        )
+    return config
 
 
 def _run_full_frame_command(args) -> int:
@@ -276,6 +305,7 @@ def _run_full_frame_command(args) -> int:
     loaded = load_preset(preset_name)
     config = _run_config_from_args(args, loaded, workflow="et-full-frame")
     spec = _spec_from_args(args, loaded)
+    config = _user_spec_device(args, config, spec)
     repo_root = Path(
         os.environ.get("ET_MAINSIM_ROOT", Path(__file__).resolve().parents[2])
     )
@@ -351,6 +381,7 @@ def _run_stamp_command(args) -> int:
     loaded = load_preset(preset_name)
     config = _stamp_config_from_args(args, loaded)
     spec = _spec_from_args(args, loaded)
+    config = _user_spec_device(args, config, spec)
     repo_root = Path(
         os.environ.get("ET_MAINSIM_ROOT", Path(__file__).resolve().parents[2])
     )

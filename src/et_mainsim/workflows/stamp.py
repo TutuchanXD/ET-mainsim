@@ -20,6 +20,7 @@ from et_mainsim.config import (
     StampWorkload,
     worker_assignments,
 )
+from et_mainsim.inputs import locked_run, locked_worker
 from et_mainsim.manifest import RunManifestStore
 from et_mainsim.presets import resource_path
 from et_mainsim.provenance import collect_provenance
@@ -966,10 +967,10 @@ def prepare_stamp_inputs(
 
     if plan.paths.data_root is None:
         raise ValueError("data_root is required")
-    if plan.run_config.execution.force_catalog_cache:
-        plan.catalog_cache.unlink(missing_ok=True)
     registry = api.DataRegistry(data_root=plan.paths.data_root)
-    catalog = api.build_catalog_from_spec(plan.spec, data_registry=registry)
+    from et_mainsim.inputs import prepare_catalog_input
+    catalog = prepare_catalog_input(plan.spec, registry, api=api, run_dir=plan.run_dir,
+                                    force=plan.run_config.execution.force_catalog_cache)
     target_ids = _select_target_ids(catalog, workload)
     return PreparedStampInputs(
         target_ids=target_ids,
@@ -2242,11 +2243,24 @@ def _worker_inputs(request: StampWorkerRequest, api: Any) -> PreparedStampInputs
     )
 
 
+@locked_worker
 def run_stamp_worker(
     request: StampWorkerRequest,
     *,
     science_api: Any | None = None,
 ) -> list[dict[str, Any]]:
+    from et_mainsim.inputs import verify_worker_inputs
+
+    verify_worker_inputs(
+        request.plan.run_dir,
+        request.plan.spec,
+        request.plan.paths.data_root,
+        catalog_cache=(
+            request.plan.catalog_cache
+            if request.plan.workload.input_mode != "table"
+            else None
+        ),
+    )
     api = _science_api() if science_api is None else science_api
     prepared = _worker_inputs(request, api)
     assigned = prepared.target_ids[request.rank :: request.world_size]
@@ -2427,12 +2441,16 @@ def _workload_identity(plan: StampRunPlan) -> dict[str, Any]:
     return payload
 
 
+@locked_run
 def run_stamp(
     plan: StampRunPlan,
     *,
     science_api: Any | None = None,
 ) -> dict[str, Any]:
+    from et_mainsim.inputs import collect_run_inputs, effective_spec, persist_effective_spec
+    plan = replace(plan, spec=effective_spec(plan.spec, plan.paths.data_root))
     preflight(plan)
+    input_identity = collect_run_inputs(plan.spec, plan.paths.data_root, catalog_cache=plan.catalog_cache)
     api = _science_api() if science_api is None else science_api
     store = RunManifestStore(plan.run_dir / "run_manifest.json")
     if (
@@ -2456,6 +2474,7 @@ def run_stamp(
             workflow="et-stamp",
             run_id=plan.run_config.run_id,
             simulation_spec=spec_payload,
+            input_identity=input_identity,
             execution=execution_payload,
             workload=workload_payload,
         )
@@ -2465,6 +2484,7 @@ def run_stamp(
             preset=plan.preset_name,
             run_id=plan.run_config.run_id,
             simulation_spec=spec_payload,
+            input_identity=input_identity,
             execution=execution_payload,
             workload=workload_payload,
             frame_plan=_frame_plan(plan.spec),
@@ -2479,9 +2499,13 @@ def run_stamp(
                 "target_artifact_manifest_name": "target_artifacts.json",
             },
         )
+    persist_effective_spec(plan.run_dir, plan.spec)
     try:
         store.start_attempt(
+            recover_running=True,
             control={
+                "execution": execution_payload,
+                "effective_spec": spec_payload,
                 "resume": plan.run_config.execution.resume,
                 "overwrite": plan.run_config.execution.overwrite,
                 "force_catalog_cache": (
@@ -2511,6 +2535,9 @@ def run_stamp(
                 prepared.input_identities,
                 planned_input_identities,
             )
+        if prepared.shared_catalog is not None:
+            from et_mainsim.inputs import record_catalog_identity
+            record_catalog_identity(store, prepared.shared_catalog)
         store.update(catalog=_catalog_manifest(prepared, plan))
         if plan.run_config.execution.backend == "in-process":
             results = [

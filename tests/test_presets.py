@@ -113,7 +113,7 @@ assert 'ray' not in sys.modules
 def test_project_requires_shared_exposure_photsim7_release() -> None:
     payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "photsim7[gpu]>=0.5.0,<0.6" in payload["project"]["dependencies"]
+    assert "photsim7[gpu]>=0.5.1,<0.6" in payload["project"]["dependencies"]
 
 
 def test_photsim7_stamp_centering_matches_formal_nearest_integer_policy() -> None:
@@ -246,19 +246,10 @@ def test_shipped_full_frame_presets_are_typed_and_complete() -> None:
     assert spec.catalog.input_magnitude_system == "Gaia_G"
     assert spec.catalog.photon_magnitude_system == "ET"
     assert spec.catalog.target_epoch_jyear == pytest.approx(2000.0)
-    assert spec.dynamic_effects.psd_motion.native_jitter_bank_path == (
-        "jitter/et/native/legacy_science_v1_et_attitude_xyz_100x3x300_v1.npy"
-    )
-    assert spec.dynamic_effects.psd_motion.native_jitter_bank_manifest_path == (
-        "jitter/et/native/legacy_science_v1_et_attitude_xyz_100x3x300_v1.manifest.json"
-    )
-    assert spec.dynamic_effects.psd_motion.native_jitter_bank_sha256 == (
-        "696a986c82902ad18f136f284a30b2ce506998d3e900ea2601a3e6af001cc4d0"
-    )
-    assert (
-        spec.dynamic_effects.psd_motion.native_jitter_bank_manifest_sha256
-        == "267453c0cc5355f7edfaff76164c56ea38052a866bb967bb124c920394bf7274"
-    )
+    assert not spec.dynamic_effects.psd_motion.native_jitter_bank_path
+    assert not spec.dynamic_effects.psd_motion.native_jitter_bank_manifest_path
+    assert spec.dynamic_effects.psd_motion.native_jitter_bank_sha256 is None
+    assert spec.dynamic_effects.psd_motion.native_jitter_bank_manifest_sha256 is None
     assert production.run_config.execution.backend == "local-subprocess"
     assert production.run_config.execution.device == "cuda"
 
@@ -301,7 +292,7 @@ def test_production_presets_select_temperature_driven_dynamics() -> None:
     canonical_payload = json.loads(
         resource_path("et_full_frame_production.spec.json").read_text(encoding="utf-8")
     )
-    assert canonical_payload["schema_version"] == 3
+    assert canonical_payload["schema_version"] == 5
     canonical_thermal = canonical_payload["dynamic_effects"]["thermal_drift"]
     canonical_breathing = canonical_payload["dynamic_effects"]["psf_breathing"]
     assert canonical_thermal["profile"] == "et_temperature_table"

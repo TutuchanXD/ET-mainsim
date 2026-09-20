@@ -23,6 +23,7 @@ from et_mainsim.config import (
     parse_frame_indices,
     worker_assignments,
 )
+from et_mainsim.inputs import locked_run, locked_worker
 from et_mainsim.manifest import RunManifestStore
 from et_mainsim.presets import resource_path
 from et_mainsim.provenance import collect_provenance
@@ -38,7 +39,7 @@ from et_mainsim.selection_schemas import (
 _SELECTION_TRUTH_SCOPE = "geometry_psf_and_jitter_selection_truth_only"
 _ET_FULL_FRAME_SPACECRAFT_ID = "et"
 _ET_FULL_FRAME_ABSOLUTE_RAW_FRAME_START_INDEX = 0
-_SHARED_EXPOSURE_BATCH_KEY_SCHEMA_ID = "et_mainsim.shared_exposure_worker_batch_key.v1"
+_SHARED_EXPOSURE_BATCH_KEY_SCHEMA_ID = "et_mainsim.shared_exposure_batch_key.v2"
 
 
 @dataclass(frozen=True)
@@ -402,8 +403,6 @@ def _canonical_shared_exposure_batch_key(
 ) -> tuple[dict[str, Any], str]:
     payload = {
         "schema_id": _SHARED_EXPOSURE_BATCH_KEY_SCHEMA_ID,
-        "rank": int(rank),
-        "world_size": int(world_size),
         "batch_index": int(batch_index),
         "frames_per_shard": int(frames_per_shard),
         "frame_ids": [int(frame_index) for frame_index in frame_ids],
@@ -420,6 +419,18 @@ def _canonical_shared_exposure_batch_key(
     return payload, sha256(encoded).hexdigest()
 
 
+def _assigned_frame_indices(request: WorkerRequest) -> tuple[int, ...]:
+    if not request.shared_exposure_stamps.enabled:
+        return tuple(request.frame_indices[request.rank :: request.world_size])
+    size = request.shared_exposure_stamps.frames_per_shard
+    return tuple(
+        frame
+        for index, start in enumerate(range(0, len(request.frame_indices), size))
+        if index % request.world_size == request.rank
+        for frame in request.frame_indices[start : start + size]
+    )
+
+
 def _shared_exposure_frame_batches(
     request: WorkerRequest,
     assigned: tuple[int, ...],
@@ -431,14 +442,21 @@ def _shared_exposure_frame_batches(
     scope_explicit = scope_contract is not None and not scope_contract.is_single_scope
     worker_root = _shared_exposure_shard_root(
         request.run_dir,
-        request.rank,
+        0,
         scope_id=scope_id,
         scope_contract=scope_contract,
     )
     batches: list[_SharedExposureFrameBatch] = []
-    for start in range(0, len(assigned), frames_per_shard):
-        frame_ids = assigned[start : start + frames_per_shard]
-        batch_index = len(batches)
+    for batch_index, start in enumerate(
+        range(0, len(request.frame_indices), frames_per_shard)
+    ):
+        frame_ids = request.frame_indices[start : start + frames_per_shard]
+        if not set(frame_ids).intersection(assigned):
+            continue
+        if not set(frame_ids).issubset(assigned):
+            raise ValueError(
+                "shared-exposure workers must own complete storage batches"
+            )
         _, content_sha256 = _canonical_shared_exposure_batch_key(
             rank=request.rank,
             world_size=request.world_size,
@@ -1272,8 +1290,6 @@ def _shared_exposure_shard_provenance(
         "workflow": "et-full-frame",
         "orchestrator_schema_id": "et_mainsim.shared_exposure_target_plan.v1",
         "target_plan_content_sha256": None,
-        "worker_rank": request.rank,
-        "world_size": request.world_size,
         "batch_schema_id": _SHARED_EXPOSURE_BATCH_KEY_SCHEMA_ID,
         "batch_sha256": batch.content_sha256,
         "batch_index": batch.batch_index,
@@ -2738,14 +2754,23 @@ def _run_multiscope_shared_exposure_worker(
     return result
 
 
+@locked_worker
 def run_worker(
     request: WorkerRequest, *, science_api: Any | None = None
 ) -> WorkerResult:
+    from et_mainsim.inputs import verify_worker_inputs
+
+    verify_worker_inputs(
+        request.run_dir,
+        request.spec,
+        request.data_root,
+        catalog_cache=request.catalog_cache,
+    )
     api = _science_api() if science_api is None else science_api
     started = time.perf_counter()
     expected_shape = tuple(int(value) for value in request.spec.detector.shape)
     scope_contract = _scope_contract_for_spec(request.run_dir, request.spec)
-    assigned = tuple(request.frame_indices[request.rank :: request.world_size])
+    assigned = _assigned_frame_indices(request)
     request.run_dir.mkdir(parents=True, exist_ok=True)
 
     shared = request.shared_exposure_stamps
@@ -3530,6 +3555,19 @@ def resolve_simulation_spec(
     if resolved_frames <= 0:
         raise ValueError("frames must be positive")
     sampling = spec.observation.sampling_interval.to(u.s)
+    observation = spec.observation
+    if frames is not None:
+        if observation.frame_start_s is not None:
+            if resolved_frames != observation.resolved_n_frames:
+                raise ValueError(
+                    "--frames conflicts with explicit frame_start_s; use frame indices to select execution frames"
+                )
+        else:
+            observation = replace(
+                observation,
+                observing_duration=resolved_frames * sampling,
+                n_frames=resolved_frames,
+            )
     catalog_updates: dict[str, Any] = {
         "cache_path": str(catalog_cache),
         "source_path": _resolve_package_catalog(spec.catalog.source_path),
@@ -3547,12 +3585,7 @@ def resolve_simulation_spec(
 
     return replace(
         spec,
-        observation=replace(
-            spec.observation,
-            observing_duration=resolved_frames * sampling,
-            n_frames=resolved_frames,
-            frame_start_s=None,
-        ),
+        observation=observation,
         catalog=replace(spec.catalog, **catalog_updates),
         psf=replace(
             spec.psf,
@@ -3650,10 +3683,16 @@ def prepare_catalog(plan: FullFrameRunPlan, *, science_api: Any | None = None) -
     api = _science_api() if science_api is None else science_api
     if plan.paths.data_root is None:
         raise ValueError("data_root is required")
-    if plan.run_config.execution.force_catalog_cache:
-        plan.catalog_cache.unlink(missing_ok=True)
     registry = api.DataRegistry(data_root=plan.paths.data_root)
-    return api.build_catalog_from_spec(plan.spec, data_registry=registry)
+    from et_mainsim.inputs import prepare_catalog_input
+
+    return prepare_catalog_input(
+        plan.spec,
+        registry,
+        api=api,
+        run_dir=plan.run_dir,
+        force=plan.run_config.execution.force_catalog_cache,
+    )
 
 
 def _write_worker_request(path: Path, request: WorkerRequest) -> None:
@@ -3816,7 +3855,7 @@ def _shared_exposure_incomplete_frames_for_worker(
     if not request.shared_exposure_stamps.enabled:
         return ()
     api = _science_api() if science_api is None else science_api
-    assigned = tuple(request.frame_indices[request.rank :: request.world_size])
+    assigned = _assigned_frame_indices(request)
     scope_contract = _scope_contract_for_spec(request.run_dir, request.spec)
     batches_by_scope = {
         scope_id: _shared_exposure_frame_batches(
@@ -3893,12 +3932,20 @@ def _shared_exposure_incomplete_frames_for_worker(
     return tuple(frame_index for frame_index in assigned if frame_index in incomplete)
 
 
+@locked_run
 def run_full_frame(
     plan: FullFrameRunPlan,
     *,
     prepare_catalog_only: bool = False,
     science_api: Any | None = None,
 ) -> dict[str, Any]:
+    from et_mainsim.inputs import (
+        collect_run_inputs,
+        effective_spec,
+        persist_effective_spec,
+    )
+
+    plan = replace(plan, spec=effective_spec(plan.spec, plan.paths.data_root))
     preflight(plan)
     scope_contract = _scope_contract_for_spec(plan.run_dir, plan.spec)
     store = RunManifestStore(plan.run_dir / "run_manifest.json")
@@ -3911,6 +3958,12 @@ def run_full_frame(
             f"Existing nonempty run directory {plan.run_dir} does not contain "
             "run_manifest.json; use a new run id"
         )
+    input_identity = collect_run_inputs(
+        plan.spec,
+        plan.paths.data_root,
+        catalog_cache=plan.catalog_cache,
+        catalog_only=prepare_catalog_only,
+    )
     plan.run_dir.mkdir(parents=True, exist_ok=True)
     execution_payload = _manifest_execution(plan)
     spec_payload = plan.spec.to_json_dict()
@@ -3920,6 +3973,7 @@ def run_full_frame(
             workflow="et-full-frame",
             run_id=plan.run_config.run_id,
             simulation_spec=spec_payload,
+            input_identity=input_identity,
             execution=execution_payload,
             workload=workload_payload,
         )
@@ -4010,6 +4064,7 @@ def run_full_frame(
             preset=plan.preset_name,
             run_id=plan.run_config.run_id,
             simulation_spec=spec_payload,
+            input_identity=input_identity,
             execution=execution_payload,
             workload=workload_payload,
             frame_plan={
@@ -4019,16 +4074,23 @@ def run_full_frame(
             provenance=collect_provenance(plan.repo_root),
             artifacts=artifacts,
         )
+    persist_effective_spec(plan.run_dir, plan.spec)
     try:
         store.start_attempt(
+            recover_running=True,
             control={
+                "execution": execution_payload,
+                "effective_spec": spec_payload,
                 "resume": plan.run_config.execution.resume,
                 "overwrite": plan.run_config.execution.overwrite,
                 "force_catalog_cache": (plan.run_config.execution.force_catalog_cache),
                 "progress": plan.run_config.execution.progress,
             }
         )
+        store.update(input_identity=input_identity)
         catalog = prepare_catalog(plan, science_api=science_api)
+        from et_mainsim.inputs import record_catalog_identity
+        record_catalog_identity(store, catalog)
         store.update(
             catalog={
                 "cache_path": str(plan.catalog_cache),

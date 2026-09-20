@@ -18,7 +18,19 @@ _TRANSITIONS = {
     "completed": frozenset(),
 }
 _NON_IDENTITY_EXECUTION_FIELDS = frozenset(
-    {"resume", "overwrite", "force_catalog_cache", "progress"}
+    {
+        "resume",
+        "overwrite",
+        "force_catalog_cache",
+        "progress",
+        "workers_per_device",
+        "gpu_ids",
+        "ray_actor_count",
+        "ray_num_cpus",
+        "ray_num_gpus",
+        "backend",
+        "preview_count",
+    }
 )
 
 
@@ -36,6 +48,18 @@ def _execution_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
         for name, value in payload.items()
         if name not in _NON_IDENTITY_EXECUTION_FIELDS
     }
+
+
+def _scientific_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
+    result = deepcopy(dict(payload))
+    for field in (
+        "warp_frame_batch_size",
+        "image_gen_batch_size",
+        "image_proc_batch_size",
+    ):
+        result.get("psf", {}).pop(field, None)
+    result.get("dynamic_effects", {}).get("psd_motion", {}).pop("chunk_size", None)
+    return result
 
 
 def _json_default(value: Any) -> Any:
@@ -107,6 +131,7 @@ class RunManifestStore:
         provenance: Mapping[str, Any],
         workload: Mapping[str, Any] | None = None,
         artifacts: Mapping[str, Any] | None = None,
+        input_identity: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if self.path.exists():
             raise FileExistsError(f"Run manifest already exists: {self.path}")
@@ -130,6 +155,7 @@ class RunManifestStore:
             "workload": deepcopy(dict(workload or {})),
             "frame_plan": deepcopy(dict(frame_plan)),
             "provenance": deepcopy(dict(provenance)),
+            "input_identity": deepcopy(input_identity),
             "catalog": None,
             "artifacts": deepcopy(dict(artifacts or {})),
             "completion": None,
@@ -147,11 +173,28 @@ class RunManifestStore:
         simulation_spec: Mapping[str, Any],
         execution: Mapping[str, Any],
         workload: Mapping[str, Any] | None = None,
+        input_identity: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = self.load()
+        previous_inputs = payload.get("input_identity")
+        catalog_stage = (payload.get("completion") or {}).get("catalog_only") is True
+        may_add_render_assets = (
+            catalog_stage
+            and isinstance(previous_inputs, Mapping)
+            and previous_inputs.get("assets") == {}
+            and isinstance(input_identity, Mapping)
+            and {k: v for k, v in previous_inputs.items() if k != "assets"}
+            == {k: v for k, v in input_identity.items() if k != "assets"}
+        )
+        if previous_inputs != input_identity and not may_add_render_assets:
+            raise ManifestIdentityError(
+                "Existing run input identity conflicts or lacks evidence; use a new run id"
+            )
         if payload["workflow"] != workflow or payload["run_id"] != run_id:
             raise ManifestIdentityError("Existing run workflow or run id conflicts")
-        if payload["simulation_spec"] != dict(simulation_spec):
+        if _scientific_identity(payload["simulation_spec"]) != _scientific_identity(
+            simulation_spec
+        ):
             raise ManifestIdentityError("Existing run scientific spec conflicts")
         if _execution_identity(payload["execution"]) != _execution_identity(execution):
             raise ManifestIdentityError("Existing run execution identity conflicts")
@@ -189,15 +232,18 @@ class RunManifestStore:
         self,
         *,
         control: Mapping[str, Any] | None = None,
+        recover_running: bool = False,
     ) -> dict[str, Any]:
         payload = self.load()
         previous_status = str(payload["status"])
-        if previous_status == "running":
+        if previous_status == "running" and not recover_running:
             raise ValueError("Run is already running")
-        if previous_status not in {"planned", "completed", "failed"}:
+        if previous_status not in {"planned", "completed", "failed", "running"}:
             raise ValueError(f"Cannot start an attempt from {previous_status!r}")
         now = _utc_now()
         attempts = payload.setdefault("attempts", [])
+        if previous_status == "running" and attempts:
+            attempts[-1].update(status="interrupted", ended_at=now)
         attempts.append(
             {
                 "number": len(attempts) + 1,
