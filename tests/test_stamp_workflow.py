@@ -975,7 +975,15 @@ def _complete_selection_api(api):
     return api
 
 
-def test_stamp_run_writes_readable_raw_coadd_truth_and_resumes(tmp_path) -> None:
+@pytest.mark.parametrize("detector,exposure,readout,starts", [
+    ("CMOS", 10, 0, (0, 10)),
+    ("CMOS", 0.25, 0.05, (0, 0.45)),
+    ("CCD", 5, 1, (2, 9)),
+    ("CMOS", 20, 0, (0, 25)),
+])
+def test_stamp_run_writes_readable_raw_coadd_truth_and_resumes(
+    tmp_path, detector, exposure, readout, starts,
+) -> None:
     from et_mainsim.presets import load_preset
     from et_mainsim.workflows.stamp import build_run_plan, run_stamp
     from photsim7.artifacts import StampShardReader
@@ -985,7 +993,7 @@ def test_stamp_run_writes_readable_raw_coadd_truth_and_resumes(tmp_path) -> None
     bundle_name, bundle_sha256 = _write_test_psf_bundle(data_root)
     spec = replace(
         _independent_stamp_spec(loaded.simulation_spec),
-        detector=replace(loaded.simulation_spec.detector, n_subpixels=3),
+        detector=replace(loaded.simulation_spec.detector, n_subpixels=3, detector_type=detector),
         psf=replace(
             loaded.simulation_spec.psf,
             bundle_name=bundle_name,
@@ -993,9 +1001,10 @@ def test_stamp_run_writes_readable_raw_coadd_truth_and_resumes(tmp_path) -> None
         ),
         observation=replace(
             loaded.simulation_spec.observation,
-            exposure_duration=10 * u.s,
-            readout_duration=0 * u.s,
-            observing_duration=20 * u.s,
+            exposure_duration=exposure * u.s,
+            readout_duration=readout * u.s,
+            observing_duration=None,
+            frame_start_s=starts,
             n_frames=2,
             n_raw_frames_per_coadd=2,
         ),
@@ -1044,6 +1053,13 @@ def test_stamp_run_writes_readable_raw_coadd_truth_and_resumes(tmp_path) -> None
     assert raw_schema["truth"]["fields"]
     assert raw_schema["rng_trace"]["entries"]
     assert coadd_schema["coadd"]["raw_frame_indices"] == [0, 1]
+    integration = exposure + readout if detector == "CMOS" else exposure
+    assert raw_schema["raw_cadence"]["frame_start_s"] == starts[0]
+    assert raw_schema["raw_cadence"]["integration_s"] == pytest.approx(integration)
+    assert coadd_schema["coadd"]["raw_frame_start_s"] == list(starts)
+    assert coadd_schema["coadd"]["total_integration_s"] == pytest.approx(2*integration)
+    assert coadd_schema["coadd"]["elapsed_span_s"] == pytest.approx(starts[-1]+integration-starts[0])
+    assert coadd_schema["coadd"]["readout_count"] == 2
     assert first["status"] == "completed"
 
     second = run_stamp(plan)

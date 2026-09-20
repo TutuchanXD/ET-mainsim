@@ -92,3 +92,27 @@ python -m pytest validation/test_s3_real_assets.py -q
 将 `ET_S3_DEVICE` 改为 `cuda` 可验证 CUDA 子进程入口。该验收只缩小场景和观测
 规模，保持五类效应开启，检查全幅、catalog/table stamp 的重复运行、续跑、
 输出目录独立性与分项种子控制。正式 campaign #43 不由本阶段自动启动。
+
+
+## 可配置 raw 时间（Photsim7 0.5.2 / #166）
+
+标准 full-frame、catalog stamp 和 table stamp 可消费非 10 s 的曝光/读出参数，
+以及带间隙的显式 frame_start_s。配置先由 Photsim7 校验；标准入口的
+simulation_cadence_mult 必须为 1，多个真实 raw 使用 coadd-size。
+CMOS 积分包含读出、CCD 积分不包含读出；相邻起点不能短于曝光+读出周期。
+
+例如 CCD 曝光 5 s、读出 1 s、起点 2/9/20 s 的三 raw coadd，累计积分为 15 s，
+首末跨度为 23 s。raw/coadd sidecar 保存各帧真实窗口、绝对帧号和读出次数。
+运行计划记录首末 raw 窗口；完整观测和输入身份参与续跑检查。执行分片继续引用
+完整父 spec，不能裁短温度模型的归一化观测区间。
+
+变源表每列应是为当前 raw 窗口准备的曝光平均因子，调整时间后需重新准备；不会
+自动重采样旧因子。长曝光若 jitter 样本数低于 PSD Nyquist 下限会报告最低数量，
+用户需调整 N Jitter Frames Per Model；该下限不代表数值积分已收敛。
+
+正式 science campaign 仍维持其 10 s 约定。连续 delivery 格式只接受 integration
+等于 sampling、且起点为绝对帧号乘 integration 的产品；Photsim7 adapter 校验实际
+窗口，拒绝误标 CCD 间隙或非规则观测。该格式的 uint16 quality counts 限制每个
+coadd 最多 65535 raws，DN uint64 累计溢出会报错。标准 stamp 产品不使用此限制。
+
+真实资产小规模验收：validation/test_s4a_raw_timing.py；所需环境变量与 S3 验收相同。

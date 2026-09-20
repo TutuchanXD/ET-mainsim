@@ -33,8 +33,8 @@ version = "0.1.2"
 [runtime_dependencies.photsim7]
 distribution = "photsim7"
 repository = "TutuchanXD/Photsim7"
-commit = "869a2d5b92916ff6b0470cc6c271aca6a6f05ac8"
-version = "0.5.1"
+commit = "9e356beffeea47152505de3f4540055a356f6db7"
+version = "0.5.2"
 
 [files]
 wheel = [
@@ -260,6 +260,7 @@ sdist = [
   "tests/test_thermal_benchmark.py",
   "tests/test_time_shards.py",
   "validation/test_s3_real_assets.py",
+  "validation/test_s4a_raw_timing.py",
   "tools/artifact_readback/README.md",
   "tools/artifact_readback/export_last90_truth_tables.py",
 ]
