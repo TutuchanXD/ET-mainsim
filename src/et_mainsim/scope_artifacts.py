@@ -1,9 +1,9 @@
-"""Artifact and resume identities for legacy-science scope execution.
+"""Artifact and resume identities for configurable telescope scopes.
 
-The scientific six-scope model is an outer execution dimension: each scope
+The scientific telescope scope axis is an outer execution dimension: each scope
 produces an independently rendered detector image.  This module deliberately
 models that fact in the on-disk layout.  It does not provide a path for a
-six-scope image sum; any later science-sample reduction must happen after the
+cross-scope image sum; any later science-sample reduction must happen after the
 per-scope products have been validated.
 """
 
@@ -17,11 +17,6 @@ from typing import Any
 
 FULL_FRAME_SCOPE_ARTIFACT_SCHEMA_ID = "et_mainsim.full_frame_scope_artifacts.v1"
 FULL_FRAME_SCOPE_ARTIFACT_SCHEMA_VERSION = 1
-
-_SCOPE_IDS_BY_TELESCOPE_COUNT: dict[int, tuple[int, ...]] = {
-    1: (0,),
-    6: (0, 1, 2, 3, 4, 5),
-}
 
 
 class ScopeArtifactContractError(ValueError):
@@ -106,10 +101,8 @@ class ScopeFrameCompletion:
 class FullFrameScopeArtifactContract:
     """Maps one logical cadence to scope-local product paths.
 
-    ``telescope_count=1`` preserves the existing root-level paths exactly.
-    ``telescope_count=6`` places every scope below ``scope_<id>/``.  The
-    contract intentionally supports only these two frozen legacy-science
-    configurations and fails closed for all other counts.
+    The legacy single scope ``(0,)`` preserves root-level paths. Other stable
+    IDs use ``scope_<id>/``, including a single telescope with a nonzero ID.
     """
 
     run_dir: Path
@@ -120,13 +113,12 @@ class FullFrameScopeArtifactContract:
         normalized_scope_ids = tuple(
             _strict_int(value, field_name="scope_ids") for value in self.scope_ids
         )
-        if normalized_scope_ids not in _SCOPE_IDS_BY_TELESCOPE_COUNT.values():
+        if not normalized_scope_ids or any(value < 0 for value in normalized_scope_ids) or len(set(normalized_scope_ids)) != len(normalized_scope_ids):
             raise ScopeArtifactContractError(
-                "scope_ids must be exactly (0,) or the canonical six-scope "
-                "sequence (0, 1, 2, 3, 4, 5)"
+                "scope_ids must contain unique non-negative stable IDs"
             )
         object.__setattr__(self, "run_dir", normalized_run_dir)
-        object.__setattr__(self, "scope_ids", normalized_scope_ids)
+        object.__setattr__(self, "scope_ids", tuple(sorted(normalized_scope_ids)))
 
     @classmethod
     def from_telescope_count(
@@ -139,22 +131,24 @@ class FullFrameScopeArtifactContract:
             telescope_count,
             field_name="telescope_count",
         )
-        try:
-            scope_ids = _SCOPE_IDS_BY_TELESCOPE_COUNT[normalized_count]
-        except KeyError as error:
+        if normalized_count < 1:
             raise ScopeArtifactContractError(
-                "legacy-science scope artifacts support telescope_count=1 or "
-                "telescope_count=6"
-            ) from error
-        return cls(run_dir=Path(run_dir), scope_ids=scope_ids)
+                "telescope_count must be positive"
+            )
+        return cls(run_dir=Path(run_dir), scope_ids=tuple(range(normalized_count)))
 
     @property
     def telescope_count(self) -> int:
         return len(self.scope_ids)
 
     @property
-    def is_single_scope(self) -> bool:
+    def uses_legacy_root_layout(self) -> bool:
+        """Whether to use the legacy scope-zero execution and storage path."""
         return self.scope_ids == (0,)
+
+    @property
+    def is_single_scope(self) -> bool:
+        return len(self.scope_ids) == 1
 
     def scope_root(self, scope_id: int) -> Path:
         normalized_scope_id = _strict_int(scope_id, field_name="scope_id")
@@ -162,7 +156,7 @@ class FullFrameScopeArtifactContract:
             raise ScopeArtifactContractError(
                 f"scope_id {normalized_scope_id} is not in {self.scope_ids}"
             )
-        if self.is_single_scope:
+        if self.uses_legacy_root_layout:
             return self.run_dir
         return self.run_dir / f"scope_{normalized_scope_id}"
 
@@ -223,7 +217,7 @@ class FullFrameScopeArtifactContract:
     def to_manifest_artifacts(self) -> dict[str, Any]:
         """Return layout metadata suitable for a run manifest.
 
-        For six scopes the root has no ``frames`` entry by design.  Consumers
+        For per-scope layouts the root has no ``frames`` entry by design.  Consumers
         must resolve an explicit scope product and cannot accidentally treat a
         detector-image sum as a persisted full-frame artifact.
         """
@@ -237,7 +231,7 @@ class FullFrameScopeArtifactContract:
             "completion_rule": "all_scopes_complete",
             "image_level_combination": "forbidden",
         }
-        if self.is_single_scope:
+        if self.uses_legacy_root_layout:
             payload.update(
                 {
                     "layout": "legacy_root_single_scope",

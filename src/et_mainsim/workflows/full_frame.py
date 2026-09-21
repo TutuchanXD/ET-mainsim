@@ -266,6 +266,9 @@ def _scope_contract_for_spec(
     run_dir: Path | str,
     spec: Any,
 ) -> FullFrameScopeArtifactContract:
+    telescopes = getattr(spec.instrument, "telescopes", None)
+    if telescopes is not None:
+        return FullFrameScopeArtifactContract(Path(run_dir), tuple(item.scope_id for item in telescopes))
     return FullFrameScopeArtifactContract.from_telescope_count(
         run_dir,
         telescope_count=int(spec.instrument.telescope_count),
@@ -305,12 +308,12 @@ def _shared_exposure_scope_root(
     """Return the scope-local shared-exposure root.
 
     The legacy single-scope layout remains byte-for-byte path compatible.
-    Six scopes receive an explicit storage namespace so a crop shard can never
+    Nonlegacy scope IDs receive an explicit storage namespace so a crop shard can never
     be mistaken for an image-level combination.
     """
 
     normalized_scope_id = int(scope_id)
-    if scope_contract is None or scope_contract.is_single_scope:
+    if scope_contract is None or scope_contract.uses_legacy_root_layout:
         if normalized_scope_id != 0:
             raise ValueError("single-scope shared exposure only accepts scope_id=0")
         return _shared_exposure_root(run_dir)
@@ -334,6 +337,32 @@ def _clear_shared_exposure_bundle_for_overwrite(run_dir: Path) -> None:
 
 def _shared_exposure_plan_path(run_dir: Path) -> Path:
     return _shared_exposure_root(run_dir) / "target_plan.json"
+
+
+
+def _scope_shared_exposure_plan_paths(
+    run_dir: Path, spec: Any, contract: FullFrameScopeArtifactContract,
+) -> dict[int, Path]:
+    telescopes = getattr(spec.instrument, "telescopes", None)
+    translated = telescopes is not None and any(
+        item.layout_mode == "reference_translation" for item in telescopes
+    )
+    return {
+        scope_id: (
+            _shared_exposure_scope_root(run_dir, scope_id=scope_id, scope_contract=contract) / "target_plan.json"
+            if translated else _shared_exposure_plan_path(run_dir)
+        ) for scope_id in contract.scope_ids
+    }
+
+
+
+def _scope_plan_path_for_parent(request: WorkerRequest, parent_root: Path) -> Path:
+    contract = _scope_contract_for_spec(request.run_dir, request.spec)
+    paths = _scope_shared_exposure_plan_paths(request.run_dir, request.spec, contract)
+    for scope_id in contract.scope_ids:
+        if contract.scope_root(scope_id) == parent_root:
+            return paths[scope_id]
+    raise ValueError("parent root is not a configured scope artifact location")
 
 
 def _shared_exposure_completion_path(
@@ -439,7 +468,7 @@ def _shared_exposure_frame_batches(
     scope_contract: FullFrameScopeArtifactContract | None = None,
 ) -> tuple[_SharedExposureFrameBatch, ...]:
     frames_per_shard = request.shared_exposure_stamps.frames_per_shard
-    scope_explicit = scope_contract is not None and not scope_contract.is_single_scope
+    scope_explicit = scope_contract is not None and not scope_contract.uses_legacy_root_layout
     worker_root = _shared_exposure_shard_root(
         request.run_dir,
         0,
@@ -822,6 +851,19 @@ def frame_is_complete(
         if schema.get("detector_id") != str(expected_spec.detector.detector_id):
             return False
         observed_scope_id = _schema_scope_id(schema)
+        service_provenance = schema.get("provenance", {}).get("services", {})
+        recorded_contract = service_provenance.get("scope_contract", {})
+        explicit_layout = getattr(expected_spec.instrument, "telescopes", None) is not None
+        if explicit_layout or recorded_contract.get("schema_version") == 2:
+            from photsim7.scope_contract import ScopeExecutionContract
+
+            expected_contract = ScopeExecutionContract.from_instrument(
+                expected_spec.instrument, detector_id=str(expected_spec.detector.detector_id),
+            )
+            if recorded_contract != expected_contract.to_metadata():
+                return False
+            if service_provenance.get("scope") != expected_contract.identity_for(expected_scope_id).to_metadata():
+                return False
         if require_scope_identity and observed_scope_id != int(expected_scope_id):
             return False
         if (
@@ -860,7 +902,7 @@ def frame_completion(
     """Validate every scope product required for one logical cadence.
 
     Single-scope products retain the pre-scope root layout and accept legacy
-    schemas without a scope provenance block.  A six-scope cadence only
+    schemas without a scope provenance block.  A cadence with per-scope paths only
     completes when every scope-local product carries its matching explicit
     ``provenance.services.scope.scope_id`` value.
     """
@@ -874,7 +916,7 @@ def frame_completion(
             expected_shape=expected_shape,
             expected_spec=expected_spec,
             expected_scope_id=paths.scope_id,
-            require_scope_identity=not contract.is_single_scope,
+            require_scope_identity=not contract.uses_legacy_root_layout,
         ),
     )
 
@@ -1004,7 +1046,7 @@ def _scope_frame_is_complete(
         expected_shape=expected_shape,
         expected_spec=expected_spec,
         expected_scope_id=scope_id,
-        require_scope_identity=not contract.is_single_scope,
+        require_scope_identity=not contract.uses_legacy_root_layout,
     )
 
 
@@ -1037,11 +1079,11 @@ def _render_multiscope_frame(
     It deliberately has no shared-exposure crop handling.
     """
 
-    if contract.is_single_scope:
-        raise ValueError("multiscope rendering requires a six-scope contract")
+    if contract.uses_legacy_root_layout:
+        raise ValueError("multiscope rendering requires per-scope artifact paths")
     if request.shared_exposure_stamps.enabled:
         raise NotImplementedError(
-            "shared-exposure target crops are not implemented for six scopes"
+            "use the shared-exposure scope renderer for target crops"
         )
 
     if request.execution.overwrite:
@@ -1507,7 +1549,7 @@ def _validate_shared_exposure_marker_for_request(
     if parent_root is None:
         parent_root = request.run_dir
     expected_parent = _artifact_paths(parent_root, frame_index)[0]
-    expected_plan = _shared_exposure_plan_path(request.run_dir)
+    expected_plan = _scope_plan_path_for_parent(request, parent_root)
     expected_shards = {
         product_key: path.resolve().relative_to(request.run_dir.resolve()).as_posix()
         for product_key, path in shard_paths.items()
@@ -1565,7 +1607,7 @@ def _build_shared_exposure_completion(
         mode=mode,
         reference_root=request.run_dir,
         parent_path=parent_path,
-        plan_path=_shared_exposure_plan_path(request.run_dir),
+        plan_path=_scope_plan_path_for_parent(request, parent_root),
         product_shards=shard_paths,
         storage_guard_cache=storage_guard_cache,
     )
@@ -2125,23 +2167,23 @@ def _render_multiscope_shared_exposure_frame(
     catalog: Any,
     frame_index: int,
     expected_shape: tuple[int, int],
-    plan: Mapping[str, Any],
-    windows: Mapping[int, Any],
+    plans_by_scope: Mapping[int, Mapping[str, Any]],
+    windows_by_scope: Mapping[int, Mapping[int, Any]],
     scope_modes: Mapping[int, str],
     runtime_by_scope_batch: dict[tuple[int, int], _SharedExposureBatchRuntime],
     batch_by_scope_frame: Mapping[int, Mapping[int, _SharedExposureFrameBatch]],
     render_frames_by_scope_batch: Mapping[tuple[int, int], tuple[int, ...]],
     all_scope_modes: Mapping[int, Mapping[int, str]],
 ) -> None:
-    """Render six parent images and stage exact same-scope crop products.
+    """Render scope-local parent images and stage exact same-scope crop products.
 
     Each yielded result is persisted and cropped before the next scope is
-    requested.  There is intentionally no in-memory six-image cube and no
+    requested.  There is intentionally no in-memory N-image cube and no
     image-level sum.
     """
 
-    if contract.is_single_scope:
-        raise ValueError("six-scope shared exposure requires a multiscope contract")
+    if contract.uses_legacy_root_layout:
+        raise ValueError("scope-local shared exposure requires per-scope artifact paths")
     if set(scope_modes) != set(contract.scope_ids):
         raise ValueError("scope_modes must contain the complete scope contract")
 
@@ -2191,6 +2233,8 @@ def _render_multiscope_shared_exposure_frame(
             )
         if torch is not None:
             torch.cuda.synchronize()
+        plan = plans_by_scope[scope_id]
+        windows = windows_by_scope[scope_id]
         mode = scope_modes[scope_id]
         if mode == "skip":
             del result
@@ -2337,10 +2381,10 @@ def _run_multiscope_shared_exposure_worker(
     started: float,
     verified_catalog: Any | None = None,
 ) -> WorkerResult:
-    """Run the exposure-first crop contract for the frozen six-scope system."""
+    """Run the exposure-first crop contract for configured telescope scopes."""
 
-    if scope_contract.is_single_scope:
-        raise ValueError("multiscope shared exposure requires six scope artifacts")
+    if scope_contract.uses_legacy_root_layout:
+        raise ValueError("multiscope shared exposure requires per-scope artifacts")
     shared = request.shared_exposure_stamps
     if not shared.enabled:
         raise ValueError("multiscope shared exposure requires enabled configuration")
@@ -2372,35 +2416,29 @@ def _run_multiscope_shared_exposure_worker(
                 f"bundle state at {shared_root}"
             ) from exc
 
-    plan_path = _shared_exposure_plan_path(request.run_dir)
-    shared_plan: dict[str, Any] | None = None
-    shared_windows: dict[int, Any] = {}
-    plan_exists = plan_path.exists()
-    if not plan_exists:
-        dependent_artifacts = (
-            [
-                path
-                for path in shared_root.rglob("*")
-                if path.is_file()
-                and not (
-                    path.parent == shared_root
+    plan_paths = _scope_shared_exposure_plan_paths(request.run_dir, request.spec, scope_contract)
+    shared_plans: dict[int, dict[str, Any]] = {}
+    windows_by_scope: dict[int, dict[int, Any]] = {}
+    for scope_id, plan_path in plan_paths.items():
+        if not plan_path.exists():
+            dependency_root = (shared_root if plan_path.parent == shared_root else plan_path.parent)
+            dependent_artifacts = [
+                path for path in dependency_root.rglob("*")
+                if path.is_file() and not (
+                    path.parent == plan_path.parent
                     and path.name.startswith(f".{plan_path.name}.")
                     and path.name.endswith(".tmp")
                 )
-            ]
-            if shared_root.exists()
-            else []
-        )
-        plan_exists = plan_path.exists()
-        if dependent_artifacts and not plan_exists:
-            raise SharedExposureReferenceDriftError(
-                "shared-exposure target plan is missing while dependent artifacts "
-                "remain"
-            )
-    if plan_exists:
-        shared_plan = read_shared_exposure_target_plan(plan_path)
-        _validate_shared_exposure_plan_for_request(shared_plan, request=request)
-        shared_windows = _shared_exposure_windows(shared_plan, api=api)
+            ] if dependency_root.exists() else []
+            if dependent_artifacts and not plan_path.exists():
+                raise SharedExposureReferenceDriftError(
+                    "shared-exposure target plan is missing while dependent artifacts remain"
+                )
+        if plan_path.exists():
+            scope_plan = read_shared_exposure_target_plan(plan_path)
+            _validate_shared_exposure_plan_for_request(scope_plan, request=request)
+            shared_plans[scope_id] = scope_plan
+            windows_by_scope[scope_id] = _shared_exposure_windows(scope_plan, api=api)
 
     batches_by_scope = {
         scope_id: _shared_exposure_frame_batches(
@@ -2432,18 +2470,18 @@ def _run_multiscope_shared_exposure_worker(
     ) -> tuple[dict[str, Path], dict[str, _SharedExposureShardSnapshot], Any]:
         key = (scope_id, batch.batch_index)
         if key not in resume_snapshots:
-            if shared_plan is None:
+            if scope_id not in shared_plans:
                 raise RuntimeError("shared-exposure plan is required for resume")
             shard_paths = _shared_exposure_batch_shard_paths(
                 batch,
-                plan_content_sha256=shared_plan["content_sha256"],
+                plan_content_sha256=shared_plans[scope_id]["content_sha256"],
                 product_keys=shared.product_keys,
             )
             snapshots = _inspect_shared_exposure_shards(
                 api=api,
                 request=request,
-                plan=shared_plan,
-                windows=shared_windows,
+                plan=shared_plans[scope_id],
+                windows=windows_by_scope[scope_id],
                 batch=batch,
                 shard_paths=shard_paths,
             )
@@ -2481,7 +2519,7 @@ def _run_multiscope_shared_exposure_worker(
                 scope_modes[scope_id][frame_index] = "parent_rendered_this_attempt"
                 every_scope_complete = False
                 continue
-            if shared_plan is None:
+            if scope_id not in shared_plans:
                 scope_modes[scope_id][frame_index] = (
                     "deterministic_parent_reconstruction"
                     if parent_complete
@@ -2507,7 +2545,7 @@ def _run_multiscope_shared_exposure_worker(
                 _validate_shared_exposure_marker_for_request(
                     marker,
                     request=request,
-                    plan=shared_plan,
+                    plan=shared_plans[scope_id],
                     frame_index=frame_index,
                     shard_paths=shard_paths,
                     parent_root=parent_root,
@@ -2555,7 +2593,7 @@ def _run_multiscope_shared_exposure_worker(
     # Validate every marker before cleaning recoverable final/partial hard-link
     # debris.  This mirrors the single-scope ordering and never mutates a bad
     # control plane artifact.
-    if shared_plan is not None and request.execution.resume:
+    if shared_plans and request.execution.resume:
         for scope_id, batch_index in sorted(linked_recovery_keys):
             batch = batches_by_scope[scope_id][batch_index]
             shard_paths = resume_shard_paths[(scope_id, batch_index)]
@@ -2563,8 +2601,8 @@ def _run_multiscope_shared_exposure_worker(
             _recover_linked_shared_exposure_publications(
                 api=api,
                 request=request,
-                plan=shared_plan,
-                windows=shared_windows,
+                plan=shared_plans[scope_id],
+                windows=windows_by_scope[scope_id],
                 batch=batch,
                 shard_paths=shard_paths,
                 snapshots=snapshots,
@@ -2628,22 +2666,25 @@ def _run_multiscope_shared_exposure_worker(
         catalog=catalog,
         data_registry=registry,
     )
-    if shared_plan is None:
-        from et_mainsim.shared_exposure import (
-            build_shared_exposure_target_plan,
-            publish_shared_exposure_target_plan,
-        )
+    from et_mainsim.shared_exposure import (
+        build_shared_exposure_target_plan,
+        publish_shared_exposure_target_plan,
+    )
 
-        geometry = api.resolve_full_frame_source_pixel_geometry(services.services[0])
-        shared_plan = build_shared_exposure_target_plan(
+    for scope_id, service in zip(scope_contract.scope_ids, services.services, strict=True):
+        geometry = api.resolve_full_frame_source_pixel_geometry(service)
+        scope_plan = build_shared_exposure_target_plan(
             geometry,
             shared.target_source_ids,
             detector_shape=expected_shape,
             stamp_shape=shared.stamp_shape,
         )
-        _validate_shared_exposure_plan_for_request(shared_plan, request=request)
-        publish_shared_exposure_target_plan(plan_path, shared_plan)
-        shared_windows = _shared_exposure_windows(shared_plan, api=api)
+        _validate_shared_exposure_plan_for_request(scope_plan, request=request)
+        if scope_id in shared_plans and scope_plan["content_sha256"] != shared_plans[scope_id]["content_sha256"]:
+            raise SharedExposureReferenceDriftError("scope target plan differs from current projected geometry")
+        publish_shared_exposure_target_plan(plan_paths[scope_id], scope_plan)
+        shared_plans[scope_id] = scope_plan
+        windows_by_scope[scope_id] = _shared_exposure_windows(scope_plan, api=api)
 
     render_frames_by_scope_batch = {
         (scope_id, batch.batch_index): tuple(
@@ -2699,8 +2740,8 @@ def _run_multiscope_shared_exposure_worker(
                 catalog=catalog,
                 frame_index=frame_index,
                 expected_shape=expected_shape,
-                plan=shared_plan,
-                windows=shared_windows,
+                plans_by_scope=shared_plans,
+                windows_by_scope=windows_by_scope,
                 scope_modes={
                     scope_id: scope_modes[scope_id][frame_index]
                     for scope_id in scope_contract.scope_ids
@@ -2779,7 +2820,7 @@ def run_worker(
     request.run_dir.mkdir(parents=True, exist_ok=True)
 
     shared = request.shared_exposure_stamps
-    if shared.enabled and not scope_contract.is_single_scope:
+    if shared.enabled and not scope_contract.uses_legacy_root_layout:
         return _run_multiscope_shared_exposure_worker(
             request=request,
             api=api,
@@ -3081,7 +3122,7 @@ def run_worker(
         api,
     )
     registry = api.DataRegistry(data_root=request.data_root)
-    if scope_contract.is_single_scope:
+    if scope_contract.uses_legacy_root_layout:
         services = api.build_full_frame_services(
             request.spec,
             catalog=catalog,
@@ -3165,7 +3206,7 @@ def run_worker(
     rendered: list[int] = []
     try:
         for frame_index in to_render:
-            if not scope_contract.is_single_scope:
+            if not scope_contract.uses_legacy_root_layout:
                 _render_multiscope_frame(
                     request=request,
                     api=api,
@@ -3886,15 +3927,17 @@ def _shared_exposure_incomplete_frames_for_worker(
         read_shared_exposure_target_plan,
     )
 
-    plan_path = _shared_exposure_plan_path(request.run_dir)
-    if not plan_path.is_file():
-        return assigned
-    plan = read_shared_exposure_target_plan(plan_path)
-    _validate_shared_exposure_plan_for_request(plan, request=request)
-    windows = _shared_exposure_windows(plan, api=api)
+    plan_paths = _scope_shared_exposure_plan_paths(request.run_dir, request.spec, scope_contract)
     incomplete: set[int] = set()
     for scope_id, batches in batches_by_scope.items():
         parent_root = scope_contract.scope_root(scope_id)
+        plan_path = plan_paths[scope_id]
+        if not plan_path.is_file():
+            incomplete.update(assigned)
+            continue
+        plan = read_shared_exposure_target_plan(plan_path)
+        _validate_shared_exposure_plan_for_request(plan, request=request)
+        windows = _shared_exposure_windows(plan, api=api)
         for batch in batches:
             storage_guard_cache = SharedExposureStorageGuardCache()
             shard_paths = _shared_exposure_batch_shard_paths(
@@ -4029,7 +4072,7 @@ def run_full_frame(
                 "independent_stamp_simulation": False,
                 "zero_new_rng_draws": True,
             }
-            if scope_contract.is_single_scope:
+            if scope_contract.uses_legacy_root_layout:
                 # Preserve the frozen single-scope manifest projection exactly.
                 shared_artifacts.update(
                     {
@@ -4073,6 +4116,13 @@ def run_full_frame(
                         },
                     }
                 )
+            scope_plan_paths = _scope_shared_exposure_plan_paths(plan.run_dir, plan.spec, scope_contract)
+            if len(set(scope_plan_paths.values())) > 1 or any(
+                path != _shared_exposure_plan_path(plan.run_dir) for path in scope_plan_paths.values()
+            ):
+                shared_artifacts.pop("target_plan", None)
+                for scope_id, scope_plan_path in scope_plan_paths.items():
+                    shared_artifacts["scopes"][f"scope_{scope_id}"]["target_plan"] = str(scope_plan_path)
             artifacts["shared_exposure"] = shared_artifacts
         store.create(
             workflow="et-full-frame",

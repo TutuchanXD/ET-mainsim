@@ -2943,3 +2943,63 @@ def test_full_frame_preflight_allows_validatable_cache_without_query_assets(
     )
     with pytest.raises(FileNotFoundError, match="focal-plane data"):
         preflight(missing_registry)
+
+
+@pytest.mark.parametrize("scope_ids", [(11,), (23, 11), (23, 11, 71)])
+def test_configurable_translated_scope_crops_and_resume(tmp_path, scope_ids):
+    from et_mainsim.config import SharedExposureStampsConfig
+    from et_mainsim.shared_exposure import read_shared_exposure_target_plan, SharedExposureReferenceDriftError
+    from et_mainsim.workflows.full_frame import run_worker, _shared_exposure_incomplete_frames_for_worker
+    from photsim7.artifacts import SharedExposureShardReader
+    from photsim7.specs import TelescopeSpec
+
+    request, api = _selection_ready_worker_request(tmp_path, n_frames=2)
+    scopes = tuple(TelescopeSpec(scope_id, request.spec.detector.detector_id,
+        'reference_translation', (index * 0.75, -index * 0.25)) for index, scope_id in enumerate(scope_ids))
+    request = replace(request, spec=replace(request.spec, instrument=replace(
+        request.spec.instrument, telescope_count=len(scopes), telescopes=scopes)),
+        shared_exposure_stamps=SharedExposureStampsConfig(enabled=True, target_source_ids=(11,),
+            stamp_rows=3, stamp_cols=3, frames_per_shard=1, product_keys=('final_stamp',)))
+    first = run_worker(request, science_api=api)
+    assert first.rendered == (0, 1)
+    hashes = set()
+    for scope in scopes:
+        shared_root = request.run_dir / 'shared_exposure' / f'scope_{scope.scope_id}'
+        plan = read_shared_exposure_target_plan(shared_root / 'target_plan.json')
+        hashes.add(plan['content_sha256'])
+        shards = sorted(shared_root.rglob('*.h5'))
+        assert len(shards) == 2
+        for shard in shards:
+            with SharedExposureShardReader(shard) as reader:
+                assert reader.provenance['scope_id'] == scope.scope_id
+                for frame_index in reader.frame_ids:
+                    crop = reader.read_array(11, frame_index)
+                    parent = np.load(request.run_dir / f'scope_{scope.scope_id}' / 'frames' / f'frame_{frame_index:06d}.npy')
+                    target = plan['targets'][0]
+                    assert target['x_frame_pix'] == 3 + scope.placement_offset_xy_pix[0]
+                    assert target['y_frame_pix'] == 2 + scope.placement_offset_xy_pix[1]
+                    window = target['window']
+                    x0, y0 = window['x_start_detector_pix'], window['y_start_detector_pix']
+                    expected = np.zeros((3, 3), dtype=parent.dtype)
+                    for y in range(3):
+                        for x in range(3):
+                            if 0 <= y0+y < parent.shape[0] and 0 <= x0+x < parent.shape[1]:
+                                expected[y, x] = parent[y0+y, x0+x]
+                    np.testing.assert_array_equal(crop, expected)
+    assert len(hashes) == len(scopes)
+    reordered = replace(request, spec=replace(request.spec, instrument=replace(
+        request.spec.instrument, telescopes=scopes[::-1])))
+    resumed = run_worker(reordered, science_api=api)
+    assert resumed.rendered == () and resumed.skipped == (0, 1)
+    assert _shared_exposure_incomplete_frames_for_worker(reordered, science_api=api) == ()
+    scheduled = run_worker(replace(reordered, world_size=2, rank=1), science_api=api)
+    assert scheduled.rendered == () and scheduled.skipped == (1,)
+    changed = replace(scopes[0], placement_offset_xy_pix=(0.1, 0.2))
+    drifted = replace(request, spec=replace(request.spec, instrument=replace(request.spec.instrument,
+        telescopes=(changed, *scopes[1:]))))
+    with pytest.raises((SharedExposureReferenceDriftError, ValueError), match='incomplete|differs|identity|spec|drift'):
+        run_worker(drifted, science_api=api)
+    added = replace(request, spec=replace(request.spec, instrument=replace(request.spec.instrument,
+        telescope_count=len(scopes)+1, telescopes=(*scopes, TelescopeSpec(999, request.spec.detector.detector_id)))))
+    with pytest.raises((SharedExposureReferenceDriftError, ValueError), match='incomplete|differs|identity|spec|drift'):
+        run_worker(added, science_api=api)
