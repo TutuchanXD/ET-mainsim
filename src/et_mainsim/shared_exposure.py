@@ -41,7 +41,7 @@ _POSITION_CONTRACTS = {
     ("x0", "y0"): "centered_offsets_to_frame_grid",
 }
 _GEOMETRY_TRUTH_MODES = frozenset(
-    {"physical_et_focalplane", "reference_field_nonphysical"}
+    {"physical_et_focalplane", "reference_field_nonphysical", "physical_sky_projection"}
 )
 _PARENT_GUARD_SCOPE = "storage_resume_guard_only"
 _NOT_SCIENTIFIC_LINEAGE = "not_scientific_lineage"

@@ -1944,9 +1944,9 @@ def test_stamp_run_identity_requires_current_product_contract(tmp_path):
         ),
         "selection_artifact_schema_version": 1,
         "selection_index_schema_id": "et_mainsim.selection_truth_index.v1",
-        "source_geometry_truth_schema_id": (
-            "photsim7.source_geometry_truth.v1"
-        ),
+        "source_geometry_truth_schema_ids": [
+            "photsim7.source_geometry_truth.v1", "photsim7.source_geometry_truth.v2"
+        ],
         "psf_selection_truth_schema_id": PSF_SELECTION_TRUTH_SCHEMA_ID,
         "cadence_selection_truth_schema_id": CADENCE_SELECTION_TRUTH_SCHEMA_ID,
         "cadence_selection_truth_schema_version": (

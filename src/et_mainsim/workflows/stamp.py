@@ -2411,9 +2411,9 @@ def _stamp_product_contract() -> dict[str, Any]:
         "selection_artifact_schema_id": _SELECTION_ARTIFACT_SCHEMA_ID,
         "selection_artifact_schema_version": 1,
         "selection_index_schema_id": _SELECTION_INDEX_SCHEMA_ID,
-        "source_geometry_truth_schema_id": (
-            "photsim7.source_geometry_truth.v1"
-        ),
+        "source_geometry_truth_schema_ids": [
+            "photsim7.source_geometry_truth.v1", "photsim7.source_geometry_truth.v2"
+        ],
         "psf_selection_truth_schema_id": PSF_SELECTION_TRUTH_SCHEMA_ID,
         "cadence_selection_truth_schema_id": CADENCE_SELECTION_TRUTH_SCHEMA_ID,
         "cadence_selection_truth_schema_version": (
