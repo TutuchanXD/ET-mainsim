@@ -2987,6 +2987,23 @@ def test_configurable_translated_scope_crops_and_resume(tmp_path, scope_ids):
                                 expected[y, x] = parent[y0+y, x0+x]
                     np.testing.assert_array_equal(crop, expected)
     assert len(hashes) == len(scopes)
+    from et_mainsim.workflows.full_frame import frame_is_complete
+    scope_root = request.run_dir / f'scope_{scopes[0].scope_id}'
+    schema_path = scope_root / 'frame_summaries' / 'frame_000000_schema.json'
+    original_schema = schema_path.read_bytes()
+    try:
+        for fields in [('provenance',), ('provenance', 'services'), ('provenance', 'services', 'scope_contract')]:
+            for invalid in (None, []):
+                payload = json.loads(original_schema)
+                target = payload
+                for key in fields[:-1]:
+                    target = target[key]
+                target[fields[-1]] = invalid
+                schema_path.write_text(json.dumps(payload))
+                assert not frame_is_complete(scope_root, 0, expected_shape=request.spec.detector.shape,
+                    expected_spec=request.spec, expected_scope_id=scopes[0].scope_id, require_scope_identity=True)
+    finally:
+        schema_path.write_bytes(original_schema)
     reordered = replace(request, spec=replace(request.spec, instrument=replace(
         request.spec.instrument, telescopes=scopes[::-1])))
     resumed = run_worker(reordered, science_api=api)

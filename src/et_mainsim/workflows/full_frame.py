@@ -851,8 +851,15 @@ def frame_is_complete(
         if schema.get("detector_id") != str(expected_spec.detector.detector_id):
             return False
         observed_scope_id = _schema_scope_id(schema)
-        service_provenance = schema.get("provenance", {}).get("services", {})
+        provenance = schema.get("provenance", {})
+        if not isinstance(provenance, Mapping):
+            return False
+        service_provenance = provenance.get("services", {})
+        if not isinstance(service_provenance, Mapping):
+            return False
         recorded_contract = service_provenance.get("scope_contract", {})
+        if not isinstance(recorded_contract, Mapping):
+            return False
         explicit_layout = getattr(expected_spec.instrument, "telescopes", None) is not None
         if explicit_layout or recorded_contract.get("schema_version") == 2:
             from photsim7.scope_contract import ScopeExecutionContract
