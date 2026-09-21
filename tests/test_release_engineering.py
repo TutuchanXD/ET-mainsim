@@ -1262,7 +1262,7 @@ def test_release_contract_reuses_full_test_runtime_dependency_identity() -> None
             "distribution": "photsim7",
             "repository": "TutuchanXD/Photsim7",
             "commit": full_test["dependencies"]["photsim7_commit"],
-            "version": "0.5.3",
+            "version": "0.5.4",
         },
     }
 

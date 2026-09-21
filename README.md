@@ -32,11 +32,11 @@ maintained Galaxy producer.
 The current full-test and release-engineering contracts are validated against
 ET-coordinate commit `f9cec8038b021c9540a026b94e876dc3240071d1`
 (version 0.1.2) and Photsim7 commit
-`144bb3acb538a4dc3bd75a0ace49ac7fab14c1e1` (version 0.5.3). Install those exact
+`0c0383f30d6e72c608b22e88077008dcbe7a8871` (version 0.5.4). Install those exact
 dependency snapshots before installing the ET-mainsim wheel with `--no-deps`,
 then run `python -m pip check`.
 
-The maintained runtime requires `photsim7[gpu]>=0.5.3,<0.6`. Its imports use
+The maintained runtime requires `photsim7[gpu]>=0.5.4,<0.6`. Its imports use
 canonical or retained public APIs and do not require the 16 top-level facades
 removed in Photsim7 0.5.0. The GPU extra supplies the Torch/Kornia backend for
 both CPU and CUDA execution; CUDA availability is checked separately at runtime.
@@ -187,7 +187,7 @@ mapping. Current details are in [full frame](docs/full_frame_workflow.md),
 bundles](docs/stamp_science_delivery_zh.md), and
 [legacy](docs/legacy_workflow.md).
 
-S4b telescope layouts require Photsim7 0.5.3. Scientific JSON accepts an explicit
+S4b telescope layouts require Photsim7 0.5.4. Scientific JSON accepts an explicit
 `instrument.telescopes` list with stable nonnegative IDs, a homogeneous detector
 association, and either `coincident` or `reference_translation` placement. The
 optional workbook row `Telescope Layout` accepts the same list as JSON. Count
