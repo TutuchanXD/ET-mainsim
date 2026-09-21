@@ -37,6 +37,36 @@ def _fake_adapter(raw: _Raw):
     )
 
 
+def test_continuous_delivery_rejects_incompatible_physical_raw_windows():
+    from dataclasses import replace
+    import pytest
+
+    raw = _fake_adapter(_fake_render(2))
+    timing = {"frame_start_s": 10.0, "frame_stop_s": 15.0,
+              "integration_s": 5.0, "sampling_interval_s": 5.0,
+              "absolute_raw_frame_index": 2, "readout_count": 1}
+    replace(raw, raw_timing=timing).validate_continuous_timing(2, 5)
+    for field, value in [("frame_start_s", 12), ("integration_s", 4),
+                         ("sampling_interval_s", 6), ("absolute_raw_frame_index", 3)]:
+        with pytest.raises(ValueError, match="continuous delivery timing"):
+            replace(raw, raw_timing={**timing, field: value}).validate_continuous_timing(2, 5)
+
+
+def test_delivery_coadd_cannot_overflow_dn_or_quality_counts():
+    from dataclasses import replace
+    import pytest
+    from et_mainsim.independent_stamp_production import _CoaddAccumulator
+
+    with pytest.raises(ValueError, match="quality-count capacity"):
+        _CoaddAccumulator(factor=65536, stamp_shape=(13, 13), raw_exposure_seconds=5)
+    accumulator = _CoaddAccumulator(factor=2, stamp_shape=(13, 13), raw_exposure_seconds=5)
+    raw = _fake_adapter(_fake_render(0))
+    maximum = replace(raw, final_dn=np.full((13, 13), np.iinfo(np.uint64).max, dtype=np.uint64))
+    accumulator.add(maximum, raw_frame_index=0)
+    with pytest.raises(OverflowError, match="coadd uint64 overflow"):
+        accumulator.add(raw, raw_frame_index=1)
+
+
 def test_streamed_independent_shard_writes_raw_and_all_coadds(tmp_path) -> None:
     from et_mainsim.independent_stamp_production import (
         IndependentStampShardRequest,
@@ -320,6 +350,9 @@ def test_photsim7_adapter_maps_delivery_calibration_and_quality_planes() -> None
 
     shape = (13, 13)
     products = SimpleNamespace(
+        raw_cadence={"frame_start_s": 0, "frame_stop_s": 10,
+                     "integration_s": 10, "sampling_interval_s": 10,
+                     "absolute_raw_frame_index": 0, "readout_count": 1},
         final_stamp=SimpleNamespace(
             array=np.full(shape, 1234, dtype=np.uint16),
             unit="dn",
@@ -367,6 +400,7 @@ def test_photsim7_adapter_maps_delivery_calibration_and_quality_planes() -> None
     )
 
     delivery = raw_stamp_delivery_frame_from_photsim7(result)
+    delivery.validate_continuous_timing(0, 10)
 
     assert delivery.final_dn.dtype == np.dtype(np.uint16)
     np.testing.assert_array_equal(delivery.final_dn, products.final_stamp.array)

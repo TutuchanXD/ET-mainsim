@@ -400,6 +400,12 @@ def _frame_plan(spec: Any) -> dict[str, Any]:
         "n_raw_frames_per_coadd": per_coadd,
         "coadd_count": raw_count // per_coadd,
         "coadd_indices": list(range(raw_count // per_coadd)),
+        "raw_timing": {
+            "first_raw": spec.observation.raw_frame_timing(spec.detector.detector_type, 0),
+            "last_raw": spec.observation.raw_frame_timing(spec.detector.detector_type, raw_count - 1),
+            "explicit_frame_start_s": spec.observation.frame_start_s,
+            "coadd_grouping": "consecutive_raw_indices_preserving_time_gaps",
+        },
     }
 
 

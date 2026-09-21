@@ -111,6 +111,7 @@ class RawStampDeliveryFrame:
     adc_low_mask: NDArray[np.bool_]
     adc_high_mask: NDArray[np.bool_]
     cosmic_mask: NDArray[np.bool_]
+    raw_timing: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         final = np.asarray(self.final_dn)
@@ -168,6 +169,31 @@ class RawStampDeliveryFrame:
             "cosmic_mask",
         ):
             object.__setattr__(self, name, _mask(getattr(self, name), name=name, shape=shape))
+        if self.raw_timing is not None:
+            object.__setattr__(self, "raw_timing", _json_mapping(self.raw_timing, name="raw_timing"))
+
+    def validate_continuous_timing(self, frame_index: int, integration_s: float) -> None:
+        """Prevent gapped or differently exposed Photsim7 raws entering this format."""
+        if self.raw_timing is None:
+            # Synthetic/raw array producers own the explicit request timeline.
+            return
+        timing = self.raw_timing
+        start = frame_index * integration_s
+        expected = {
+            "frame_start_s": start,
+            "frame_stop_s": start + integration_s,
+            "integration_s": integration_s,
+            "sampling_interval_s": integration_s,
+        }
+        if (timing.get("absolute_raw_frame_index") != frame_index
+                or timing.get("readout_count") != 1
+                or any(not math.isclose(float(timing.get(key, float("nan"))), value,
+                                        rel_tol=1e-12, abs_tol=0)
+                       for key, value in expected.items())):
+            raise ValueError(
+                "Photsim7 raw timing conflicts with continuous delivery timing; "
+                "use et-stamp raw/coadd products for readout gaps or irregular starts"
+            )
 
     @property
     def stamp_shape(self) -> tuple[int, int]:
@@ -250,6 +276,10 @@ class _CoaddAccumulator:
     adc_high_count: NDArray[np.uint16] | None = None
     cosmic_count: NDArray[np.uint16] | None = None
 
+    def __post_init__(self) -> None:
+        if self.factor <= 0 or self.factor > np.iinfo(np.uint16).max:
+            raise ValueError("delivery coadd factor exceeds uint16 quality-count capacity")
+
     def add(self, raw: RawStampDeliveryFrame, *, raw_frame_index: int) -> None:
         if raw.stamp_shape != self.stamp_shape:
             raise ValueError("raw frame stamp shape differs from coadd accumulator")
@@ -274,7 +304,10 @@ class _CoaddAccumulator:
         assert self.adc_low_count is not None
         assert self.adc_high_count is not None
         assert self.cosmic_count is not None
-        self.final_dn += raw.final_dn.astype(np.uint64, copy=False)
+        values = raw.final_dn.astype(np.uint64, copy=False)
+        if np.any(values > np.iinfo(np.uint64).max - self.final_dn):
+            raise OverflowError("delivery coadd uint64 overflow")
+        self.final_dn += values
         self.background_expectation_e += raw.background_expectation_e
         self.captured_flux_weighted_sum_e += (
             raw.captured_flux_fraction * raw.captured_flux_weight_e
@@ -742,6 +775,7 @@ def run_independent_stamp_time_shard(
                 raw = adapt_raw(render_raw(raw_frame_index))
                 if not isinstance(raw, RawStampDeliveryFrame):
                     raise TypeError("adapt_raw must return RawStampDeliveryFrame")
+                raw.validate_continuous_timing(raw_frame_index, request.shard.raw_exposure_seconds)
                 if raw.stamp_shape != request.stamp_shape:
                     raise ValueError(
                         "rendered raw frame stamp shape differs from request.stamp_shape"
@@ -810,6 +844,9 @@ def raw_stamp_delivery_frame_from_photsim7(result: Any) -> RawStampDeliveryFrame
     final_product = getattr(products, "final_stamp", None)
     if final_product is None:
         raise ValueError("Photsim7 result is missing final_stamp")
+    timing = getattr(products, "raw_cadence", None)
+    if not isinstance(timing, Mapping) or "frame_start_s" not in timing:
+        raise ValueError("Photsim7 result lacks explicit raw timing; requires Photsim7 >=0.5.2")
     final_dn = _to_numpy(final_product.array)
     if getattr(final_product, "unit", None) != "dn":
         raise ValueError("formal delivery requires ADC-enabled Photsim7 final_dn")
@@ -891,6 +928,7 @@ def raw_stamp_delivery_frame_from_photsim7(result: Any) -> RawStampDeliveryFrame
         adc_low_mask=product_mask("adc_low_clipped_mask"),
         adc_high_mask=product_mask("adc_high_clipped_mask"),
         cosmic_mask=cosmic_mask,
+        raw_timing=timing,
     )
 
 

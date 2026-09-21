@@ -1,9 +1,9 @@
 schema_version = 1
 pytest_version = "9.0.3"
 python_versions = ["3.12", "3.13"]
-# Full suite inventory, including S3 configurable-input and recovery regressions.
-expected_collected = 1031
-nodeid_sha256 = "383b0f1f9c5c17254d5ef13221bcec06f4f307bc01ec033206b641bc1c7ac25f"
+# Full suite inventory, including S4a raw timing, delivery and coadd regressions.
+expected_collected = 1036
+nodeid_sha256 = "56ad9d0c0754a65182954ae919d9023a2d0822bb858e9e5bd30098220dcef942"
 allowed_skips = [
   "tests/test_galaxy_delivery_notebooks.py::test_galaxy_delivery_notebook_is_a_read_only_raw_coverage_v2_consumer",
   "tests/test_galaxy_delivery_notebooks.py::test_galaxy_campaign_summary_notebook_only_consumes_atomic_raw_coverage_summary",
@@ -57,4 +57,4 @@ test_files = [
 
 [dependencies]
 et_coordinate_commit = "f9cec8038b021c9540a026b94e876dc3240071d1"
-photsim7_commit = "869a2d5b92916ff6b0470cc6c271aca6a6f05ac8"
+photsim7_commit = "9e356beffeea47152505de3f4540055a356f6db7"

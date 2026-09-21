@@ -3578,6 +3578,7 @@ def resolve_simulation_spec(
                 observing_duration=resolved_frames * sampling,
                 n_frames=resolved_frames,
             )
+    observation.validate_raw_timing(spec.detector.detector_type)
     catalog_updates: dict[str, Any] = {
         "cache_path": str(catalog_cache),
         "source_path": _resolve_package_catalog(spec.catalog.source_path),

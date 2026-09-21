@@ -57,7 +57,7 @@ def test_planning_preserves_explicit_observation_and_user_device(tmp_path):
             loaded.simulation_spec.observation,
             n_frames=2,
             observing_duration=20 * u.s,
-            frame_start_s=(0.0, 9.0),
+            frame_start_s=(0.0, 12.0),
         ),
         psf=replace(loaded.simulation_spec.psf, compute_device="cuda"),
     )
