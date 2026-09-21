@@ -217,3 +217,26 @@ def test_cli_completes_partial_table_workload_before_validation(tmp_path, capsys
         == 0
     )
     assert json.loads(capsys.readouterr().out)["workload"]["input_mode"] == "table"
+
+
+def test_cli_workbook_null_resets_an_explicit_preset_scope_list(tmp_path, monkeypatch, capsys):
+    import et_mainsim.cli as cli
+    from photsim7.specs import TelescopeSpec
+    original = load_preset('et-full-frame-smoke')
+    base = original.simulation_spec
+    preset = replace(original, simulation_spec=replace(base, instrument=replace(
+        base.instrument, telescope_count=1,
+        telescopes=(TelescopeSpec(23, base.detector.detector_id),))))
+    monkeypatch.setattr(cli, 'load_preset', lambda name: preset)
+    path = tmp_path / 'reset.xlsx'
+    book = Workbook()
+    book.active.append(['Group', 'Parameter', 'Value', 'Unit'])
+    book.active.append(['Instrument', 'Telescope Layout', 'null', None])
+    book.save(path)
+    book.close()
+    assert cli.main(['run', 'et-full-frame', '--preset', 'smoke', '--spec', str(path),
+                     '--output-root', str(tmp_path/'out'), '--dry-run']) == 0
+    spec = json.loads(capsys.readouterr().out)['simulation_spec']
+    assert spec['instrument']['telescope_count'] == 1
+    assert spec['instrument']['telescopes'] is None
+    assert not (tmp_path/'out').exists()
