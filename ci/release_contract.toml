@@ -33,7 +33,7 @@ version = "0.1.2"
 [runtime_dependencies.photsim7]
 distribution = "photsim7"
 repository = "TutuchanXD/Photsim7"
-commit = "ed42c13ecee9e95e148765ccb756ef1935095bdc"
+commit = "144bb3acb538a4dc3bd75a0ace49ac7fab14c1e1"
 version = "0.5.3"
 
 [files]

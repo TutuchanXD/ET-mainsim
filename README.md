@@ -32,7 +32,7 @@ maintained Galaxy producer.
 The current full-test and release-engineering contracts are validated against
 ET-coordinate commit `f9cec8038b021c9540a026b94e876dc3240071d1`
 (version 0.1.2) and Photsim7 commit
-`ed42c13ecee9e95e148765ccb756ef1935095bdc` (version 0.5.3). Install those exact
+`144bb3acb538a4dc3bd75a0ace49ac7fab14c1e1` (version 0.5.3). Install those exact
 dependency snapshots before installing the ET-mainsim wheel with `--no-deps`,
 then run `python -m pip check`.
 
