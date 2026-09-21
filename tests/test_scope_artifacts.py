@@ -95,7 +95,7 @@ def test_scope_contract_fails_closed_for_unsupported_count_and_scope_id(
     with pytest.raises(ScopeArtifactContractError, match="telescope_count"):
         FullFrameScopeArtifactContract.from_telescope_count(
             tmp_path / "run",
-            telescope_count=2,
+            telescope_count=0,
         )
 
     contract = FullFrameScopeArtifactContract.from_telescope_count(
@@ -104,3 +104,15 @@ def test_scope_contract_fails_closed_for_unsupported_count_and_scope_id(
     )
     with pytest.raises(ScopeArtifactContractError, match="scope_id"):
         contract.paths_for_scope_frame(scope_id=6, frame_index=0)
+
+
+@pytest.mark.parametrize("scope_ids", [(11,), (23, 11), (50, 3, 15)])
+def test_sparse_ids_use_canonical_scope_directories(tmp_path, scope_ids):
+    from et_mainsim.scope_artifacts import FullFrameScopeArtifactContract
+    contract = FullFrameScopeArtifactContract(tmp_path, scope_ids)
+    assert contract.scope_ids == tuple(sorted(scope_ids))
+    assert contract.is_single_scope == (len(scope_ids) == 1)
+    assert not contract.uses_legacy_root_layout
+    for scope_id in scope_ids:
+        assert contract.scope_root(scope_id) == tmp_path / f"scope_{scope_id}"
+    assert not contract.frame_completion(frame_index=0, scope_is_complete=lambda p: p.scope_id != min(scope_ids)).is_complete

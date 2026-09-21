@@ -32,11 +32,11 @@ maintained Galaxy producer.
 The current full-test and release-engineering contracts are validated against
 ET-coordinate commit `f9cec8038b021c9540a026b94e876dc3240071d1`
 (version 0.1.2) and Photsim7 commit
-`9e356beffeea47152505de3f4540055a356f6db7` (version 0.5.2). Install those exact
+`144bb3acb538a4dc3bd75a0ace49ac7fab14c1e1` (version 0.5.3). Install those exact
 dependency snapshots before installing the ET-mainsim wheel with `--no-deps`,
 then run `python -m pip check`.
 
-The maintained runtime requires `photsim7[gpu]>=0.5.2,<0.6`. Its imports use
+The maintained runtime requires `photsim7[gpu]>=0.5.3,<0.6`. Its imports use
 canonical or retained public APIs and do not require the 16 top-level facades
 removed in Photsim7 0.5.0. The GPU extra supplies the Torch/Kornia backend for
 both CPU and CUDA execution; CUDA availability is checked separately at runtime.
@@ -186,3 +186,21 @@ mapping. Current details are in [full frame](docs/full_frame_workflow.md),
 [stamp](docs/stamp_workflow.md), [stamp science delivery
 bundles](docs/stamp_science_delivery_zh.md), and
 [legacy](docs/legacy_workflow.md).
+
+S4b telescope layouts require Photsim7 0.5.3. Scientific JSON accepts an explicit
+`instrument.telescopes` list with stable nonnegative IDs, a homogeneous detector
+association, and either `coincident` or `reference_translation` placement. The
+optional workbook row `Telescope Layout` accepts the same list as JSON. Count
+and list length must agree. List order is canonicalized before run identity is
+computed. Legacy scope zero keeps its root directory; other configurations use
+`scope_<id>/`, including a single nonzero ID. Reference translations require a
+nonphysical reference catalog and explicit PSF field selection; they do not
+claim calibrated ET pointing geometry.
+
+Full-frame shared-exposure stamps use each scope's parent and projected target
+windows. Translated layouts store each plan at
+`shared_exposure/scope_<id>/target_plan.json`; manifests and completion markers
+reference that plan. Reordering scopes preserves resume identity; changing
+members, detector association or layout requires a new run. Independent target
+MC remains single-scope. Real CPU/CUDA acceptance is available through
+`validation/test_s4b_telescope_layouts.py` with the same asset environment as S3.
