@@ -39,6 +39,7 @@ _TARGET_ARTIFACT_SCHEMA_VERSION = 2
 _SELECTION_ARTIFACT_SCHEMA_ID = (
     "et_mainsim.stamp_selection_truth_artifacts.v1"
 )
+_POSE_SELECTION_ARTIFACT_SCHEMA_ID = "et_mainsim.stamp_selection_truth_artifacts.v2"
 _SELECTION_INDEX_SCHEMA_ID = "et_mainsim.selection_truth_index.v1"
 _SELECTION_TRUTH_SCOPE = (
     "geometry_psf_and_jitter_selection_truth_only"
@@ -1055,6 +1056,10 @@ def _selection_identity_payload(identity: Any, *, target_dir: Path) -> dict[str,
     }
 
 
+def _geometry_changes_within_observation(geometry_truth: Any) -> bool:
+    return not geometry_truth.pointing_is_fixed
+
+
 class _SelectionTruthAccumulator:
     def __init__(
         self,
@@ -1084,6 +1089,9 @@ class _SelectionTruthAccumulator:
         self.absolute_raw_frame_start_index: int | None = None
         self.geometry: dict[str, Any] | None = None
         self.psf: dict[str, Any] | None = None
+        self.dynamic_geometry: bool | None = None
+        self.geometry_identities: dict[str, dict[str, Any]] = {}
+        self.psf_identities: dict[str, dict[str, Any]] = {}
         self.cadence_schema_id: str | None = None
         self.cadence_schema_version: int | None = None
         self.science_conformance_claim: bool | None = None
@@ -1205,15 +1213,21 @@ class _SelectionTruthAccumulator:
             raise RuntimeError("PSF sidecar identity conflicts with truth")
         if cadence["content_sha256"] != truth.content_sha256:
             raise RuntimeError("cadence sidecar identity conflicts with truth")
+        dynamic_geometry = _geometry_changes_within_observation(
+            truth.source_geometry_truth
+        )
         if self.geometry is None:
             self.geometry = geometry
             self.psf = psf
+            self.dynamic_geometry = dynamic_geometry
             self.cadence_schema_id = cadence["schema_id"]
             self.cadence_schema_version = cadence["schema_version"]
             self.science_conformance_claim = bool(
                 truth.science_conformance_claim
             )
-        elif self.geometry != geometry or self.psf != psf:
+        elif self.dynamic_geometry != dynamic_geometry:
+            raise RuntimeError("geometry temporal binding changed by cadence")
+        elif not dynamic_geometry and (self.geometry != geometry or self.psf != psf):
             raise RuntimeError(
                 "static geometry or PSF selection identity changed by cadence"
             )
@@ -1224,6 +1238,8 @@ class _SelectionTruthAccumulator:
             is not bool(truth.science_conformance_claim)
         ):
             raise RuntimeError("cadence selection contract changed by cadence")
+        self.geometry_identities[geometry["content_sha256"]] = geometry
+        self.psf_identities[psf["content_sha256"]] = psf
 
         expected_relative = (
             Path("selection_truth")
@@ -1264,8 +1280,12 @@ class _SelectionTruthAccumulator:
         ):
             raise RuntimeError("selection truth accumulator is incomplete")
         return {
-            "schema_id": _SELECTION_ARTIFACT_SCHEMA_ID,
-            "schema_version": 1,
+            "schema_id": (
+                _POSE_SELECTION_ARTIFACT_SCHEMA_ID
+                if self.dynamic_geometry
+                else _SELECTION_ARTIFACT_SCHEMA_ID
+            ),
+            "schema_version": 2 if self.dynamic_geometry else 1,
             "verification_status": "persisted_and_verified",
             "science_conformance_claim": self.science_conformance_claim,
             "science_conformance_claim_scope": _SELECTION_TRUTH_SCOPE,
@@ -1274,23 +1294,28 @@ class _SelectionTruthAccumulator:
             ),
             "missing_components": [],
             "artifact_root": ".",
-            "source_geometry_truth": dict(self.geometry),
-            "psf_selection_truth": dict(self.psf),
+            "source_geometry_truth": (
+                [
+                    self.geometry_identities[key]
+                    for key in sorted(self.geometry_identities)
+                ]
+                if self.dynamic_geometry
+                else dict(self.geometry)
+            ),
+            "psf_selection_truth": (
+                [self.psf_identities[key] for key in sorted(self.psf_identities)]
+                if self.dynamic_geometry
+                else dict(self.psf)
+            ),
             "cadence_selection_truth": {
                 "schema_id": self.cadence_schema_id,
                 "schema_version": self.cadence_schema_version,
                 "relative_directory": "selection_truth/cadence",
-                "filename_template": (
-                    "frame_{absolute_raw_frame_index:09d}.json"
-                ),
+                "filename_template": ("frame_{absolute_raw_frame_index:09d}.json"),
                 "count": self.count,
-                "absolute_raw_frame_start_index": (
-                    self.absolute_raw_frame_start_index
-                ),
+                "absolute_raw_frame_start_index": (self.absolute_raw_frame_start_index),
                 "spacecraft_id": self.expected_spacecraft_id,
-                "science_realization_id": (
-                    self.expected_science_realization_id
-                ),
+                "science_realization_id": (self.expected_science_realization_id),
                 "index_digest_schema_id": _SELECTION_INDEX_SCHEMA_ID,
                 "index_content_sha256": self.digest.hexdigest(),
             },
@@ -1337,13 +1362,18 @@ def _validate_selection_sidecars(
     selection = payload.get("selection_truth")
     if not isinstance(selection, Mapping):
         return False
-    if selection.get("schema_id") != _SELECTION_ARTIFACT_SCHEMA_ID:
-        return False
-    if int(selection.get("schema_version", 0)) != 1:
+    schema_pair = (selection.get("schema_id"), selection.get("schema_version"))
+    dynamic_geometry = schema_pair == (_POSE_SELECTION_ARTIFACT_SCHEMA_ID, 2)
+    if schema_pair not in {
+        (_SELECTION_ARTIFACT_SCHEMA_ID, 1),
+        (_POSE_SELECTION_ARTIFACT_SCHEMA_ID, 2),
+    }:
         return False
     raw_ids, _ = _expected_ids(plan)
     verification_status = selection.get("verification_status")
     if verification_status == "unavailable":
+        if dynamic_geometry:
+            return False
         if set(selection) != {
             "schema_id",
             "schema_version",
@@ -1397,14 +1427,18 @@ def _validate_selection_sidecars(
         return False
     if selection.get("artifact_root") != ".":
         return False
-    geometry = _selection_identity_from_manifest(
-        selection["source_geometry_truth"],
-        label="source geometry truth",
-    )
-    psf = _selection_identity_from_manifest(
-        selection["psf_selection_truth"],
-        label="PSF selection truth",
-    )
+    identities = {}
+    for key in ("source_geometry_truth", "psf_selection_truth"):
+        values = selection[key] if dynamic_geometry else [selection[key]]
+        if not isinstance(values, list) or not values:
+            return False
+        parsed = [
+            _selection_identity_from_manifest(value, label=key) for value in values
+        ]
+        identities[key] = {value["content_sha256"]: value for value in parsed}
+        if len(identities[key]) != len(parsed):
+            return False
+    seen_geometry, seen_psf = set(), set()
     cadence = selection["cadence_selection_truth"]
     if not isinstance(cadence, Mapping):
         return False
@@ -1493,6 +1527,18 @@ def _validate_selection_sidecars(
             return False
         geometry_reference = truth.geometry_reference
         psf_reference = truth.psf_reference
+        if dynamic_geometry != _geometry_changes_within_observation(
+            truth.source_geometry_truth
+        ):
+            return False
+        geometry = identities["source_geometry_truth"].get(
+            geometry_reference["content_sha256"]
+        )
+        psf = identities["psf_selection_truth"].get(psf_reference["content_sha256"])
+        if geometry is None or psf is None:
+            return False
+        seen_geometry.add(geometry["content_sha256"])
+        seen_psf.add(psf["content_sha256"])
         for field_name in (
             "schema_id",
             "schema_version",
@@ -1510,7 +1556,11 @@ def _validate_selection_sidecars(
                 content_sha256=truth.content_sha256,
             )
         )
-    return digest.hexdigest() == expected_digest
+    return (
+        digest.hexdigest() == expected_digest
+        and seen_geometry == set(identities["source_geometry_truth"])
+        and seen_psf == set(identities["psf_selection_truth"])
+    )
 
 
 def _read_target_artifacts(
@@ -2399,7 +2449,10 @@ def _catalog_manifest(prepared: PreparedStampInputs, plan: StampRunPlan) -> dict
 
 
 def _stamp_product_contract() -> dict[str, Any]:
-    from photsim7.psf.selection_truth import PSF_SELECTION_TRUTH_SCHEMA_ID
+    from photsim7.psf.selection_truth import (
+        PSF_SELECTION_TRUTH_SCHEMA_ID,
+        POSE_PSF_SELECTION_TRUTH_SCHEMA_ID,
+    )
     from photsim7.selection_artifacts import (
         CADENCE_SELECTION_TRUTH_SCHEMA_ID,
         CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
@@ -2408,13 +2461,19 @@ def _stamp_product_contract() -> dict[str, Any]:
     return {
         "target_artifact_schema_id": "et_mainsim.stamp_target_artifacts",
         "target_artifact_schema_version": _TARGET_ARTIFACT_SCHEMA_VERSION,
-        "selection_artifact_schema_id": _SELECTION_ARTIFACT_SCHEMA_ID,
-        "selection_artifact_schema_version": 1,
+        "selection_artifact_schemas": [
+            {"schema_id": _SELECTION_ARTIFACT_SCHEMA_ID, "schema_version": 1},
+            {"schema_id": _POSE_SELECTION_ARTIFACT_SCHEMA_ID, "schema_version": 2},
+        ],
         "selection_index_schema_id": _SELECTION_INDEX_SCHEMA_ID,
-        "source_geometry_truth_schema_id": (
-            "photsim7.source_geometry_truth.v1"
-        ),
-        "psf_selection_truth_schema_id": PSF_SELECTION_TRUTH_SCHEMA_ID,
+        "source_geometry_truth_schema_ids": [
+            "photsim7.source_geometry_truth.v1",
+            "photsim7.source_geometry_truth.v2",
+        ],
+        "psf_selection_truth_schema_ids": [
+            PSF_SELECTION_TRUTH_SCHEMA_ID,
+            POSE_PSF_SELECTION_TRUTH_SCHEMA_ID,
+        ],
         "cadence_selection_truth_schema_id": CADENCE_SELECTION_TRUTH_SCHEMA_ID,
         "cadence_selection_truth_schema_version": (
             CADENCE_SELECTION_TRUTH_SCHEMA_VERSION

@@ -1,5 +1,12 @@
 # ET-mainsim
 
+Photsim7 0.5.6 的配套支持包括 `SimulationSpec.geometry`、逐帧
+`physical_sky_projection`、绑定源/相机/观测时间/积分时长的预计算 DVA，以及动态
+geometry/PSF truth。full-frame 的 shared crop 保持父运行首帧的 detector 窗口，stamp 保持几何声明首个
+pose 的窗口；stamp coadd 与严格 sidecar 完成校验支持跨指向切换。运行身份包含完整配置，
+修改几何或观测起点后须使用新 run。坐标与边界见上游
+[观测几何文档](https://github.com/TutuchanXD/Photsim7/blob/main/docs/observation_geometry.md)。
+
 ET-mainsim is the reference application for Earth 2.0 Telescope simulations.
 It owns presets, CLI orchestration, manifests, local workers, Slurm templates,
 resume policy, and examples. Photsim7 owns all catalog, photometry, PSF,
@@ -32,11 +39,11 @@ maintained Galaxy producer.
 The current full-test and release-engineering contracts are validated against
 ET-coordinate commit `f9cec8038b021c9540a026b94e876dc3240071d1`
 (version 0.1.2) and Photsim7 commit
-`0c0383f30d6e72c608b22e88077008dcbe7a8871` (version 0.5.4). Install those exact
+`7611ef0857d27847b03306d9d7472b0d5c028a93` (version 0.5.6). Install those exact
 dependency snapshots before installing the ET-mainsim wheel with `--no-deps`,
 then run `python -m pip check`.
 
-The maintained runtime requires `photsim7[gpu]>=0.5.4,<0.6`. Its imports use
+The maintained runtime requires `photsim7[gpu]>=0.5.6,<0.6`. Its imports use
 canonical or retained public APIs and do not require the 16 top-level facades
 removed in Photsim7 0.5.0. The GPU extra supplies the Torch/Kornia backend for
 both CPU and CUDA execution; CUDA availability is checked separately at runtime.
@@ -187,7 +194,7 @@ mapping. Current details are in [full frame](docs/full_frame_workflow.md),
 bundles](docs/stamp_science_delivery_zh.md), and
 [legacy](docs/legacy_workflow.md).
 
-S4b telescope layouts require Photsim7 0.5.4. Scientific JSON accepts an explicit
+S4b telescope layouts require Photsim7 0.5.6. Scientific JSON accepts an explicit
 `instrument.telescopes` list with stable nonnegative IDs, a homogeneous detector
 association, and either `coincident` or `reference_translation` placement. The
 optional workbook row `Telescope Layout` accepts the same list as JSON. Count

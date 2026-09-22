@@ -1,9 +1,9 @@
 schema_version = 1
 pytest_version = "9.0.3"
 python_versions = ["3.12", "3.13"]
-# Full suite inventory, including S4b telescope layout, crop and resume regressions.
-expected_collected = 1043
-nodeid_sha256 = "7cec42f21587d549b2b10a510527d9b66eff0015b785f181b97f3508fb384bac"
+# Full suite inventory, including S5 per-frame geometry, bound DVA and stamp resume regressions.
+expected_collected = 1049
+nodeid_sha256 = "036b534cd923c46ec78cdc11897a5aaa673ceed56e7e80237963e06985dfab7e"
 allowed_skips = [
   "tests/test_galaxy_delivery_notebooks.py::test_galaxy_delivery_notebook_is_a_read_only_raw_coverage_v2_consumer",
   "tests/test_galaxy_delivery_notebooks.py::test_galaxy_campaign_summary_notebook_only_consumes_atomic_raw_coverage_summary",
@@ -57,4 +57,4 @@ test_files = [
 
 [dependencies]
 et_coordinate_commit = "f9cec8038b021c9540a026b94e876dc3240071d1"
-photsim7_commit = "0c0383f30d6e72c608b22e88077008dcbe7a8871"
+photsim7_commit = "7611ef0857d27847b03306d9d7472b0d5c028a93"

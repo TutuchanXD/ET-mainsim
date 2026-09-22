@@ -339,7 +339,6 @@ def _shared_exposure_plan_path(run_dir: Path) -> Path:
     return _shared_exposure_root(run_dir) / "target_plan.json"
 
 
-
 def _scope_shared_exposure_plan_paths(
     run_dir: Path, spec: Any, contract: FullFrameScopeArtifactContract,
 ) -> dict[int, Path]:
@@ -353,7 +352,6 @@ def _scope_shared_exposure_plan_paths(
             if translated else _shared_exposure_plan_path(run_dir)
         ) for scope_id in contract.scope_ids
     }
-
 
 
 def _scope_plan_path_for_parent(request: WorkerRequest, parent_root: Path) -> Path:
@@ -1288,10 +1286,24 @@ def _select_brightest_catalog(catalog: Any, max_stars: int | None, api: Any) -> 
             if array.ndim == 1 and len(array) == int(catalog.n_sources)
             else value
         )
+    metadata = dict(catalog.metadata)
+    if metadata.get("geometry", {}).get("mode") == "physical_sky_projection":
+        from photsim7.effects.sky_projection import TangentPlaneProjector
+        from photsim7.geometry_truth import (
+            sky_projection_declaration, source_geometry_declaration_from_metadata,
+        )
+
+        declaration = source_geometry_declaration_from_metadata(metadata)
+        projection = TangentPlaneProjector.from_json_dict(declaration["projection_inputs"])
+        if not np.array_equal(projection.source_ids, np.asarray(catalog.star_data["source_id"])):
+            raise ValueError("sky projection declaration source order conflicts with catalog selection")
+        subset = replace(projection, source_ids=projection.source_ids[order],
+                         ra_deg=projection.ra_deg[order], dec_deg=projection.dec_deg[order])
+        metadata["geometry"] = sky_projection_declaration(subset.to_json_dict())
     return api.PreparedStarCatalog(
         star_data=selected,
         metadata={
-            **dict(catalog.metadata),
+            **metadata,
             "et_mainsim_selection": {
                 "policy": "brightest",
                 "input_n_sources": int(catalog.n_sources),
@@ -3862,8 +3874,11 @@ def _full_frame_product_contract() -> dict[str, Any]:
         FRAME_PRODUCT_SCHEMA_ID,
         FRAME_PRODUCT_SCHEMA_VERSION,
     )
-    from photsim7.geometry_truth import SOURCE_GEOMETRY_TRUTH_SCHEMA_ID
-    from photsim7.psf.selection_truth import PSF_SELECTION_TRUTH_SCHEMA_ID
+    from photsim7.geometry_truth import (SOURCE_GEOMETRY_TRUTH_SCHEMA_ID, SOURCE_GEOMETRY_TRUTH_V2_SCHEMA_ID)
+    from photsim7.psf.selection_truth import (
+        PSF_SELECTION_TRUTH_SCHEMA_ID,
+        POSE_PSF_SELECTION_TRUTH_SCHEMA_ID,
+    )
     from photsim7.selection_artifacts import (
         CADENCE_SELECTION_TRUTH_SCHEMA_ID,
         CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
@@ -3880,8 +3895,14 @@ def _full_frame_product_contract() -> dict[str, Any]:
     return {
         "frame_product_schema_id": FRAME_PRODUCT_SCHEMA_ID,
         "frame_product_schema_version": FRAME_PRODUCT_SCHEMA_VERSION,
-        "source_geometry_truth_schema_id": SOURCE_GEOMETRY_TRUTH_SCHEMA_ID,
-        "psf_selection_truth_schema_id": PSF_SELECTION_TRUTH_SCHEMA_ID,
+        "source_geometry_truth_schema_ids": [
+            SOURCE_GEOMETRY_TRUTH_SCHEMA_ID,
+            SOURCE_GEOMETRY_TRUTH_V2_SCHEMA_ID,
+        ],
+        "psf_selection_truth_schema_ids": [
+            PSF_SELECTION_TRUTH_SCHEMA_ID,
+            POSE_PSF_SELECTION_TRUTH_SCHEMA_ID,
+        ],
         "cadence_selection_truth_schema_id": (CADENCE_SELECTION_TRUTH_SCHEMA_ID),
         "cadence_selection_truth_schema_version": (
             CADENCE_SELECTION_TRUTH_SCHEMA_VERSION

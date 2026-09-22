@@ -993,6 +993,12 @@ def _complete_full_frame_selection_api(api):
                 sampling_interval_s=(spec.observation.sampling_interval.to_value(u.s)),
             ),
             source_geometry=services.source_geometry,
+            projector=services.projector,
+            components=(
+                services.effect_timeseries.components
+                if services.effect_timeseries is not None
+                else ()
+            ),
             jitter_integrated_psf_offsets=np.zeros((100, 2, 1)),
             jitter_model_selector=selector,
         )
@@ -1113,6 +1119,141 @@ def _enable_shared_exposure(
             product_keys=product_keys,
         ),
     )
+
+
+@pytest.mark.parametrize("max_stars", [None, 1])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_synthetic_sky_geometry_renders_shared_crops_and_resumes(
+    tmp_path, max_stars, dynamic
+):
+    from et_mainsim.config import SharedExposureStampsConfig
+    from et_mainsim.shared_exposure import read_shared_exposure_target_plan
+    from et_mainsim.workflows.full_frame import run_worker
+    from photsim7.catalogs.cache import StarCatalogCache
+    from photsim7.catalogs.sources import PreparedStarCatalog
+    from photsim7.effects.sky_projection import TangentPlaneProjector
+    from photsim7.geometry_truth import sky_projection_declaration
+    from photsim7.specs.geometry import GeometrySpec
+    from photsim7.selection_artifacts import read_source_geometry_truth
+
+    request, api = _selection_ready_worker_request(tmp_path, n_frames=2)
+    spec = replace(request.spec,
+        detector=replace(request.spec.detector, detector_id='synthetic-A'),
+        catalog=replace(request.spec.catalog, target_epoch_jyear=2000.),
+        psf=replace(request.spec.psf, field_id='nearest', field_id_policy='nearest'))
+    geometry = GeometrySpec(
+        sample_time_s=(0.0, 1.0) if dynamic else (0.0,),
+        pointing_ra_deg=(10.0, 10.001) if dynamic else (10.0,),
+        pointing_dec_deg=(20.0, 20.0005) if dynamic else (20.0,),
+        roll_deg=(35.0, 90.0) if dynamic else (35.0,),
+    )
+    if dynamic:
+        spec = replace(spec, geometry=geometry)
+    request = replace(request, spec=spec, execution=replace(request.execution, max_stars=max_stars), shared_exposure_stamps=SharedExposureStampsConfig(
+        enabled=True, target_source_ids=(11,), stamp_rows=3, stamp_cols=5, product_keys=('final_stamp',)))
+
+    def write_catalog(roll):
+        p = TangentPlaneProjector(
+            geometry=geometry if dynamic else replace(geometry, roll_deg=(roll,)),
+            source_ids=[11, 71],
+            ra_deg=[10.001, 10.002],
+            dec_deg=[20.0005, 20.001],
+            source_frame="icrs",
+            source_epoch_jyear=2000.0,
+            detector_id="synthetic-A",
+            detector_shape=(5, 7),
+            pixel_scale_arcsec_per_pix=4.83,
+        )
+        xy = p.detector_xy_pix
+        catalog = PreparedStarCatalog(star_data=dict(source_id=p.source_ids,
+            ra=p.ra_deg, dec=p.dec_deg, et_mag=[12., 13.], x0=xy[:, 0]-3, y0=xy[:, 1]-2,
+            frame_xpix=xy[:, 0], frame_ypix=xy[:, 1], detector_xpix=xy[:, 0],
+            detector_ypix=xy[:, 1], detector_id=p.source_geometry.detector_id,
+            field_x_deg=p.field_xy_deg[:, 0], field_y_deg=p.field_xy_deg[:, 1]),
+            metadata={'geometry': sky_projection_declaration(p.to_json_dict())})
+        if dynamic:
+            catalog.star_data = {
+                k: v
+                for k, v in catalog.star_data.items()
+                if k in ("source_id", "ra", "dec", "et_mag")
+            }
+            catalog.metadata = {}
+        StarCatalogCache.write(request.catalog_cache, catalog)
+        return p
+
+    p = write_catalog(35.)
+    if dynamic:
+        from photsim7.effects.dva import make_bound_field_dva_model
+
+        model = make_bound_field_dva_model(
+            p.to_json_dict(),
+            [0.5, 1.5],
+            np.full((2, 2, 2), 0.01),
+            model_id="synthetic-bound-dva",
+            observing_start_date=spec.observation.observing_start_date,
+            integration_s=1.0,
+        )
+        model_path = request.data_root / "bound-dva.pkl"
+        with model_path.open("wb") as handle:
+            pickle.dump(model, handle)
+        spec = replace(
+            spec,
+            dynamic_effects=replace(
+                spec.dynamic_effects,
+                dva=replace(
+                    spec.dynamic_effects.dva,
+                    enabled=True,
+                    model_kind="bound_field_xy_v1",
+                    model_path=str(model_path),
+                    t0_day=0.0,
+                    time_policy="raise",
+                ),
+            ),
+        )
+        request = replace(request, spec=spec)
+    # Persist the coordinator's real input guards before invoking its workers.
+    from et_mainsim.inputs import catalog_identity, collect_run_inputs
+    request.run_dir.mkdir(parents=True, exist_ok=True)
+    (request.run_dir/'run_manifest.json').write_text(json.dumps({
+        'input_identity': collect_run_inputs(spec, request.data_root, catalog_cache=request.catalog_cache),
+        'catalog_content': catalog_identity(StarCatalogCache.read(request.catalog_cache)),
+    }))
+    first = run_worker(request, science_api=api)
+    assert first.rendered == (0, 1)
+    plan = read_shared_exposure_target_plan(request.run_dir/'shared_exposure'/'target_plan.json')
+    assert plan['source_geometry']['geometry_truth_mode'] == 'physical_sky_projection'
+    np.testing.assert_allclose(plan['targets'][0]['x_frame_pix'], p.detector_xy_pix[0, 0])
+    truth_paths = list((request.run_dir/'selection_truth'/'geometry').glob('*.json'))
+    assert len(truth_paths) == (2 if dynamic else 1)
+    truth = read_source_geometry_truth(truth_paths[0])
+    assert truth.schema_version == 2
+    assert truth.source_ids.tolist() == ([11] if max_stars else [11, 71])
+    assert truth.projection_inputs["geometry"]["roll_deg"] == (
+        (35.0, 90.0) if dynamic else (35.0,)
+    )
+    resumed = run_worker(request, science_api=api)
+    assert resumed.rendered == () and resumed.skipped == (0, 1)
+
+    if dynamic:
+        changed_time = replace(
+            request,
+            spec=replace(
+                spec,
+                observation=replace(
+                    spec.observation, observing_start_date="2027-01-01T00:00:00"
+                ),
+            ),
+        )
+        with pytest.raises((ValueError, RuntimeError), match="changed"):
+            run_worker(changed_time, science_api=api)
+        request = replace(
+            request,
+            spec=replace(spec, geometry=replace(geometry, roll_deg=(35.0, 91.0))),
+        )
+    else:
+        write_catalog(90.0)
+    with pytest.raises((ValueError, RuntimeError), match='changed'):
+        run_worker(request, science_api=api)
 
 
 def _shared_final_shard_path(request, *, product_key="final_stamp") -> Path:
@@ -2736,7 +2877,10 @@ def test_full_frame_run_identity_requires_current_product_contract(tmp_path, mon
     from et_mainsim.manifest import ManifestIdentityError
     from et_mainsim.presets import load_preset
     from et_mainsim.workflows.full_frame import build_run_plan, run_full_frame
-    from photsim7.psf.selection_truth import PSF_SELECTION_TRUTH_SCHEMA_ID
+    from photsim7.psf.selection_truth import (
+        PSF_SELECTION_TRUTH_SCHEMA_ID,
+        POSE_PSF_SELECTION_TRUTH_SCHEMA_ID,
+    )
     from photsim7.selection_artifacts import (
         CADENCE_SELECTION_TRUTH_SCHEMA_ID,
         CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
@@ -2770,8 +2914,14 @@ def test_full_frame_run_identity_requires_current_product_contract(tmp_path, mon
     assert original["workload"]["product_contract"] == {
         "frame_product_schema_id": ("photsim7.single_cadence_frame_products.v1"),
         "frame_product_schema_version": 1,
-        "source_geometry_truth_schema_id": ("photsim7.source_geometry_truth.v1"),
-        "psf_selection_truth_schema_id": PSF_SELECTION_TRUTH_SCHEMA_ID,
+        "source_geometry_truth_schema_ids": [
+            "photsim7.source_geometry_truth.v1",
+            "photsim7.source_geometry_truth.v2",
+        ],
+        "psf_selection_truth_schema_ids": [
+            PSF_SELECTION_TRUTH_SCHEMA_ID,
+            POSE_PSF_SELECTION_TRUTH_SCHEMA_ID,
+        ],
         "cadence_selection_truth_schema_id": CADENCE_SELECTION_TRUTH_SCHEMA_ID,
         "cadence_selection_truth_schema_version": (
             CADENCE_SELECTION_TRUTH_SCHEMA_VERSION

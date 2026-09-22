@@ -113,7 +113,7 @@ assert 'ray' not in sys.modules
 def test_project_requires_shared_exposure_photsim7_release() -> None:
     payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "photsim7[gpu]>=0.5.4,<0.6" in payload["project"]["dependencies"]
+    assert "photsim7[gpu]>=0.5.6,<0.6" in payload["project"]["dependencies"]
 
 
 def test_photsim7_stamp_centering_matches_formal_nearest_integer_policy() -> None:

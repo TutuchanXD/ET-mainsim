@@ -183,6 +183,8 @@ class RunManifestStore:
             result.pop("assets", None)
             if isinstance(result.get("runtime"), Mapping):
                 result["runtime"].pop("rendering", None)
+            if isinstance(result.get("simulation_spec"), Mapping):
+                result["simulation_spec"].get("psf", {}).pop("compute_device", None)
             return result
 
         promoting_catalog = (
