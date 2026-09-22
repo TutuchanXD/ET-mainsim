@@ -2,8 +2,8 @@
 
 Photsim7 0.5.6 的配套支持包括 `SimulationSpec.geometry`、逐帧
 `physical_sky_projection`、绑定源/相机/观测时间/积分时长的预计算 DVA，以及动态
-geometry/PSF truth。full-frame 的 shared crop 和 stamp 均保持首次曝光的 detector
-窗口；stamp coadd 与严格 sidecar 完成校验支持跨指向切换。运行身份包含完整配置，
+geometry/PSF truth。full-frame 的 shared crop 保持父运行首帧的 detector 窗口，stamp 保持几何声明首个
+pose 的窗口；stamp coadd 与严格 sidecar 完成校验支持跨指向切换。运行身份包含完整配置，
 修改几何或观测起点后须使用新 run。坐标与边界见上游
 [观测几何文档](https://github.com/TutuchanXD/Photsim7/blob/main/docs/observation_geometry.md)。
 
@@ -39,7 +39,7 @@ maintained Galaxy producer.
 The current full-test and release-engineering contracts are validated against
 ET-coordinate commit `f9cec8038b021c9540a026b94e876dc3240071d1`
 (version 0.1.2) and Photsim7 commit
-`f8f8891c1c91053b9e4105b10f27fa792a42b845` (version 0.5.6). Install those exact
+`9c7cc448d52bea997eab829edcdeff361629f4a4` (version 0.5.6). Install those exact
 dependency snapshots before installing the ET-mainsim wheel with `--no-deps`,
 then run `python -m pip check`.
 

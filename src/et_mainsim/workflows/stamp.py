@@ -1056,6 +1056,10 @@ def _selection_identity_payload(identity: Any, *, target_dir: Path) -> dict[str,
     }
 
 
+def _geometry_changes_within_observation(geometry_truth: Any) -> bool:
+    return not geometry_truth.pointing_is_fixed
+
+
 class _SelectionTruthAccumulator:
     def __init__(
         self,
@@ -1209,7 +1213,9 @@ class _SelectionTruthAccumulator:
             raise RuntimeError("PSF sidecar identity conflicts with truth")
         if cadence["content_sha256"] != truth.content_sha256:
             raise RuntimeError("cadence sidecar identity conflicts with truth")
-        dynamic_geometry = not truth.psf_selection_truth.fixed_for_observation
+        dynamic_geometry = _geometry_changes_within_observation(
+            truth.source_geometry_truth
+        )
         if self.geometry is None:
             self.geometry = geometry
             self.psf = psf
@@ -1521,7 +1527,9 @@ def _validate_selection_sidecars(
             return False
         geometry_reference = truth.geometry_reference
         psf_reference = truth.psf_reference
-        if dynamic_geometry == truth.psf_selection_truth.fixed_for_observation:
+        if dynamic_geometry != _geometry_changes_within_observation(
+            truth.source_geometry_truth
+        ):
             return False
         geometry = identities["source_geometry_truth"].get(
             geometry_reference["content_sha256"]

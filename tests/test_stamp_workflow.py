@@ -979,7 +979,8 @@ def _complete_selection_api(api):
     return api
 
 
-def test_dynamic_sky_stamp_coadd_sidecars_and_resume(tmp_path):
+@pytest.mark.parametrize("switch_time_s", [1.0, 10.0])
+def test_dynamic_sky_stamp_coadd_sidecars_and_resume(tmp_path, switch_time_s):
     from test_full_frame_workflow import _selection_ready_worker_request
     from et_mainsim.presets import load_preset
     from et_mainsim.workflows.stamp import (
@@ -1004,7 +1005,7 @@ def test_dynamic_sky_stamp_coadd_sidecars_and_resume(tmp_path):
     spec = replace(
         request.spec,
         geometry=GeometrySpec(
-            sample_time_s=(0.0, 1.0),
+            sample_time_s=(0.0, switch_time_s),
             pointing_ra_deg=(10.0, 10.001),
             pointing_dec_deg=(20.0, 20.0005),
             roll_deg=(0.0, 90.0),
@@ -1048,12 +1049,13 @@ def test_dynamic_sky_stamp_coadd_sidecars_and_resume(tmp_path):
     assert first["completion"]["rendered_targets"] == 1
     target_dir = plan.run_dir / "stamps" / "target_11"
     selection = first["completion"]["targets"][0]["artifacts"]["selection_truth"]
-    assert selection["schema_version"] == 2
-    assert (
-        len(selection["source_geometry_truth"])
-        == len(selection["psf_selection_truth"])
-        == 2
-    )
+    assert selection["schema_version"] == (2 if switch_time_s == 1.0 else 1)
+    if switch_time_s == 1.0:
+        assert (
+            len(selection["source_geometry_truth"])
+            == len(selection["psf_selection_truth"])
+            == 2
+        )
     with (
         StampShardReader(target_dir / "raw.h5") as raw,
         StampShardReader(target_dir / "coadd.h5") as coadd,
@@ -1065,7 +1067,12 @@ def test_dynamic_sky_stamp_coadd_sidecars_and_resume(tmp_path):
     assert target_is_complete(plan, 11, api=api)
     resumed = run_stamp(plan, science_api=api)
     assert resumed["completion"]["skipped_targets"] == 1
-    broken = target_dir / selection["source_geometry_truth"][1]["relative_path"]
+    geometry_identity = (
+        selection["source_geometry_truth"][1]
+        if switch_time_s == 1.0
+        else selection["source_geometry_truth"]
+    )
+    broken = target_dir / geometry_identity["relative_path"]
     broken.unlink()
     assert not target_is_complete(plan, 11, api=api)
 
@@ -1853,6 +1860,7 @@ def test_selection_resume_binds_spacecraft_and_science_realization(tmp_path):
                     rng_trace_payload=lambda _seed_tree: {}
                 ),
                 psf_selection_truth=SimpleNamespace(fixed_for_observation=True),
+                source_geometry_truth=SimpleNamespace(pointing_is_fixed=True),
                 geometry_reference=geometry,
                 psf_reference=psf,
                 content_sha256=content_sha256,
