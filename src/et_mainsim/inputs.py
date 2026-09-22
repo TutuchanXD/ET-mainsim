@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 import platform
 
-from .manifest import ManifestIdentityError, _atomic_write_json
+from .manifest import ManifestIdentityError, _atomic_write_json, _scientific_identity
 
 
 @contextmanager
@@ -208,7 +208,8 @@ def collect_run_inputs(
     registry = DataRegistry(data_root)
     validate_catalog_cache_location(spec, registry)
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "simulation_spec": _scientific_identity(spec.to_json_dict()),
         "assets": {} if catalog_only else simulation_asset_identity(spec, registry),
         "runtime": runtime_identity(spec, catalog_only=catalog_only, gpu_ids=gpu_ids),
     }

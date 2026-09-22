@@ -955,11 +955,15 @@ def _complete_selection_api(api):
             timing=build_frame_timing(
                 n_frames=spec.observation.resolved_n_frames,
                 integration_s=services.frame_exposure.to_value(u.s),
-                sampling_interval_s=(
-                    spec.observation.sampling_interval.to_value(u.s)
-                ),
+                sampling_interval_s=(spec.observation.sampling_interval.to_value(u.s)),
             ),
             source_geometry=services.source_geometry,
+            projector=services.full_frame_services.projector,
+            components=(
+                services.effect_timeseries.components
+                if services.effect_timeseries is not None
+                else ()
+            ),
             jitter_integrated_psf_offsets=np.zeros((100, 2, 1)),
             jitter_model_selector=selector,
         )
@@ -973,6 +977,97 @@ def _complete_selection_api(api):
 
     api.build_stamp_services = build_services
     return api
+
+
+def test_dynamic_sky_stamp_coadd_sidecars_and_resume(tmp_path):
+    from test_full_frame_workflow import _selection_ready_worker_request
+    from et_mainsim.presets import load_preset
+    from et_mainsim.workflows.stamp import (
+        build_run_plan,
+        run_stamp,
+        target_is_complete,
+        _science_api,
+    )
+    from photsim7.catalogs.cache import StarCatalogCache
+    from photsim7.specs.geometry import GeometrySpec
+    from photsim7.artifacts import StampShardReader
+
+    request, _ = _selection_ready_worker_request(tmp_path)
+    catalog = StarCatalogCache.read(request.catalog_cache)
+    catalog.metadata = {}
+    catalog.star_data = {
+        k: v
+        for k, v in catalog.star_data.items()
+        if k in ("source_id", "ra", "dec", "et_mag")
+    }
+    StarCatalogCache.write(request.catalog_cache, catalog)
+    spec = replace(
+        request.spec,
+        geometry=GeometrySpec(
+            sample_time_s=(0.0, 1.0),
+            pointing_ra_deg=(10.0, 10.001),
+            pointing_dec_deg=(20.0, 20.0005),
+            roll_deg=(0.0, 90.0),
+        ),
+        catalog=replace(request.spec.catalog, target_epoch_jyear=2000.0),
+        observation=replace(request.spec.observation, n_raw_frames_per_coadd=2),
+        psf=replace(
+            request.spec.psf,
+            mode="stamp",
+            field_id="nearest",
+            field_id_policy="nearest",
+        ),
+    )
+    loaded = load_preset("et-stamp-smoke")
+    config = replace(
+        loaded.run_config,
+        paths=replace(
+            loaded.run_config.paths,
+            output_root=str(tmp_path / "output"),
+            data_root=str(request.data_root),
+            catalog_cache=str(request.catalog_cache),
+        ),
+        workload=replace(
+            loaded.run_config.workload,
+            target_source_ids=(11,),
+            stamp_rows=3,
+            stamp_cols=5,
+        ),
+    )
+    plan = build_run_plan(
+        preset_name="et-stamp-smoke", run_config=config, spec=spec, repo_root=tmp_path
+    )
+    api = _complete_selection_api(_science_api())
+    plan.catalog_cache.unlink()
+    api.build_catalog_from_spec(
+        plan.spec,
+        prepared_catalog=catalog,
+        data_registry=api.DataRegistry(request.data_root),
+    )
+    first = run_stamp(plan, science_api=api)
+    assert first["completion"]["rendered_targets"] == 1
+    target_dir = plan.run_dir / "stamps" / "target_11"
+    selection = first["completion"]["targets"][0]["artifacts"]["selection_truth"]
+    assert selection["schema_version"] == 2
+    assert (
+        len(selection["source_geometry_truth"])
+        == len(selection["psf_selection_truth"])
+        == 2
+    )
+    with (
+        StampShardReader(target_dir / "raw.h5") as raw,
+        StampShardReader(target_dir / "coadd.h5") as coadd,
+    ):
+        np.testing.assert_array_equal(
+            coadd.read_stamp(11, 0),
+            np.asarray(raw.read_stamp(11, 0), dtype=np.uint64) + raw.read_stamp(11, 1),
+        )
+    assert target_is_complete(plan, 11, api=api)
+    resumed = run_stamp(plan, science_api=api)
+    assert resumed["completion"]["skipped_targets"] == 1
+    broken = target_dir / selection["source_geometry_truth"][1]["relative_path"]
+    broken.unlink()
+    assert not target_is_complete(plan, 11, api=api)
 
 
 @pytest.mark.parametrize("detector,exposure,readout,starts", [
@@ -1757,6 +1852,7 @@ def test_selection_resume_binds_spacecraft_and_science_realization(tmp_path):
                 jitter_model_selection_truth=SimpleNamespace(
                     rng_trace_payload=lambda _seed_tree: {}
                 ),
+                psf_selection_truth=SimpleNamespace(fixed_for_observation=True),
                 geometry_reference=geometry,
                 psf_reference=psf,
                 content_sha256=content_sha256,
@@ -1925,7 +2021,10 @@ def test_stamp_completion_rejects_selection_manifest_identity_changes(
 def test_stamp_run_identity_requires_current_product_contract(tmp_path):
     from et_mainsim.manifest import ManifestIdentityError
     from et_mainsim.workflows.stamp import _science_api, run_stamp
-    from photsim7.psf.selection_truth import PSF_SELECTION_TRUTH_SCHEMA_ID
+    from photsim7.psf.selection_truth import (
+        PSF_SELECTION_TRUTH_SCHEMA_ID,
+        POSE_PSF_SELECTION_TRUTH_SCHEMA_ID,
+    )
     from photsim7.selection_artifacts import (
         CADENCE_SELECTION_TRUTH_SCHEMA_ID,
         CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
@@ -1939,15 +2038,25 @@ def test_stamp_run_identity_requires_current_product_contract(tmp_path):
     assert original["workload"]["product_contract"] == {
         "target_artifact_schema_id": "et_mainsim.stamp_target_artifacts",
         "target_artifact_schema_version": 2,
-        "selection_artifact_schema_id": (
-            "et_mainsim.stamp_selection_truth_artifacts.v1"
-        ),
-        "selection_artifact_schema_version": 1,
+        "selection_artifact_schemas": [
+            {
+                "schema_id": "et_mainsim.stamp_selection_truth_artifacts.v1",
+                "schema_version": 1,
+            },
+            {
+                "schema_id": "et_mainsim.stamp_selection_truth_artifacts.v2",
+                "schema_version": 2,
+            },
+        ],
         "selection_index_schema_id": "et_mainsim.selection_truth_index.v1",
         "source_geometry_truth_schema_ids": [
-            "photsim7.source_geometry_truth.v1", "photsim7.source_geometry_truth.v2"
+            "photsim7.source_geometry_truth.v1",
+            "photsim7.source_geometry_truth.v2",
         ],
-        "psf_selection_truth_schema_id": PSF_SELECTION_TRUTH_SCHEMA_ID,
+        "psf_selection_truth_schema_ids": [
+            PSF_SELECTION_TRUTH_SCHEMA_ID,
+            POSE_PSF_SELECTION_TRUTH_SCHEMA_ID,
+        ],
         "cadence_selection_truth_schema_id": CADENCE_SELECTION_TRUTH_SCHEMA_ID,
         "cadence_selection_truth_schema_version": (
             CADENCE_SELECTION_TRUTH_SCHEMA_VERSION

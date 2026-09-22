@@ -130,3 +130,19 @@ validation includes exact frame/source coverage, finite non-negative factors,
 `effective = baseline * relative_flux`, and content digest. A complete target
 is skipped as one unit; incompatible shard identity fails closed. Direct
 target and variability tables use resolved path, byte size, and SHA-256.
+
+## 逐帧观测几何（S5）
+
+prepared catalog 模式支持 Photsim7 0.5.6 的 `SimulationSpec.geometry`；星表可只提供
+source ID、ICRS RA/Dec 和光度列，由上游服务按每次 raw exposure 解析像元及 PSF。
+表格输入的 ET/reference 适配路径保持原契约，不隐式转换为通用天空几何。
+
+窗口固定在首次原始曝光的 detector 坐标，指向变化后星像在此窗口内移动；coadd
+相加同一 detector 区域。动态 PSF truth 使用 v4，selection artifact manifest 使用
+`et_mainsim.stamp_selection_truth_artifacts.v2`，其中 geometry/PSF 身份为唯一记录列表。
+每个 cadence sidecar 绑定实际使用的记录，完成校验核对所有引用、索引顺序与集合
+完整性。静态 selection manifest v1 保持读取兼容。
+
+run input identity v2 包含完整 SimulationSpec；指向、roll、观测时间、DVA 或资产变更
+均不能直接续跑旧实验。曝光内连续指向变化与未绑定的 ET 径向 DVA/thermal 表会明确
+失败；本支持不构成真实 Kepler mission 或任务标定验证。

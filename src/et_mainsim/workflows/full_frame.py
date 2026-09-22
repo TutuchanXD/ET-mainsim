@@ -339,7 +339,6 @@ def _shared_exposure_plan_path(run_dir: Path) -> Path:
     return _shared_exposure_root(run_dir) / "target_plan.json"
 
 
-
 def _scope_shared_exposure_plan_paths(
     run_dir: Path, spec: Any, contract: FullFrameScopeArtifactContract,
 ) -> dict[int, Path]:
@@ -353,7 +352,6 @@ def _scope_shared_exposure_plan_paths(
             if translated else _shared_exposure_plan_path(run_dir)
         ) for scope_id in contract.scope_ids
     }
-
 
 
 def _scope_plan_path_for_parent(request: WorkerRequest, parent_root: Path) -> Path:
@@ -3877,7 +3875,10 @@ def _full_frame_product_contract() -> dict[str, Any]:
         FRAME_PRODUCT_SCHEMA_VERSION,
     )
     from photsim7.geometry_truth import (SOURCE_GEOMETRY_TRUTH_SCHEMA_ID, SOURCE_GEOMETRY_TRUTH_V2_SCHEMA_ID)
-    from photsim7.psf.selection_truth import PSF_SELECTION_TRUTH_SCHEMA_ID
+    from photsim7.psf.selection_truth import (
+        PSF_SELECTION_TRUTH_SCHEMA_ID,
+        POSE_PSF_SELECTION_TRUTH_SCHEMA_ID,
+    )
     from photsim7.selection_artifacts import (
         CADENCE_SELECTION_TRUTH_SCHEMA_ID,
         CADENCE_SELECTION_TRUTH_SCHEMA_VERSION,
@@ -3894,8 +3895,14 @@ def _full_frame_product_contract() -> dict[str, Any]:
     return {
         "frame_product_schema_id": FRAME_PRODUCT_SCHEMA_ID,
         "frame_product_schema_version": FRAME_PRODUCT_SCHEMA_VERSION,
-        "source_geometry_truth_schema_ids": [SOURCE_GEOMETRY_TRUTH_SCHEMA_ID, SOURCE_GEOMETRY_TRUTH_V2_SCHEMA_ID],
-        "psf_selection_truth_schema_id": PSF_SELECTION_TRUTH_SCHEMA_ID,
+        "source_geometry_truth_schema_ids": [
+            SOURCE_GEOMETRY_TRUTH_SCHEMA_ID,
+            SOURCE_GEOMETRY_TRUTH_V2_SCHEMA_ID,
+        ],
+        "psf_selection_truth_schema_ids": [
+            PSF_SELECTION_TRUTH_SCHEMA_ID,
+            POSE_PSF_SELECTION_TRUTH_SCHEMA_ID,
+        ],
         "cadence_selection_truth_schema_id": (CADENCE_SELECTION_TRUTH_SCHEMA_ID),
         "cadence_selection_truth_schema_version": (
             CADENCE_SELECTION_TRUTH_SCHEMA_VERSION

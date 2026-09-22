@@ -1,8 +1,11 @@
 # ET-mainsim
 
-Photsim7 0.5.5 的配套支持包括固定指向 `physical_sky_projection` prepared catalog、
-geometry truth v2 和 shared-exposure 固定窗口。标准运行记录会绑定 catalog 中的
-几何声明；修改 roll/源坐标后不能沿用旧运行。动态指向服务仍未接通，见上游 #168。
+Photsim7 0.5.6 的配套支持包括 `SimulationSpec.geometry`、逐帧
+`physical_sky_projection`、绑定源/相机/观测时间/积分时长的预计算 DVA，以及动态
+geometry/PSF truth。full-frame 的 shared crop 和 stamp 均保持首次曝光的 detector
+窗口；stamp coadd 与严格 sidecar 完成校验支持跨指向切换。运行身份包含完整配置，
+修改几何或观测起点后须使用新 run。坐标与边界见上游
+[观测几何文档](https://github.com/TutuchanXD/Photsim7/blob/main/docs/observation_geometry.md)。
 
 ET-mainsim is the reference application for Earth 2.0 Telescope simulations.
 It owns presets, CLI orchestration, manifests, local workers, Slurm templates,
@@ -36,11 +39,11 @@ maintained Galaxy producer.
 The current full-test and release-engineering contracts are validated against
 ET-coordinate commit `f9cec8038b021c9540a026b94e876dc3240071d1`
 (version 0.1.2) and Photsim7 commit
-`72a001b063feb4604c179c80ee87f0ed19b10bfe` (version 0.5.5). Install those exact
+`f8f8891c1c91053b9e4105b10f27fa792a42b845` (version 0.5.6). Install those exact
 dependency snapshots before installing the ET-mainsim wheel with `--no-deps`,
 then run `python -m pip check`.
 
-The maintained runtime requires `photsim7[gpu]>=0.5.5,<0.6`. Its imports use
+The maintained runtime requires `photsim7[gpu]>=0.5.6,<0.6`. Its imports use
 canonical or retained public APIs and do not require the 16 top-level facades
 removed in Photsim7 0.5.0. The GPU extra supplies the Torch/Kornia backend for
 both CPU and CUDA execution; CUDA availability is checked separately at runtime.
@@ -191,7 +194,7 @@ mapping. Current details are in [full frame](docs/full_frame_workflow.md),
 bundles](docs/stamp_science_delivery_zh.md), and
 [legacy](docs/legacy_workflow.md).
 
-S4b telescope layouts require Photsim7 0.5.5. Scientific JSON accepts an explicit
+S4b telescope layouts require Photsim7 0.5.6. Scientific JSON accepts an explicit
 `instrument.telescopes` list with stable nonnegative IDs, a homogeneous detector
 association, and either `coincident` or `reference_translation` placement. The
 optional workbook row `Telescope Layout` accepts the same list as JSON. Count
