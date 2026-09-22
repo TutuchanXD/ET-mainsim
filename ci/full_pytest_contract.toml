@@ -57,4 +57,4 @@ test_files = [
 
 [dependencies]
 et_coordinate_commit = "f9cec8038b021c9540a026b94e876dc3240071d1"
-photsim7_commit = "927611b208230df05e58ad4bcf47f86bbbe78c8a"
+photsim7_commit = "7611ef0857d27847b03306d9d7472b0d5c028a93"
