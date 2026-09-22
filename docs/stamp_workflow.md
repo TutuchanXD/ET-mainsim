@@ -149,3 +149,7 @@ run input identity v2 包含完整 SimulationSpec；指向、roll、观测时间
 
 manifest 的静态/动态模式直接依据 geometry truth 中绑定的实际 raw windows，
 不以 PSF policy 代替几何判断；时间表中尚未使用的后续 pose 不会使当前窗口变为动态。
+
+PSF field-id 使用上游的名义几何场角；DVA 等位置位移不会逐帧重新选节点。
+当 geometry/PSF truth 声明在实际窗口内固定时，改变其身份仍视为契约冲突，
+不能仅因未来可能扩展的 PSF 时变模型而放宽当前完成校验。
