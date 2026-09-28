@@ -1,0 +1,484 @@
+"""Application-owned execution of Photsim7's explicit equivalent products.
+
+Scientific configuration and validity stay in the upstream typed request. This
+module owns file inputs, group selection, CPU policy, run manifests and resume.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+import hashlib
+import importlib
+from importlib.metadata import version
+import json
+from pathlib import Path
+import tomllib
+from typing import Mapping
+
+from .inputs import run_lock, _source_code_identity
+from .manifest import RunManifestStore, _atomic_write_json
+
+
+CONFIG_SCHEMA = "et_mainsim.equivalent_coadd_run.v1"
+
+
+def _integer(value, name, minimum=0):
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return value
+
+
+def _file_sha(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+@dataclass(frozen=True)
+class EquivalentRunConfig:
+    request_path: Path
+    catalog_path: Path
+    variability_path: Path
+    data_root: Path
+    output_root: Path
+    run_id: str
+    coadd_indices: tuple[int, ...] | None = None
+    block_shape: tuple[int, int] = (512, 512)
+    cpu_threads: int = 2
+    resume: bool = True
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping, *, base=None):
+        base = Path.cwd() if base is None else Path(base)
+        if not isinstance(payload, Mapping):
+            raise ValueError("equivalent run config must be a mapping")
+        required = {
+            "schema_id",
+            "request_path",
+            "catalog_path",
+            "variability_path",
+            "data_root",
+            "output_root",
+            "run_id",
+        }
+        optional = {"coadd_indices", "block_shape", "cpu_threads", "resume"}
+        if not required <= set(payload) or set(payload) - required - optional:
+            raise ValueError("equivalent run config has missing or unknown fields")
+        if payload["schema_id"] != CONFIG_SCHEMA:
+            raise ValueError("unsupported equivalent run config schema")
+        run_id = payload["run_id"]
+        if (
+            not isinstance(run_id, str)
+            or not run_id.strip()
+            or run_id in (".", "..")
+            or Path(run_id).name != run_id
+        ):
+            raise ValueError("run_id must be a single nonempty path component")
+        paths = {}
+        for name in required - {"schema_id", "run_id"}:
+            value = payload[name]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a nonempty path")
+            path = Path(value).expanduser()
+            paths[name] = (path if path.is_absolute() else Path(base) / path).resolve()
+        indices = payload.get("coadd_indices")
+        if indices is not None:
+            if not isinstance(indices, (list, tuple)) or not indices:
+                raise ValueError("coadd_indices must be nonempty when supplied")
+            indices = tuple(_integer(v, "coadd index") for v in indices)
+            if len(set(indices)) != len(indices):
+                raise ValueError(
+                    "duplicate coadd indices are not independent exposures"
+                )
+        block = payload.get("block_shape", (512, 512))
+        if not isinstance(block, (list, tuple)) or len(block) != 2:
+            raise ValueError("block_shape requires two dimensions")
+        block = tuple(_integer(v, "block dimension", 128) for v in block)
+        if any(v % 128 for v in block):
+            raise ValueError("block dimensions must be multiples of 128")
+        threads = _integer(payload.get("cpu_threads", 2), "cpu_threads", 1)
+        resume = payload.get("resume", True)
+        if type(resume) is not bool:
+            raise ValueError("resume must be a boolean")
+        return cls(
+            **paths,
+            run_id=run_id,
+            coadd_indices=indices,
+            block_shape=block,
+            cpu_threads=threads,
+            resume=resume,
+        )
+
+    @classmethod
+    def from_file(cls, path):
+        path = Path(path).resolve()
+        text = path.read_text()
+        payload = (
+            json.loads(text) if path.suffix.lower() == ".json" else tomllib.loads(text)
+        )
+        return cls.from_mapping(payload, base=path.parent)
+
+    def to_dict(self):
+        return {
+            "schema_id": CONFIG_SCHEMA,
+            **{
+                name: str(getattr(self, name))
+                for name in (
+                    "request_path",
+                    "catalog_path",
+                    "variability_path",
+                    "data_root",
+                    "output_root",
+                )
+            },
+            "run_id": self.run_id,
+            "coadd_indices": None
+            if self.coadd_indices is None
+            else list(self.coadd_indices),
+            "block_shape": list(self.block_shape),
+            "cpu_threads": self.cpu_threads,
+            "resume": self.resume,
+        }
+
+
+def _api():
+    try:
+        api = importlib.import_module("photsim7.equivalent_coadd")
+    except ImportError as error:
+        raise RuntimeError(
+            "installed Photsim7 lacks the formal equivalent runtime; install the documented upstream revision"
+        ) from error
+    for name in (
+        "EquivalentCoaddRequest",
+        "SourceVariabilityDelivery",
+        "run_equivalent_coadd_product",
+        "read_equivalent_coadd_product",
+    ):
+        if not hasattr(api, name):
+            raise RuntimeError(
+                f"installed Photsim7 lacks {name}; install the documented upstream revision"
+            )
+    return api
+
+
+@contextmanager
+def _numeric_policy(threads):
+    import torch
+    from numba import get_num_threads, set_num_threads
+    from threadpoolctl import threadpool_limits
+
+    old_torch = torch.get_num_threads()
+    old_numba = get_num_threads()
+    try:
+        set_num_threads(threads)
+        torch.set_num_threads(threads)
+        with threadpool_limits(threads):
+            yield
+    finally:
+        set_num_threads(old_numba)
+        torch.set_num_threads(old_torch)
+
+
+def _inputs(config):
+    from photsim7.catalogs import PreparedStarCatalog
+    from photsim7.data_registry import DataRegistry
+
+    before = {
+        name: _file_sha(getattr(config, name))
+        for name in ("request_path", "catalog_path", "variability_path")
+    }
+    api = _api()
+    request = api.EquivalentCoaddRequest.from_json_dict(
+        json.loads(config.request_path.read_text())
+    )
+    payload = request.to_json_dict()
+    catalog_data = json.loads(config.catalog_path.read_text())
+    if not isinstance(catalog_data, dict) or set(catalog_data) != {
+        "data",
+        "metadata",
+        "raw_source_arrays",
+    }:
+        raise ValueError("catalog JSON requires data, metadata and raw_source_arrays")
+    catalog = PreparedStarCatalog(
+        star_data=catalog_data["data"],
+        metadata=catalog_data["metadata"],
+        raw_source_arrays=catalog_data["raw_source_arrays"],
+    )
+    delivery = api.SourceVariabilityDelivery.from_json_dict(
+        json.loads(config.variability_path.read_text())
+    )
+    # These are the upstream request's semantic input identities, not a new
+    # scientific derivation or permission to use a naked folded spec.
+    catalog_sha = hashlib.sha256(
+        json.dumps(
+            catalog_data, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+    ).hexdigest()
+    if (
+        catalog_sha != payload["catalog_sha256"]
+        or delivery.content_sha256 != payload["variability_sha256"]
+    ):
+        raise ValueError("catalog/variability content differs from the typed request")
+    indices = config.coadd_indices
+    if indices is None:
+        indices = tuple(range(payload["coadd_start"], payload["coadd_stop"]))
+    if any(not payload["coadd_start"] <= i < payload["coadd_stop"] for i in indices):
+        raise ValueError("selected group is outside the declared request family")
+    if any(
+        _file_sha(getattr(config, name)) != digest for name, digest in before.items()
+    ):
+        raise ValueError("input files changed while reading")
+    return (
+        api,
+        request,
+        catalog,
+        delivery,
+        DataRegistry(data_root=config.data_root),
+        indices,
+        before,
+    )
+
+
+def build_equivalent_run_plan(config: EquivalentRunConfig):
+    """Validate declared files and group selection without loading PSF assets."""
+    config = EquivalentRunConfig.from_mapping(config.to_dict())
+    _, request, _, _, _, indices, _ = _inputs(config)
+    derivation = request.derivation
+    return {
+        "workflow": "et-equivalent-coadd",
+        "run_dir": str(config.output_root / config.run_id),
+        "request_sha256": request.content_sha256,
+        "output_kind": request.output_kind,
+        "coadd_indices": list(indices),
+        "cadence_s": 10 * derivation.n_raw,
+        "absolute_raw_frame_start_index": derivation.absolute_raw_frame_start_index,
+        "input_accuracy": "unqualified",
+        "asset_validation": "required_at_execution",
+    }
+
+
+def _context(config):
+    """Bind the configuration, immutable input snapshots and current assets."""
+    config = EquivalentRunConfig.from_mapping(config.to_dict())
+    api, request, catalog, delivery, registry, indices, input_files = _inputs(config)
+    import photsim7
+    import et_mainsim
+    from photsim7.input_identity import simulation_asset_identity
+
+    derivation = request.derivation
+    payload = request.to_json_dict()
+    if (
+        simulation_asset_identity(derivation.source_spec, registry)
+        != payload["asset_identity"]
+    ):
+        raise ValueError("scientific assets differ from the typed request")
+    run_dir = config.output_root / config.run_id
+    store = RunManifestStore(run_dir / "run_manifest.json")
+    workload = {
+        "kind": "equivalent-coadd",
+        "request_sha256": request.content_sha256,
+        "coadd_indices": list(indices),
+        "block_shape": list(config.block_shape),
+        "cpu_threads": config.cpu_threads,
+    }
+    execution = {
+        "backend": "in-process",
+        "device": "cpu",
+        "resume": config.resume,
+        "cpu_threads": config.cpu_threads,
+    }
+    identity = {
+        "request_sha256": request.content_sha256,
+        "files": input_files,
+        "assets": payload["asset_identity"],
+        "et_mainsim_source_sha256": _source_code_identity(et_mainsim),
+        "photsim7_source_sha256": _source_code_identity(photsim7),
+    }
+    common = dict(
+        workflow="et-equivalent-coadd",
+        run_id=config.run_id,
+        simulation_spec=derivation.source_spec.to_json_dict(),
+        execution=execution,
+        workload=workload,
+        input_identity=identity,
+    )
+    return config, api, request, catalog, delivery, registry, indices, store, common
+
+
+def _sidecars(config, request, run_dir):
+    if (
+        json.loads((run_dir / "equivalent_request.json").read_text())
+        != request.to_json_dict()
+    ):
+        raise ValueError("saved typed request differs from run authority")
+    saved = json.loads((run_dir / "equivalent_run_config.json").read_text())
+    current = config.to_dict()
+    saved.pop("resume", None)
+    current.pop("resume", None)
+    if saved != current:
+        raise ValueError("saved application config differs from run authority")
+
+
+def _record(path, index, result):
+    return {
+        "coadd_index": index,
+        "path": str(path),
+        "product_manifest_sha256": _file_sha(path / "product_manifest.json"),
+        "arrays": result["manifest"]["arrays"],
+        "raw_indices": result["metadata"]["raw_indices"],
+        "raw_time_windows_s": result["metadata"]["raw_time_windows_s"],
+        "clipping_certificate": result["metadata"]["clipping_certificate"],
+    }
+
+
+def _prior_products(payload, indices, run_dir):
+    records = payload.get("artifacts", {}).get("equivalent_products", [])
+    if not isinstance(records, list):
+        raise ValueError("invalid application product records")
+    prior = {}
+    for record in records:
+        index = record.get("coadd_index")
+        if type(index) is not int or index not in indices or index in prior:
+            raise ValueError("application product group inventory differs from request")
+        path = run_dir / "products" / f"group_{index:08d}"
+        if record.get("path") != str(path) or _file_sha(
+            path / "product_manifest.json"
+        ) != record.get("product_manifest_sha256"):
+            raise ValueError(
+                "product manifest differs from the application completion record"
+            )
+        prior[index] = record
+    return prior
+
+
+def verify_equivalent_run(config: EquivalentRunConfig):
+    """Independently consume every completed upstream product without rendering."""
+    config, api, request, _, _, _, indices, store, common = _context(config)
+    run_dir = config.output_root / config.run_id
+    with run_lock(run_dir), _numeric_policy(config.cpu_threads):
+        payload = store.ensure_identity(**common)
+        _sidecars(config, request, run_dir)
+        expected = {
+            "coadd_groups": len(indices),
+            "request_sha256": request.content_sha256,
+            "input_accuracy": "unqualified",
+        }
+        if (
+            payload.get("status") != "completed"
+            or payload.get("completion") != expected
+        ):
+            raise ValueError("application run is not complete")
+        prior = _prior_products(payload, indices, run_dir)
+        if set(prior) != set(indices):
+            raise ValueError("application completion omits declared groups")
+        for index in indices:
+            path = run_dir / "products" / f"group_{index:08d}"
+            checked = api.read_equivalent_coadd_product(
+                path, request=request, coadd_index=index
+            )
+            if any(
+                prior[index].get(k) != v
+                for k, v in _record(path, index, checked).items()
+            ):
+                raise ValueError(
+                    "actual upstream product differs from application record"
+                )
+        if any(
+            _file_sha(getattr(config, name)) != digest
+            for name, digest in common["input_identity"]["files"].items()
+        ):
+            raise ValueError("run input files changed during verification")
+        return {
+            "status": "verified",
+            "workflow": "et-equivalent-coadd",
+            "run_dir": str(run_dir),
+            **expected,
+        }
+
+
+def run_equivalent_coadd(config: EquivalentRunConfig):
+    """Produce verified formal upstream products under an application run lock."""
+    config, api, request, catalog, delivery, registry, indices, store, common = (
+        _context(config)
+    )
+    run_dir = config.output_root / config.run_id
+    derivation = request.derivation
+    payload = request.to_json_dict()
+    identity = common["input_identity"]
+    with run_lock(run_dir), _numeric_policy(config.cpu_threads):
+        if store.path.exists():
+            if not config.resume:
+                raise FileExistsError(run_dir)
+            previous = store.ensure_identity(**common)
+            _sidecars(config, request, run_dir)
+        else:
+            if run_dir.exists() and any(run_dir.iterdir()):
+                raise ValueError("nonempty run directory lacks its manifest")
+            previous = store.create(
+                **common,
+                preset="explicit-equivalent-request",
+                frame_plan={
+                    "coadd_indices": list(indices),
+                    "n_raw": derivation.n_raw,
+                    "absolute_raw_frame_start_index": derivation.absolute_raw_frame_start_index,
+                },
+                provenance={
+                    "photsim7_version": version("photsim7"),
+                    "input_accuracy": "unqualified",
+                },
+            )
+            _atomic_write_json(run_dir / "equivalent_request.json", payload)
+            _atomic_write_json(run_dir / "equivalent_run_config.json", config.to_dict())
+        store.start_attempt(control={"resume": config.resume}, recover_running=True)
+        try:
+            prior = _prior_products(previous, indices, run_dir)
+            products = []
+            for index in indices:
+                path = run_dir / "products" / f"group_{index:08d}"
+                result = api.run_equivalent_coadd_product(
+                    request,
+                    prepared_catalog=catalog,
+                    variability_delivery=delivery,
+                    data_registry=registry,
+                    coadd_index=index,
+                    output=path,
+                    block_shape=config.block_shape,
+                    resume=config.resume,
+                )
+                # The upstream writer/reuser returns only after complete
+                # readback. Consume that verified record without a second full
+                # same-process read; verify_equivalent_run provides independent
+                # inspection of a completed application run.
+                record = _record(path, index, result)
+                if index in prior and any(
+                    prior[index].get(k) != v for k, v in record.items()
+                ):
+                    raise ValueError(
+                        "actual upstream product differs from application record"
+                    )
+                products.append({**record, "reused": result["reused"]})
+                store.update(artifacts={"equivalent_products": products})
+            if any(
+                _file_sha(getattr(config, name)) != digest
+                for name, digest in identity["files"].items()
+            ):
+                raise ValueError("run input files changed during execution")
+            return store.transition(
+                "completed",
+                completion={
+                    "coadd_groups": len(products),
+                    "request_sha256": request.content_sha256,
+                    "input_accuracy": "unqualified",
+                },
+            )
+        except BaseException as error:
+            store.fail(error)
+            raise
+
+
+__all__ = [
+    "EquivalentRunConfig",
+    "build_equivalent_run_plan",
+    "run_equivalent_coadd",
+    "verify_equivalent_run",
+]

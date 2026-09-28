@@ -33,8 +33,8 @@ version = "0.1.2"
 [runtime_dependencies.photsim7]
 distribution = "photsim7"
 repository = "TutuchanXD/Photsim7"
-commit = "7611ef0857d27847b03306d9d7472b0d5c028a93"
-version = "0.5.6"
+commit = "dcff9edca8a791b7bdfdcc1e4cb9214399ffe08d"
+version = "0.5.11"
 
 [files]
 wheel = [
@@ -42,6 +42,7 @@ wheel = [
   "et_mainsim/__main__.py",
   "et_mainsim/aster_saturation_validation.py",
   "et_mainsim/cli.py",
+  "et_mainsim/equivalent_coadd.py",
   "et_mainsim/config.py",
   "et_mainsim/coverage_aware_stamp_analysis.py",
   "et_mainsim/galaxy_campaign_qc.py",
@@ -128,6 +129,7 @@ sdist = [
   "docs/examples/et_full_frame_shared_exposure.run.toml",
   "docs/full_frame_validation.md",
   "docs/full_frame_workflow.md",
+  "docs/equivalent_coadd_workflow.md",
   "docs/galaxy_independent_stamp_production_zh.md",
   "docs/galaxy_raw_coverage_science_delivery_zh.md",
   "docs/legacy_workflow.md",
@@ -170,6 +172,7 @@ sdist = [
   "src/et_mainsim/__main__.py",
   "src/et_mainsim/aster_saturation_validation.py",
   "src/et_mainsim/cli.py",
+  "src/et_mainsim/equivalent_coadd.py",
   "src/et_mainsim/config.py",
   "src/et_mainsim/coverage_aware_stamp_analysis.py",
   "src/et_mainsim/galaxy_campaign_qc.py",
@@ -218,6 +221,7 @@ sdist = [
   "tests/test_aster_saturation_validation.py",
   "tests/test_ci_workflow.py",
   "tests/test_cli.py",
+  "tests/test_equivalent_coadd_workflow.py",
   "tests/test_config.py",
   "tests/test_coverage_aware_stamp_analysis.py",
   "tests/test_evaluate_main_rd_benchmark.py",
