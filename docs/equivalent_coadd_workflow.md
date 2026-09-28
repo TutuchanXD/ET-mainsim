@@ -11,7 +11,7 @@ stamp 或全幅正式产品。科学配置、实际输入身份、组内恒定 v
 预算及产品 schema 均由 Photsim7 验证。ET-mainsim 负责文件输入、组选择、CPU 线程、
 运行锁、应用 manifest 和续跑。普通 raw/coadd 工作流保持原有语义。
 
-上游必须包含 `run_equivalent_coadd_product` 和 `read_equivalent_coadd_product`；
+包依赖最低为 `photsim7[gpu]>=0.5.11,<0.6`；上游必须包含 `run_equivalent_coadd_product` 和 `read_equivalent_coadd_product`；
 版本号本身不能证明接口存在。CI 固定上游的实际提交，安装步骤见 README。
 科学与 API 边界见 [Photsim7 equivalent API](https://github.com/TutuchanXD/Photsim7/blob/main/docs/api/equivalent_coadd.md)。
 
@@ -67,7 +67,10 @@ clipping 证书及每个 product manifest 的 SHA-256。DN 为 `uint32`，不能
 
 `resume=true` 保留完整请求和应用身份，逐组重新验证实际文件后复用。后续组失败时，
 应用状态记录为 failed；同一配置再次执行可复用已验证的完整前缀。输入／实现／数值环境、
-保存的请求／配置或完成记录发生冲突时失败，不覆盖旧运行。没有自动删除／覆盖模式。
+保存的请求／配置或完成记录发生冲突时失败，不覆盖旧运行。数值身份在第一组执行前绑定
+Python、CPU/平台、科学包与 native library 版本、Torch build 和线程策略；没有产物的
+失败任务也不能跨环境续跑。初始化 sidecar 写入中断时，仅在 manifest 仍为 planned、
+无 attempt/产物且身份完全匹配时补齐缺失文件，已有冲突文件不覆盖。没有自动删除／覆盖模式。
 
 正常执行直接消费上游发布前完整读回的结果。`--verify-only` 是独立消费入口：不渲染，
 核对应用完成记录并调用上游 reader，重新检查真实文件和数组、参数、原始时间窗、
@@ -75,4 +78,5 @@ RNG roots、风险证书和保存电子数的读出重放。即使有人更新�
 产品 manifest 仍须匹配应用层保存的 hash。hash 用于完整性检查，不是数字签名。
 
 内存与耗时随产品和执行布局而变；正式产品包含诊断参数及完整验证，不能把纯渲染时间
-当作总交付时间。本工作流不执行新的统计资格判定，也不触发普通 stamp 光变分析。
+当作总交付时间。运行与独立检查结束前均重新计算科学输入和资产身份；
+发现中途变化时不能宣告完成或验证成功。本工作流不执行新的统计资格判定，也不触发普通 stamp 光变分析。

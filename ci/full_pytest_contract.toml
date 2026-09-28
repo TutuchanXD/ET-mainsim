@@ -2,8 +2,8 @@ schema_version = 1
 pytest_version = "9.0.3"
 python_versions = ["3.12", "3.13"]
 # Full suite inventory, including S5 per-frame geometry, bound DVA and stamp resume regressions.
-expected_collected = 1073
-nodeid_sha256 = "25915031d2f80b080a3b134ca28682f9ff4467bc6709b3477bb9a70398bb35b0"
+expected_collected = 1082
+nodeid_sha256 = "bb77169906a14310d0a65b7a0210998225294943f1479172171218c7ad630c59"
 allowed_skips = [
   "tests/test_galaxy_delivery_notebooks.py::test_galaxy_delivery_notebook_is_a_read_only_raw_coverage_v2_consumer",
   "tests/test_galaxy_delivery_notebooks.py::test_galaxy_campaign_summary_notebook_only_consumes_atomic_raw_coverage_summary",
@@ -58,4 +58,4 @@ test_files = [
 
 [dependencies]
 et_coordinate_commit = "f9cec8038b021c9540a026b94e876dc3240071d1"
-photsim7_commit = "dcff9edca8a791b7bdfdcc1e4cb9214399ffe08d"
+photsim7_commit = "2bcf179274ee4d7ba158584a3a4da67551664c6e"

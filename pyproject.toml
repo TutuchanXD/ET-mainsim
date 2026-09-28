@@ -16,7 +16,7 @@ dependencies = [
   "matplotlib>=3.10,<4",
   "numpy>=1.26",
   "numba>=0.62,<0.66",
-  "photsim7[gpu]>=0.5.6,<0.6",
+  "photsim7[gpu]>=0.5.11,<0.6",
   "torch>=2.7,<3",
   "threadpoolctl>=3.1,<4",
 ]

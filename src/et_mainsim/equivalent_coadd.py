@@ -13,10 +13,11 @@ import importlib
 from importlib.metadata import version
 import json
 from pathlib import Path
+import platform
 import tomllib
 from typing import Mapping
 
-from .inputs import run_lock, _source_code_identity
+from .inputs import run_lock, _source_code_identity, runtime_identity
 from .manifest import RunManifestStore, _atomic_write_json
 
 
@@ -293,6 +294,7 @@ def _context(config):
         "assets": payload["asset_identity"],
         "et_mainsim_source_sha256": _source_code_identity(et_mainsim),
         "photsim7_source_sha256": _source_code_identity(photsim7),
+        "runtime": _runtime_identity(derivation.source_spec),
     }
     common = dict(
         workflow="et-equivalent-coadd",
@@ -305,18 +307,85 @@ def _context(config):
     return config, api, request, catalog, delivery, registry, indices, store, common
 
 
-def _sidecars(config, request, run_dir):
-    if (
-        json.loads((run_dir / "equivalent_request.json").read_text())
-        != request.to_json_dict()
+def _runtime_identity(spec):
+    """Bind a run before its first product, including interrupted empty runs."""
+    import torch
+    from threadpoolctl import threadpool_info
+
+    identity = runtime_identity(spec)
+    identity["packages"].update(
+        {name: version(name) for name in ("numba", "h5py", "threadpoolctl")}
+    )
+    cpu = Path("/proc/cpuinfo")
+    identity.update(
+        platform=platform.platform(),
+        cpu_model=next(
+            (
+                line.split(":", 1)[1].strip()
+                for line in (cpu.read_text().splitlines() if cpu.exists() else [])
+                if line.startswith("model name")
+            ),
+            platform.processor(),
+        ),
+        torch_build_sha256=hashlib.sha256(torch.__config__.show().encode()).hexdigest(),
+        torch_cpu_capability=torch.backends.cpu.get_cpu_capability(),
+        torch_interop_threads=torch.get_num_interop_threads(),
+        native_libraries=sorted(
+            [
+                {
+                    key: pool.get(key)
+                    for key in (
+                        "internal_api",
+                        "prefix",
+                        "version",
+                        "threading_layer",
+                        "architecture",
+                    )
+                }
+                for pool in threadpool_info()
+            ],
+            key=lambda pool: json.dumps(pool, sort_keys=True),
+        ),
+    )
+    return identity
+
+
+def _sidecars(config, request, run_dir, *, initialize=False):
+    expected = {
+        "equivalent_request.json": (request.to_json_dict(), "typed request"),
+        "equivalent_run_config.json": (config.to_dict(), "application config"),
+    }
+    missing = []
+    # Validate all existing files before repairing any missing initialization.
+    for name, (current, label) in expected.items():
+        path = run_dir / name
+        if not path.exists() and initialize:
+            missing.append((path, current))
+            continue
+        saved = json.loads(path.read_text())
+        comparison = dict(current)
+        if name == "equivalent_run_config.json":
+            saved.pop("resume", None)
+            comparison.pop("resume", None)
+        if saved != comparison:
+            raise ValueError(f"saved {label} differs from run authority")
+    for path, current in missing:
+        _atomic_write_json(path, current)
+
+
+def _verify_inputs(config, request, registry, identity):
+    from photsim7.input_identity import simulation_asset_identity
+
+    if any(
+        _file_sha(getattr(config, name)) != digest
+        for name, digest in identity["files"].items()
     ):
-        raise ValueError("saved typed request differs from run authority")
-    saved = json.loads((run_dir / "equivalent_run_config.json").read_text())
-    current = config.to_dict()
-    saved.pop("resume", None)
-    current.pop("resume", None)
-    if saved != current:
-        raise ValueError("saved application config differs from run authority")
+        raise ValueError("run input files changed during execution or verification")
+    if (
+        simulation_asset_identity(request.derivation.source_spec, registry)
+        != identity["assets"]
+    ):
+        raise ValueError("scientific assets changed during execution or verification")
 
 
 def _record(path, index, result):
@@ -353,9 +422,10 @@ def _prior_products(payload, indices, run_dir):
 
 def verify_equivalent_run(config: EquivalentRunConfig):
     """Independently consume every completed upstream product without rendering."""
-    config, api, request, _, _, _, indices, store, common = _context(config)
+    config = EquivalentRunConfig.from_mapping(config.to_dict())
     run_dir = config.output_root / config.run_id
     with run_lock(run_dir), _numeric_policy(config.cpu_threads):
+        config, api, request, _, _, registry, indices, store, common = _context(config)
         payload = store.ensure_identity(**common)
         _sidecars(config, request, run_dir)
         expected = {
@@ -383,11 +453,7 @@ def verify_equivalent_run(config: EquivalentRunConfig):
                 raise ValueError(
                     "actual upstream product differs from application record"
                 )
-        if any(
-            _file_sha(getattr(config, name)) != digest
-            for name, digest in common["input_identity"]["files"].items()
-        ):
-            raise ValueError("run input files changed during verification")
+        _verify_inputs(config, request, registry, common["input_identity"])
         return {
             "status": "verified",
             "workflow": "et-equivalent-coadd",
@@ -398,19 +464,31 @@ def verify_equivalent_run(config: EquivalentRunConfig):
 
 def run_equivalent_coadd(config: EquivalentRunConfig):
     """Produce verified formal upstream products under an application run lock."""
-    config, api, request, catalog, delivery, registry, indices, store, common = (
-        _context(config)
-    )
+    config = EquivalentRunConfig.from_mapping(config.to_dict())
     run_dir = config.output_root / config.run_id
-    derivation = request.derivation
-    payload = request.to_json_dict()
-    identity = common["input_identity"]
     with run_lock(run_dir), _numeric_policy(config.cpu_threads):
+        config, api, request, catalog, delivery, registry, indices, store, common = (
+            _context(config)
+        )
+        derivation = request.derivation
+        identity = common["input_identity"]
         if store.path.exists():
             if not config.resume:
                 raise FileExistsError(run_dir)
             previous = store.ensure_identity(**common)
-            _sidecars(config, request, run_dir)
+            # A manifest is the identity anchor. Repair sidecars only before
+            # any attempt or artifact exists, after ensure_identity succeeds.
+            _sidecars(
+                config,
+                request,
+                run_dir,
+                initialize=(
+                    previous.get("status") == "planned"
+                    and previous.get("attempts") == []
+                    and previous.get("artifacts") == {}
+                    and previous.get("completion") is None
+                ),
+            )
         else:
             if run_dir.exists() and any(run_dir.iterdir()):
                 raise ValueError("nonempty run directory lacks its manifest")
@@ -427,8 +505,7 @@ def run_equivalent_coadd(config: EquivalentRunConfig):
                     "input_accuracy": "unqualified",
                 },
             )
-            _atomic_write_json(run_dir / "equivalent_request.json", payload)
-            _atomic_write_json(run_dir / "equivalent_run_config.json", config.to_dict())
+            _sidecars(config, request, run_dir, initialize=True)
         store.start_attempt(control={"resume": config.resume}, recover_running=True)
         try:
             prior = _prior_products(previous, indices, run_dir)
@@ -458,11 +535,7 @@ def run_equivalent_coadd(config: EquivalentRunConfig):
                     )
                 products.append({**record, "reused": result["reused"]})
                 store.update(artifacts={"equivalent_products": products})
-            if any(
-                _file_sha(getattr(config, name)) != digest
-                for name, digest in identity["files"].items()
-            ):
-                raise ValueError("run input files changed during execution")
+            _verify_inputs(config, request, registry, identity)
             return store.transition(
                 "completed",
                 completion={

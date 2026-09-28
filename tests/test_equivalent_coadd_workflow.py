@@ -346,3 +346,111 @@ def test_changed_actual_product_cannot_resume_as_completed(tmp_path):
         (config.output_root / config.run_id / "run_manifest.json").read_text()
     )
     assert manifest["status"] == "failed"
+
+
+@pytest.mark.parametrize("operation", ["run", "verify"])
+def test_assets_changed_during_operation_cannot_pass(tmp_path, monkeypatch, operation):
+    import photsim7.equivalent_coadd as upstream
+
+    config, _, _ = make_inputs(tmp_path, 30)
+    asset = config.data_root / "psf/reference/sim_psf_images.pkl"
+    if operation == "verify":
+        run_equivalent_coadd(config)
+    name = (
+        "run_equivalent_coadd_product"
+        if operation == "run"
+        else "read_equivalent_coadd_product"
+    )
+    original = getattr(upstream, name)
+
+    def change_after_last_product(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if kwargs["coadd_index"] == 1:
+            asset.write_bytes(asset.read_bytes() + b"changed-after-render")
+        return result
+
+    monkeypatch.setattr(upstream, name, change_after_last_product)
+    manifest_path = config.output_root / config.run_id / "run_manifest.json"
+    before = manifest_path.read_bytes() if operation == "verify" else None
+    with pytest.raises(ValueError, match="scientific assets changed"):
+        (run_equivalent_coadd if operation == "run" else verify_equivalent_run)(config)
+    if operation == "run":
+        assert json.loads(manifest_path.read_text())["status"] == "failed"
+    else:
+        assert manifest_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "sidecar", ["equivalent_request.json", "equivalent_run_config.json"]
+)
+def test_interrupted_initial_sidecars_are_recoverable(tmp_path, monkeypatch, sidecar):
+    import et_mainsim.equivalent_coadd as workflow
+
+    config, _, _ = make_inputs(tmp_path, 30)
+    original = workflow._atomic_write_json
+
+    def interrupt(path, payload):
+        if path.name == sidecar:
+            raise OSError("interrupted initial publication")
+        return original(path, payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(workflow, "_atomic_write_json", interrupt)
+        with pytest.raises(OSError, match="interrupted initial"):
+            run_equivalent_coadd(config)
+    run_dir = config.output_root / config.run_id
+    planned = json.loads((run_dir / "run_manifest.json").read_text())
+    assert planned["status"] == "planned" and planned["attempts"] == []
+    result = run_equivalent_coadd(config)
+    assert result["status"] == "completed"
+    assert verify_equivalent_run(config)["status"] == "verified"
+
+
+def test_missing_sidecar_after_execution_is_not_repaired(tmp_path):
+    config, _, _ = make_inputs(tmp_path, 30)
+    run_equivalent_coadd(config)
+    path = config.output_root / config.run_id / "equivalent_run_config.json"
+    path.unlink()
+    with pytest.raises(FileNotFoundError):
+        run_equivalent_coadd(config)
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("field", ["python", "machine", "packages", "native_libraries"])
+def test_empty_failed_run_cannot_resume_across_numerical_runtime(
+    tmp_path, monkeypatch, field
+):
+    import et_mainsim.equivalent_coadd as workflow
+    import photsim7.equivalent_coadd as upstream
+    from et_mainsim.manifest import ManifestIdentityError
+
+    config, _, _ = make_inputs(tmp_path, 30)
+
+    def fail_before_first_product(*args, **kwargs):
+        raise RuntimeError("failure before first product")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            upstream, "run_equivalent_coadd_product", fail_before_first_product
+        )
+        with pytest.raises(RuntimeError, match="before first product"):
+            run_equivalent_coadd(config)
+    manifest_path = config.output_root / config.run_id / "run_manifest.json"
+    before = manifest_path.read_bytes()
+    saved_runtime = json.loads(before)["input_identity"]["runtime"]
+    assert {"numpy", "scipy", "astropy", "numba", "h5py", "threadpoolctl"} <= set(
+        saved_runtime["packages"]
+    )
+    assert {"torch", "kornia"} <= set(saved_runtime["rendering"]["packages"])
+    assert saved_runtime["native_libraries"]
+    original = workflow._runtime_identity
+
+    def changed_runtime(spec):
+        identity = original(spec)
+        identity[field] = "changed-runtime"
+        return identity
+
+    monkeypatch.setattr(workflow, "_runtime_identity", changed_runtime)
+    with pytest.raises(ManifestIdentityError, match="input identity"):
+        run_equivalent_coadd(config)
+    assert manifest_path.read_bytes() == before
