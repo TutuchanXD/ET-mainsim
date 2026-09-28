@@ -166,16 +166,27 @@ def test_full_suite_uses_frozen_runtime_dependencies_and_no_science_data() -> No
 
 
 def test_full_suite_installs_release_tools_for_release_engineering_tests() -> None:
-    from ci.run_local import install_plan
+    from ci.run_local import BATMAN_CP313_WHEEL, install_plan
+    from packaging.requirements import Requirement
     commands = install_plan(Path('/python'), Path('/repo'), Path('/coordinate'), Path('/photsim'))
     assert commands == [
         ['/python', '-m', 'pip', 'install', '--upgrade', 'pip'],
         ['/python', '-m', 'pip', 'install', '--index-url', 'https://download.pytorch.org/whl/cpu', 'torch>=2.7,<3'],
         ['/python', '-m', 'pip', 'install', '/coordinate'],
+        ['/python', '-m', 'pip', 'install', '--no-deps', BATMAN_CP313_WHEEL],
         ['/python', '-m', 'pip', 'install', '/photsim[gpu]'],
         ['/python', '-m', 'pip', 'install', '-e', '/repo[test,release]'],
         ['/python', '-m', 'pip', 'check'],
     ]
+    wheel = Requirement(BATMAN_CP313_WHEEL)
+    assert wheel.url.startswith('https://files.pythonhosted.org/')
+    assert wheel.url.endswith('#sha256=f9b152055524360a5955f45151638b549cc00e8e1a3f62072a0c161eee738259')
+    target = dict(python_version='3.13', sys_platform='linux',
+                  platform_machine='x86_64', implementation_name='cpython')
+    assert wheel.marker.evaluate(target)
+    for field, value in [('python_version', '3.12'), ('sys_platform', 'darwin'),
+                         ('platform_machine', 'aarch64'), ('implementation_name', 'pypy')]:
+        assert not wheel.marker.evaluate({**target, field: value})
 
 
 def test_ci_actions_and_checkout_credentials_are_locked_down() -> None:

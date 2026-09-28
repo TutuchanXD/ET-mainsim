@@ -10,6 +10,17 @@ import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
+# The Linux CPython 3.13 hosted index returned no batman-package candidates
+# twice on 2026-09-28. This compatible wheel and digest are published by the
+# official PyPI JSON API. Other platforms keep normal dependency resolution.
+BATMAN_CP313_WHEEL = (
+    'batman-package @ https://files.pythonhosted.org/packages/36/d8/'
+    '59bd093fff5834e7e20bb9b9c4a0ff7f6660c5a7589f55143a5724cb6c8a/'
+    'batman_package-2.5.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl'
+    '#sha256=f9b152055524360a5955f45151638b549cc00e8e1a3f62072a0c161eee738259'
+    ' ; python_version == "3.13" and sys_platform == "linux"'
+    ' and platform_machine == "x86_64" and implementation_name == "cpython"'
+)
 
 
 def hermetic_environment(work: Path, base=None) -> dict[str, str]:
@@ -30,6 +41,7 @@ def install_plan(python: Path, root: Path, coordinate: Path, photsim: Path):
         pip + ['install', '--upgrade', 'pip'],
         pip + ['install', '--index-url', 'https://download.pytorch.org/whl/cpu', 'torch>=2.7,<3'],
         pip + ['install', str(coordinate)],
+        pip + ['install', '--no-deps', BATMAN_CP313_WHEEL],
         pip + ['install', str(photsim) + '[gpu]'],
         pip + ['install', '-e', str(root) + '[test,release]'],
         pip + ['check'],
