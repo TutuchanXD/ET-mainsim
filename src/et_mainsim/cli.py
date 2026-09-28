@@ -41,6 +41,14 @@ def _parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="Run a maintained workflow.")
     run_subparsers = run_parser.add_subparsers(dest="workflow", required=True)
+    equivalent = run_subparsers.add_parser(
+        "et-equivalent-coadd",
+        help="Run an explicit typed equivalent-coadd request and formal products.",
+    )
+    equivalent.add_argument("--config", type=Path, required=True)
+    equivalent_modes = equivalent.add_mutually_exclusive_group()
+    equivalent_modes.add_argument("--dry-run", action="store_true")
+    equivalent_modes.add_argument("--verify-only", action="store_true")
     full_frame = run_subparsers.add_parser(
         "et-full-frame",
         help="Run one physical ET main detector.",
@@ -498,6 +506,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             return _run_full_frame_command(args)
         except (KeyError, OSError, RuntimeError, ValueError) as error:
+            parser.error(str(error))
+    if args.command == "run" and args.workflow == "et-equivalent-coadd":
+        from et_mainsim.equivalent_coadd import (
+            EquivalentRunConfig,
+            build_equivalent_run_plan,
+            run_equivalent_coadd,
+            verify_equivalent_run,
+        )
+
+        try:
+            config = EquivalentRunConfig.from_file(args.config)
+            action = (
+                build_equivalent_run_plan
+                if args.dry_run
+                else (
+                    verify_equivalent_run if args.verify_only else run_equivalent_coadd
+                )
+            )
+            _json_print(action(config))
+            return 0
+        except (
+            ImportError,
+            KeyError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
             parser.error(str(error))
     if args.command == "run" and args.workflow == "et-stamp":
         try:

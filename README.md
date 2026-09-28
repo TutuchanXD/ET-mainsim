@@ -12,13 +12,18 @@ It owns presets, CLI orchestration, manifests, local workers, Slurm templates,
 resume policy, and examples. Photsim7 owns all catalog, photometry, PSF,
 dynamic-effect, detector, RNG, and product-schema behavior.
 
-Three end-to-end workflows are maintained:
+Four end-to-end workflows are maintained:
 
 ```text
 et-mainsim run et-full-frame --preset smoke|production
 et-mainsim run et-stamp --preset smoke|production
 et-mainsim run legacy-sim --preset full-effects-smoke|full-effects-production
+et-mainsim run et-equivalent-coadd --config equivalent.toml
 ```
+
+The explicit equivalent workflow consumes an identity-bound static request,
+writes formal stamp/full-frame products and verifies completed groups on resume.
+See [equivalent coadd configuration and validation](docs/equivalent_coadd_workflow.md).
 
 ## Install
 
@@ -39,11 +44,11 @@ maintained Galaxy producer.
 The current full-test and release-engineering contracts are validated against
 ET-coordinate commit `f9cec8038b021c9540a026b94e876dc3240071d1`
 (version 0.1.2) and Photsim7 commit
-`7611ef0857d27847b03306d9d7472b0d5c028a93` (version 0.5.6). Install those exact
+`2bcf179274ee4d7ba158584a3a4da67551664c6e` (version 0.5.11, including the formal equivalent API). Install those exact
 dependency snapshots before installing the ET-mainsim wheel with `--no-deps`,
 then run `python -m pip check`.
 
-The maintained runtime requires `photsim7[gpu]>=0.5.6,<0.6`. Its imports use
+The maintained runtime requires `photsim7[gpu]>=0.5.11,<0.6`. Its imports use
 canonical or retained public APIs and do not require the 16 top-level facades
 removed in Photsim7 0.5.0. The GPU extra supplies the Torch/Kornia backend for
 both CPU and CUDA execution; CUDA availability is checked separately at runtime.
