@@ -477,3 +477,98 @@ def test_empty_failed_run_cannot_resume_across_numerical_runtime(
     with pytest.raises(ManifestIdentityError, match="input identity"):
         run_equivalent_coadd(config)
     assert manifest_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("extra", [None, "user-file", "directory", "symlink"])
+def test_initial_manifest_orphans_recover_without_touching_unknown_files(
+    tmp_path, extra
+):
+    config, _, _ = make_inputs(tmp_path, 30)
+    run_dir = config.output_root / config.run_id
+    run_dir.mkdir(parents=True)
+    orphan = run_dir / ".run_manifest.json.ab12_cd3.tmp"
+    orphan.write_text('{"schema_id":')
+    other = run_dir / "keep-me"
+    if extra == "user-file":
+        other.write_text("user data")
+    elif extra == "directory":
+        other.mkdir()
+    elif extra == "symlink":
+        other.symlink_to(config.request_path)
+    if extra is None:
+        result = run_equivalent_coadd(config)
+        assert result["status"] == "completed"
+        assert not orphan.exists()
+    else:
+        with pytest.raises(ValueError, match="nonempty run directory"):
+            run_equivalent_coadd(config)
+        assert orphan.read_text() == '{"schema_id":'
+        assert other.exists()
+        assert not (run_dir / "run_manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    "member", ["arrays.h5", "metadata.json", "product_manifest.json"]
+)
+def test_earlier_product_changed_during_later_group_cannot_complete(
+    tmp_path, monkeypatch, member
+):
+    import photsim7.equivalent_coadd as upstream
+
+    config, _, _ = make_inputs(tmp_path, 30)
+    original = upstream.run_equivalent_coadd_product
+
+    def corrupt_previous(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if kwargs["coadd_index"] == 1:
+            path = (
+                config.output_root / config.run_id / "products/group_00000000" / member
+            )
+            path.write_bytes(path.read_bytes() + b"changed-after-verification")
+        return result
+
+    monkeypatch.setattr(upstream, "run_equivalent_coadd_product", corrupt_previous)
+    with pytest.raises(ValueError, match="product files changed"):
+        run_equivalent_coadd(config)
+    manifest = json.loads(
+        (config.output_root / config.run_id / "run_manifest.json").read_text()
+    )
+    assert manifest["status"] == "failed"
+
+
+def test_concurrent_numeric_policies_are_serialized_and_restored():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    import torch
+    from numba import config as numba_config
+    from et_mainsim.equivalent_coadd import _numeric_policy
+
+    original = torch.get_num_threads()
+    first_entered, second_started, second_entered, release = (Event() for _ in range(4))
+    other_threads = min(2, numba_config.NUMBA_NUM_THREADS)
+
+    def first():
+        with _numeric_policy(1):
+            first_entered.set()
+            assert release.wait(5)
+            assert torch.get_num_threads() == 1
+
+    def second():
+        second_started.set()
+        with _numeric_policy(other_threads):
+            second_entered.set()
+            assert torch.get_num_threads() == other_threads
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a = pool.submit(first)
+        try:
+            assert first_entered.wait(5)
+            b = pool.submit(second)
+            assert second_started.wait(5)
+            assert not second_entered.wait(0.1)
+        finally:
+            release.set()
+        a.result(timeout=5)
+        b.result(timeout=5)
+    assert second_entered.is_set()
+    assert torch.get_num_threads() == original

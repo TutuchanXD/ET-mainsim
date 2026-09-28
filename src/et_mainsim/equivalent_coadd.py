@@ -14,6 +14,8 @@ from importlib.metadata import version
 import json
 from pathlib import Path
 import platform
+import re
+import threading
 import tomllib
 from typing import Mapping
 
@@ -22,6 +24,7 @@ from .manifest import RunManifestStore, _atomic_write_json
 
 
 CONFIG_SCHEMA = "et_mainsim.equivalent_coadd_run.v1"
+_NUMERIC_POLICY_LOCK = threading.RLock()
 
 
 def _integer(value, name, minimum=0):
@@ -166,6 +169,15 @@ def _api():
 
 @contextmanager
 def _numeric_policy(threads):
+    # Torch and native pool settings are process-global, even for distinct
+    # run IDs. Keep the complete execution/restoration scope serialized.
+    with _NUMERIC_POLICY_LOCK:
+        with _locked_numeric_policy(threads):
+            yield
+
+
+@contextmanager
+def _locked_numeric_policy(threads):
     import torch
     from numba import get_num_threads, set_num_threads
     from threadpoolctl import threadpool_limits
@@ -391,15 +403,64 @@ def _verify_inputs(config, request, registry, identity):
 
 
 def _record(path, index, result):
+    manifest_bytes = (path / "product_manifest.json").read_bytes()
+    if json.loads(manifest_bytes) != result["manifest"]:
+        raise ValueError("product manifest changed after upstream verification")
     return {
         "coadd_index": index,
         "path": str(path),
-        "product_manifest_sha256": _file_sha(path / "product_manifest.json"),
+        "product_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "files": result["manifest"]["files"],
         "arrays": result["manifest"]["arrays"],
         "raw_indices": result["metadata"]["raw_indices"],
         "raw_time_windows_s": result["metadata"]["raw_time_windows_s"],
         "clipping_certificate": result["metadata"]["clipping_certificate"],
     }
+
+
+def _verify_product_files(products):
+    """Recheck all bytes that the upstream reader already validated."""
+    for record in products:
+        path = Path(record["path"])
+        files = {
+            **record["files"],
+            "product_manifest.json": record["product_manifest_sha256"],
+        }
+        if path.is_symlink() or {p.name for p in path.iterdir()} != set(files):
+            raise ValueError("verified product directory changed before completion")
+        for name, digest in files.items():
+            member = path / name
+            if (
+                member.is_symlink()
+                or not member.is_file()
+                or _file_sha(member) != digest
+            ):
+                raise ValueError("verified product files changed before completion")
+
+
+def _recover_initial_manifest(config, run_dir):
+    if run_dir.is_symlink():
+        raise ValueError("run directory must not be a symlink")
+    if not run_dir.exists():
+        return
+    entries = list(run_dir.iterdir())
+    # A killed atomic writer can leave its unpublished temporary manifest.
+    # Inspect the whole inventory before removing any known orphan; preserve
+    # directories, links, sidecars and unknown/user files without modification.
+    if entries and (
+        not config.resume
+        or run_dir.is_symlink()
+        or any(
+            entry.is_symlink()
+            or not entry.is_file()
+            or re.fullmatch(r"\.run_manifest\.json\.[a-z0-9_]{8}\.tmp", entry.name)
+            is None
+            for entry in entries
+        )
+    ):
+        raise ValueError("nonempty run directory lacks its manifest")
+    for entry in entries:
+        entry.unlink()
 
 
 def _prior_products(payload, indices, run_dir):
@@ -455,6 +516,7 @@ def verify_equivalent_run(config: EquivalentRunConfig):
                 raise ValueError(
                     "actual upstream product differs from application record"
                 )
+        _verify_product_files(prior.values())
         _verify_inputs(config, request, registry, common["input_identity"])
         return {
             "status": "verified",
@@ -492,8 +554,7 @@ def run_equivalent_coadd(config: EquivalentRunConfig):
                 ),
             )
         else:
-            if run_dir.exists() and any(run_dir.iterdir()):
-                raise ValueError("nonempty run directory lacks its manifest")
+            _recover_initial_manifest(config, run_dir)
             previous = store.create(
                 **common,
                 preset="explicit-equivalent-request",
@@ -537,6 +598,7 @@ def run_equivalent_coadd(config: EquivalentRunConfig):
                     )
                 products.append({**record, "reused": result["reused"]})
                 store.update(artifacts={"equivalent_products": products})
+            _verify_product_files(products)
             _verify_inputs(config, request, registry, identity)
             return store.transition(
                 "completed",
