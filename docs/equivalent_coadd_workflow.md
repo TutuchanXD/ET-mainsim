@@ -62,7 +62,7 @@ cadence、配置、科学资产或精度声明。文件身份冲突会在执行�
 
 应用 manifest 记录实际 DN/电子数/分量期望/mask 的数组身份、raw indices 和时间窗、
 clipping 证书及每个 product manifest 的 SHA-256。DN 为 `uint32`，不能改名或强制转换后
-冒充现有 `uint64` raw-DN sum stamp delivery。所有输入的精度资格保持 `unqualified`：
+冒充现有 `uint64` raw-DN sum stamp delivery。运行目录、manifest、产品父目录和 sidecar 不接受符号链接；完成前再次核对保存的请求／配置和应用记录。所有输入的精度资格保持 `unqualified`：
 固定矩阵的 10 ppm／1% 方法资格不自动扩展到本次源场。
 
 `resume=true` 保留完整请求和应用身份，逐组重新验证实际文件后复用。后续组失败时，

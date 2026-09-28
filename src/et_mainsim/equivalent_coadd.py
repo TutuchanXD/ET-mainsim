@@ -373,6 +373,8 @@ def _sidecars(config, request, run_dir, *, initialize=False):
     # Validate all existing files before repairing any missing initialization.
     for name, (current, label) in expected.items():
         path = run_dir / name
+        if path.is_symlink():
+            raise ValueError("saved sidecars must not be symlinks")
         if not path.exists() and initialize:
             missing.append((path, current))
             continue
@@ -463,6 +465,23 @@ def _recover_initial_manifest(config, run_dir):
         entry.unlink()
 
 
+def _validate_run_paths(run_dir):
+    paths = [
+        run_dir,
+        *(
+            run_dir / name
+            for name in (
+                "run_manifest.json",
+                "equivalent_request.json",
+                "equivalent_run_config.json",
+                "products",
+            )
+        ),
+    ]
+    if any(path.is_symlink() for path in paths):
+        raise ValueError("run directories, manifest and sidecars must not be symlinks")
+
+
 def _prior_products(payload, indices, run_dir):
     records = payload.get("artifacts", {}).get("equivalent_products", [])
     if not isinstance(records, list):
@@ -487,7 +506,9 @@ def verify_equivalent_run(config: EquivalentRunConfig):
     """Independently consume every completed upstream product without rendering."""
     config = EquivalentRunConfig.from_mapping(config.to_dict())
     run_dir = config.output_root / config.run_id
+    _validate_run_paths(run_dir)
     with run_lock(run_dir), _numeric_policy(config.cpu_threads):
+        _validate_run_paths(run_dir)
         config, api, request, _, _, registry, indices, store, common = _context(config)
         payload = store.ensure_identity(**common)
         _sidecars(config, request, run_dir)
@@ -518,6 +539,10 @@ def verify_equivalent_run(config: EquivalentRunConfig):
                 )
         _verify_product_files(prior.values())
         _verify_inputs(config, request, registry, common["input_identity"])
+        _validate_run_paths(run_dir)
+        _sidecars(config, request, run_dir)
+        if store.ensure_identity(**common) != payload:
+            raise ValueError("application manifest changed during verification")
         return {
             "status": "verified",
             "workflow": "et-equivalent-coadd",
@@ -530,7 +555,9 @@ def run_equivalent_coadd(config: EquivalentRunConfig):
     """Produce verified formal upstream products under an application run lock."""
     config = EquivalentRunConfig.from_mapping(config.to_dict())
     run_dir = config.output_root / config.run_id
+    _validate_run_paths(run_dir)
     with run_lock(run_dir), _numeric_policy(config.cpu_threads):
+        _validate_run_paths(run_dir)
         config, api, request, catalog, delivery, registry, indices, store, common = (
             _context(config)
         )
@@ -600,6 +627,13 @@ def run_equivalent_coadd(config: EquivalentRunConfig):
                 store.update(artifacts={"equivalent_products": products})
             _verify_product_files(products)
             _verify_inputs(config, request, registry, identity)
+            _validate_run_paths(run_dir)
+            _sidecars(config, request, run_dir)
+            current = store.ensure_identity(**common)
+            if current.get("artifacts") != {"equivalent_products": products}:
+                raise ValueError(
+                    "application product records changed before completion"
+                )
             return store.transition(
                 "completed",
                 completion={
@@ -609,7 +643,14 @@ def run_equivalent_coadd(config: EquivalentRunConfig):
                 },
             )
         except BaseException as error:
-            store.fail(error)
+            # Do not follow a replaced publication path while recording an
+            # integrity failure; preserve the original exception instead.
+            if (
+                not run_dir.is_symlink()
+                and not store.path.is_symlink()
+                and store.path.is_file()
+            ):
+                store.fail(error)
             raise
 
 

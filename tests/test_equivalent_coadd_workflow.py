@@ -572,3 +572,103 @@ def test_concurrent_numeric_policies_are_serialized_and_restored():
         b.result(timeout=5)
     assert second_entered.is_set()
     assert torch.get_num_threads() == original
+
+
+@pytest.mark.parametrize(
+    "sidecar", ["equivalent_request.json", "equivalent_run_config.json"]
+)
+@pytest.mark.parametrize("operation", ["run", "verify"])
+def test_sidecars_changed_during_operation_cannot_pass(
+    tmp_path, monkeypatch, sidecar, operation
+):
+    import photsim7.equivalent_coadd as upstream
+
+    config, _, _ = make_inputs(tmp_path, 30)
+    if operation == "verify":
+        run_equivalent_coadd(config)
+    name = (
+        "run_equivalent_coadd_product"
+        if operation == "run"
+        else "read_equivalent_coadd_product"
+    )
+    original = getattr(upstream, name)
+    run_dir = config.output_root / config.run_id
+
+    def change_saved_authority(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if kwargs["coadd_index"] == 1:
+            path = run_dir / sidecar
+            data = json.loads(path.read_text())
+            data["run_id" if "config" in sidecar else "coadd_stop"] = "changed"
+            path.write_text(json.dumps(data))
+        return result
+
+    monkeypatch.setattr(upstream, name, change_saved_authority)
+    with pytest.raises(ValueError, match="saved .* differs"):
+        (run_equivalent_coadd if operation == "run" else verify_equivalent_run)(config)
+    if operation == "run":
+        assert (
+            json.loads((run_dir / "run_manifest.json").read_text())["status"]
+            == "failed"
+        )
+
+
+@pytest.mark.parametrize("member", [None, "run_manifest.json", "products"])
+@pytest.mark.parametrize("operation", ["run", "verify"])
+def test_symlinked_run_publication_paths_are_rejected_without_writing(
+    tmp_path, member, operation
+):
+    config, _, _ = make_inputs(tmp_path, 30)
+    run_equivalent_coadd(config)
+    run_dir = config.output_root / config.run_id
+    path = run_dir if member is None else run_dir / member
+    outside = tmp_path / "external-copy"
+    path.rename(outside)
+    path.symlink_to(outside, target_is_directory=outside.is_dir())
+    manifest_path = (
+        outside / "run_manifest.json"
+        if member is None
+        else outside
+        if member == "run_manifest.json"
+        else run_dir / "run_manifest.json"
+    )
+    before = manifest_path.read_bytes()
+    with pytest.raises(ValueError, match="symlinks"):
+        (run_equivalent_coadd if operation == "run" else verify_equivalent_run)(config)
+    assert path.is_symlink()
+    assert manifest_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "sidecar", ["equivalent_request.json", "equivalent_run_config.json"]
+)
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_initialization_repair_never_replaces_or_accepts_sidecar_links(
+    tmp_path, monkeypatch, sidecar, target_exists
+):
+    import et_mainsim.equivalent_coadd as workflow
+
+    config, request, _ = make_inputs(tmp_path, 30)
+    with monkeypatch.context() as patch:
+
+        def interrupt(*args, **kwargs):
+            raise OSError("interrupted before sidecars")
+
+        patch.setattr(workflow, "_atomic_write_json", interrupt)
+        with pytest.raises(OSError, match="before sidecars"):
+            run_equivalent_coadd(config)
+    run_dir = config.output_root / config.run_id
+    outside = tmp_path / "external-sidecar.json"
+    if target_exists:
+        outside.write_text(
+            json.dumps(
+                config.to_dict() if "config" in sidecar else request.to_json_dict()
+            )
+        )
+    path = run_dir / sidecar
+    path.symlink_to(outside)
+    before = (run_dir / "run_manifest.json").read_bytes()
+    with pytest.raises(ValueError, match="symlinks"):
+        run_equivalent_coadd(config)
+    assert path.is_symlink() and outside.exists() == target_exists
+    assert (run_dir / "run_manifest.json").read_bytes() == before
