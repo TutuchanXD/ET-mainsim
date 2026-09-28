@@ -182,6 +182,10 @@ def _locked_numeric_policy(threads):
     from numba import get_num_threads, set_num_threads
     from threadpoolctl import threadpool_limits
 
+    # NumPy and SciPy wheels can ship separate BLAS runtimes. Load SciPy's
+    # native linear algebra before threadpoolctl snapshots loaded libraries;
+    # otherwise _context() can introduce an uncapped pool on the first run.
+    importlib.import_module("scipy.linalg")
     old_torch = torch.get_num_threads()
     old_numba = get_num_threads()
     try:

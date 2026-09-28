@@ -672,3 +672,58 @@ def test_initialization_repair_never_replaces_or_accepts_sidecar_links(
         run_equivalent_coadd(config)
     assert path.is_symlink() and outside.exists() == target_exists
     assert (run_dir / "run_manifest.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("kind", ["stamp", "full_frame"])
+def test_fresh_process_caps_late_native_pools_and_resumes(tmp_path, kind):
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    import et_mainsim
+    import photsim7
+
+    config, _, _ = make_inputs(tmp_path, 30, kind)
+    path = tmp_path / "cold-run.json"
+    path.write_text(json.dumps(config.to_dict()))
+    env = dict(os.environ)
+    # The child starts with a conflicting ambient policy. A warm parent or
+    # OMP_NUM_THREADS=1 must not hide a backend loaded after policy entry.
+    for name in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        env[name] = "3"
+    roots = [
+        str(Path(package.__file__).resolve().parent.parent)
+        for package in (et_mainsim, photsim7)
+    ]
+    env["PYTHONPATH"] = os.pathsep.join(
+        [*dict.fromkeys(roots), env.get("PYTHONPATH", "")]
+    )
+    probe = """
+import json, sys
+from pathlib import Path
+from et_mainsim.equivalent_coadd import EquivalentRunConfig, run_equivalent_coadd, verify_equivalent_run
+config = EquivalentRunConfig.from_file(sys.argv[1])
+first = run_equivalent_coadd(config)
+assert first["status"] == "completed"
+metadata = json.loads((config.output_root / config.run_id / "products/group_00000000/metadata.json").read_text())
+assert all(count == config.cpu_threads for _, count in metadata["execution_environment"]["native_thread_limits"])
+second = run_equivalent_coadd(config)
+assert all(group["reused"] for group in second["artifacts"]["equivalent_products"])
+assert verify_equivalent_run(config)["status"] == "verified"
+print("cold run, bounded native pools, resume and verification passed")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(path)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

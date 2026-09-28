@@ -2,8 +2,8 @@ schema_version = 1
 pytest_version = "9.0.3"
 python_versions = ["3.12", "3.13"]
 # Full suite inventory, including S5 per-frame geometry, bound DVA and stamp resume regressions.
-expected_collected = 1107
-nodeid_sha256 = "6cd824387851154a477a3d48845dbae656979e56c42fda1b455e198f11fe2a7e"
+expected_collected = 1109
+nodeid_sha256 = "f330d171c0a656c1c4305fcbf095bdeb1f17c2ff57933357eb9f6ae1bc37b536"
 allowed_skips = [
   "tests/test_galaxy_delivery_notebooks.py::test_galaxy_delivery_notebook_is_a_read_only_raw_coverage_v2_consumer",
   "tests/test_galaxy_delivery_notebooks.py::test_galaxy_campaign_summary_notebook_only_consumes_atomic_raw_coverage_summary",

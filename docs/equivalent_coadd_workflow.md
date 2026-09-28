@@ -52,6 +52,7 @@ cadence、配置、科学资产或精度声明。文件身份冲突会在执行�
 
 `--dry-run` 检查请求文件和组选择，不加载 PSF、不创建输出目录。实际运行还检查
 当前科学资产。CPU 线程数是显式执行策略，作用于 Torch、Numba 和 native pools，
+数值库在设置线程上限前初始化，覆盖 NumPy／SciPy 分别携带 BLAS 的 wheel 安装；
 同一进程中的 equivalent 调用串行执行，结束或失败后恢复调用方设置；不支持隐含的 CUDA、Ray 或普通 raw-frame 覆盖参数。
 
 ## 产物、续跑与独立检查
