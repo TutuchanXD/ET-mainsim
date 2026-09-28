@@ -17,6 +17,7 @@ dependencies = [
   "numpy>=1.26",
   "numba>=0.62,<0.66",
   "photsim7[gpu]>=0.5.11,<0.6",
+  "scipy>=1.15,<1.18",
   "torch>=2.7,<3",
   "threadpoolctl>=3.1,<4",
 ]
