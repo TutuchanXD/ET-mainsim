@@ -239,6 +239,7 @@ def test_cli_routes_explicit_request_without_generic_spec_builder(tmp_path, caps
         ("coadd_indices", [True]),
         ("block_shape", [129, 128]),
         ("run_id", "../escape"),
+        ("run_id", ".run_locks"),
         ("n_raw", 12),
     ],
 )
@@ -331,6 +332,28 @@ def test_changed_catalog_is_rejected_before_run_creation(tmp_path):
     config.catalog_path.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="content differs"):
         run_equivalent_coadd(config)
+    assert not (config.output_root / config.run_id).exists()
+
+
+@pytest.mark.parametrize("operation", ["plan", "run"])
+def test_cuda_request_is_rejected_by_typed_authority_before_assets(
+    tmp_path, monkeypatch, operation
+):
+    import photsim7.input_identity as identity
+
+    config, _, _ = make_inputs(tmp_path, 30)
+    payload = json.loads(config.request_path.read_text())
+    payload["derivation"]["source_spec"]["psf"]["compute_device"] = "cuda"
+    config.request_path.write_text(json.dumps(payload))
+
+    def unexpected_assets(*args, **kwargs):
+        raise AssertionError("CUDA request reached scientific assets")
+
+    monkeypatch.setattr(identity, "simulation_asset_identity", unexpected_assets)
+    with pytest.raises(ValueError, match="CPU only"):
+        (build_equivalent_run_plan if operation == "plan" else run_equivalent_coadd)(
+            config
+        )
     assert not (config.output_root / config.run_id).exists()
 
 

@@ -71,10 +71,12 @@ class EquivalentRunConfig:
         if (
             not isinstance(run_id, str)
             or not run_id.strip()
-            or run_id in (".", "..")
+            or run_id in (".", "..", ".run_locks")
             or Path(run_id).name != run_id
         ):
-            raise ValueError("run_id must be a single nonempty path component")
+            raise ValueError(
+                "run_id must be a single nonempty, unreserved path component"
+            )
         paths = {}
         for name in required - {"schema_id", "run_id"}:
             value = payload[name]
