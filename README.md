@@ -44,7 +44,7 @@ maintained Galaxy producer.
 The current full-test and release-engineering contracts are validated against
 ET-coordinate commit `f9cec8038b021c9540a026b94e876dc3240071d1`
 (version 0.1.2) and Photsim7 commit
-`2bcf179274ee4d7ba158584a3a4da67551664c6e` (version 0.5.11, including the formal equivalent API). Install those exact
+`429b7687895ea97eca2f23d5c09b9f823bed3bee` (version 0.5.11, including the formal equivalent, legacy expectation, reference photometry and calibration APIs). Install those exact
 dependency snapshots before installing the ET-mainsim wheel with `--no-deps`,
 then run `python -m pip check`.
 
@@ -216,3 +216,7 @@ reference that plan. Reordering scopes preserves resume identity; changing
 members, detector association or layout requires a new run. Independent target
 MC remains single-scope. Real CPU/CUDA acceptance is available through
 `validation/test_s4b_telescope_layouts.py` with the same asset environment as S3.
+
+The [legacy expectation workflow](docs/legacy_expectation_workflow.md) provides
+explicit electron coadds and public per-scope/combined photometry for full frames,
+catalog stamps and independent table targets.

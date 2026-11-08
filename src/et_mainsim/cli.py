@@ -49,6 +49,16 @@ def _parser() -> argparse.ArgumentParser:
     equivalent_modes = equivalent.add_mutually_exclusive_group()
     equivalent_modes.add_argument("--dry-run", action="store_true")
     equivalent_modes.add_argument("--verify-only", action="store_true")
+    expectation = run_subparsers.add_parser(
+        "et-legacy-expectation", help="Run electron coadds and public multi-scope photometry.",
+    )
+    expectation.add_argument("--config", type=Path, required=True)
+    expectation_modes = expectation.add_mutually_exclusive_group()
+    expectation_modes.add_argument("--dry-run", action="store_true")
+    expectation_modes.add_argument("--verify-only", action="store_true")
+    expectation.add_argument("--group-index", type=int, action="append", dest="group_indices")
+    expectation.add_argument("--shard-index", type=int, default=0)
+    expectation.add_argument("--shard-count", type=int, default=1)
     full_frame = run_subparsers.add_parser(
         "et-full-frame",
         help="Run one physical ET main detector.",
@@ -506,6 +516,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             return _run_full_frame_command(args)
         except (KeyError, OSError, RuntimeError, ValueError) as error:
+            parser.error(str(error))
+    if args.command == "run" and args.workflow == "et-legacy-expectation":
+        from et_mainsim.legacy_expectation import (
+            LegacyExpectationConfig, build_legacy_expectation_plan,
+            run_legacy_expectation, verify_legacy_expectation_run,
+        )
+        try:
+            config = LegacyExpectationConfig.from_file(args.config)
+            if args.dry_run or args.verify_only:
+                if args.group_indices is not None or args.shard_index != 0 or args.shard_count != 1:
+                    raise ValueError("dry-run/verify-only inspect the full run; scheduling selectors are execution-only")
+                action = build_legacy_expectation_plan if args.dry_run else verify_legacy_expectation_run
+                result = action(config)
+            else:
+                result = run_legacy_expectation(config, group_indices=args.group_indices,
+                                                shard_index=args.shard_index, shard_count=args.shard_count)
+            _json_print(result)
+            return 0
+        except (ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
             parser.error(str(error))
     if args.command == "run" and args.workflow == "et-equivalent-coadd":
         from et_mainsim.equivalent_coadd import (
