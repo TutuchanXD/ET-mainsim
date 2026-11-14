@@ -1,0 +1,500 @@
+{
+  "schema_id": "et_mainsim.m6_validation.v1",
+  "platform": "Linux-7.0.0-42-generic-x86_64-with-glibc2.39",
+  "cuda_device": "NVIDIA GeForce RTX 5090",
+  "runs": {
+    "cpu-catalog-stamp": {
+      "elapsed_with_verify_resume_s": 2.972178901982261,
+      "status": {
+        "schema_id": "et_mainsim.legacy_expectation_status.v1",
+        "status": "completed",
+        "run_dir": "/home/cxgao/ET/outputs/m6-legacy-expectation-20261109/runs/cpu-catalog-stamp",
+        "identity_sha256": "c318affc73d096a660543d1392ba79540a6390aaa9ce812868818be7d98949e2",
+        "groups": [
+          {
+            "group_index": 0,
+            "manifest_sha256": "efddb75dd925b6674a7bbd1c3943f0a3be409ba8313cb93682cf410b35935a39",
+            "elapsed_s": 0.7167210670013446
+          },
+          {
+            "group_index": 1,
+            "manifest_sha256": "e562b58eed22c0115f424ae2bc1b6ca82e6cc7cdc5b79b41020206de15ec8c50",
+            "elapsed_s": 0.1972689529939089
+          },
+          {
+            "group_index": 2,
+            "manifest_sha256": "4aa9386db34eb7b80f7aefe9e16929c2ea83865893c1e5cec17a3fee347ca160",
+            "elapsed_s": 0.3264522079844028
+          },
+          {
+            "group_index": 3,
+            "manifest_sha256": "babfbbb14482192e8a1c27fde0da8b15ebfaac9e3b482a06c999dfbdc00f746c",
+            "elapsed_s": 0.19968713002162986
+          }
+        ],
+        "missing_groups": []
+      },
+      "host_peak_rss_kib": 951520,
+      "pixel_vs_light_sharded": {
+        "arrays_compared": 340,
+        "bitwise_required": true,
+        "maximum_absolute_difference": 0.0,
+        "maximum_absolute_difference_by_field": {
+          "frame_start_s": 0.0,
+          "frame_stop_s": 0.0,
+          "mid_time_s": 0.0,
+          "integration_s": 0.0,
+          "flux_electrons": 0.0,
+          "electron_rate": 0.0,
+          "effective_aperture_area_pix": 0.0,
+          "centroid_xy_pix": 0.0,
+          "quality": 0.0,
+          "input_quality": 0.0,
+          "effective_integration_s": 0.0,
+          "weighted_mean_electron_rate": 0.0,
+          "contributing_scope_count": 0.0,
+          "scope_weights": 0.0,
+          "applied_scope_weights": 0.0,
+          "scope_present": 0.0,
+          "scope_used": 0.0,
+          "scope_quality": 0.0,
+          "scope_flux_electrons": 0.0,
+          "scope_electron_rate": 0.0,
+          "scope_integration_s": 0.0,
+          "scope_mid_time_s": 0.0
+        }
+      }
+    },
+    "cpu-full-frame": {
+      "elapsed_with_verify_resume_s": 2.04915190700558,
+      "status": {
+        "schema_id": "et_mainsim.legacy_expectation_status.v1",
+        "status": "completed",
+        "run_dir": "/home/cxgao/ET/outputs/m6-legacy-expectation-20261109/runs/cpu-full-frame",
+        "identity_sha256": "53da6bb2f2143054ee01d8676e0de295bd23effaf342f859585884c7d7a49a54",
+        "groups": [
+          {
+            "group_index": 0,
+            "manifest_sha256": "0235cdda83519a8b747aa3095a36633dd67e7b90d3300a9609ec0a3e0fa51ccd",
+            "elapsed_s": 0.7031087710056454
+          },
+          {
+            "group_index": 1,
+            "manifest_sha256": "7b53e992c0d4436b9a25d5c306e43abd34212674dac3c2b9ab4de99621c8a67a",
+            "elapsed_s": 0.2514986799797043
+          },
+          {
+            "group_index": 2,
+            "manifest_sha256": "66c939f9031ba8d28e5d529e8513a4405e21b3324dd8883fe0afd1ae73b92f93",
+            "elapsed_s": 0.2455541180097498
+          },
+          {
+            "group_index": 3,
+            "manifest_sha256": "8462bd92e305104d398b925f4c52eddd335abb789d20c132157a19b44330410c",
+            "elapsed_s": 0.24286365500302054
+          }
+        ],
+        "missing_groups": []
+      },
+      "host_peak_rss_kib": 976332,
+      "pixel_vs_light_sharded": {
+        "arrays_compared": 340,
+        "bitwise_required": true,
+        "maximum_absolute_difference": 0.0,
+        "maximum_absolute_difference_by_field": {
+          "frame_start_s": 0.0,
+          "frame_stop_s": 0.0,
+          "mid_time_s": 0.0,
+          "integration_s": 0.0,
+          "flux_electrons": 0.0,
+          "electron_rate": 0.0,
+          "effective_aperture_area_pix": 0.0,
+          "centroid_xy_pix": 0.0,
+          "quality": 0.0,
+          "input_quality": 0.0,
+          "effective_integration_s": 0.0,
+          "weighted_mean_electron_rate": 0.0,
+          "contributing_scope_count": 0.0,
+          "scope_weights": 0.0,
+          "applied_scope_weights": 0.0,
+          "scope_present": 0.0,
+          "scope_used": 0.0,
+          "scope_quality": 0.0,
+          "scope_flux_electrons": 0.0,
+          "scope_electron_rate": 0.0,
+          "scope_integration_s": 0.0,
+          "scope_mid_time_s": 0.0
+        }
+      }
+    },
+    "cpu-table-stamp": {
+      "elapsed_with_verify_resume_s": 7.048839246010175,
+      "status": {
+        "schema_id": "et_mainsim.legacy_expectation_status.v1",
+        "status": "completed",
+        "run_dir": "/home/cxgao/ET/outputs/m6-legacy-expectation-20261109/runs/cpu-table-stamp",
+        "identity_sha256": "0c4999c4e66d3ddb0a82637bf53d0c0c9c8e64549a86e773dba972b124d1b31f",
+        "groups": [
+          {
+            "group_index": 0,
+            "manifest_sha256": "f5c363db50fb562bf8264bf5938136c710231d1b396e4b3256fdd9946ece8123",
+            "elapsed_s": 1.2527707919944078
+          },
+          {
+            "group_index": 1,
+            "manifest_sha256": "3deef1d43d8546b3e9d295ab131980aa9c36e88ef41f6ef3418256630bdf550c",
+            "elapsed_s": 1.247372377983993
+          },
+          {
+            "group_index": 2,
+            "manifest_sha256": "c50a37136422061461d07669efb28ec078f04851175d9c081eb99574d3240ed8",
+            "elapsed_s": 1.3887887239980046
+          },
+          {
+            "group_index": 3,
+            "manifest_sha256": "f5e45b7dee7432a0de83ad91be69572d2e8c892ce7bdb6b3e46df4f1e77c7e88",
+            "elapsed_s": 1.2696170159906615
+          }
+        ],
+        "missing_groups": []
+      },
+      "host_peak_rss_kib": 991880,
+      "pixel_vs_light_sharded": {
+        "arrays_compared": 680,
+        "bitwise_required": true,
+        "maximum_absolute_difference": 0.0,
+        "maximum_absolute_difference_by_field": {
+          "frame_start_s": 0.0,
+          "frame_stop_s": 0.0,
+          "mid_time_s": 0.0,
+          "integration_s": 0.0,
+          "flux_electrons": 0.0,
+          "electron_rate": 0.0,
+          "effective_aperture_area_pix": 0.0,
+          "centroid_xy_pix": 0.0,
+          "quality": 0.0,
+          "input_quality": 0.0,
+          "effective_integration_s": 0.0,
+          "weighted_mean_electron_rate": 0.0,
+          "contributing_scope_count": 0.0,
+          "scope_weights": 0.0,
+          "applied_scope_weights": 0.0,
+          "scope_present": 0.0,
+          "scope_used": 0.0,
+          "scope_quality": 0.0,
+          "scope_flux_electrons": 0.0,
+          "scope_electron_rate": 0.0,
+          "scope_integration_s": 0.0,
+          "scope_mid_time_s": 0.0
+        }
+      }
+    },
+    "cuda-catalog-stamp": {
+      "elapsed_with_verify_resume_s": 2.985733289999189,
+      "status": {
+        "schema_id": "et_mainsim.legacy_expectation_status.v1",
+        "status": "completed",
+        "run_dir": "/home/cxgao/ET/outputs/m6-legacy-expectation-20261109/runs/cuda-catalog-stamp",
+        "identity_sha256": "90a74739b8b013d7fcf57d77b457eb5ccc863d4caa1e648ff359af656faa5db3",
+        "groups": [
+          {
+            "group_index": 0,
+            "manifest_sha256": "3e4f10a22f4a512eb3ddc32e4118e6d9edb7a6bba344be2ba7c83056066e39dd",
+            "elapsed_s": 1.4652816260058898
+          },
+          {
+            "group_index": 1,
+            "manifest_sha256": "b98a01d9dfeaedeb91d0c4773e5780c2ecce2d7bee625b730f47288ae27d73c1",
+            "elapsed_s": 0.27187953700195067
+          },
+          {
+            "group_index": 2,
+            "manifest_sha256": "8e32d85c31d5a54dff3a50236c1852f1f2c77f30525c2fe128e12d514b8714d5",
+            "elapsed_s": 0.2732509060006123
+          },
+          {
+            "group_index": 3,
+            "manifest_sha256": "c143b34d7989bb1bded4e87802a96945093e472f5003bd756acbad9380dbac4a",
+            "elapsed_s": 0.26707880999310873
+          }
+        ],
+        "missing_groups": []
+      },
+      "host_peak_rss_kib": 2075432,
+      "cuda_peak_allocated_bytes": 63146496,
+      "pixel_vs_light_sharded": {
+        "arrays_compared": 340,
+        "bitwise_required": true,
+        "maximum_absolute_difference": 0.0,
+        "maximum_absolute_difference_by_field": {
+          "frame_start_s": 0.0,
+          "frame_stop_s": 0.0,
+          "mid_time_s": 0.0,
+          "integration_s": 0.0,
+          "flux_electrons": 0.0,
+          "electron_rate": 0.0,
+          "effective_aperture_area_pix": 0.0,
+          "centroid_xy_pix": 0.0,
+          "quality": 0.0,
+          "input_quality": 0.0,
+          "effective_integration_s": 0.0,
+          "weighted_mean_electron_rate": 0.0,
+          "contributing_scope_count": 0.0,
+          "scope_weights": 0.0,
+          "applied_scope_weights": 0.0,
+          "scope_present": 0.0,
+          "scope_used": 0.0,
+          "scope_quality": 0.0,
+          "scope_flux_electrons": 0.0,
+          "scope_electron_rate": 0.0,
+          "scope_integration_s": 0.0,
+          "scope_mid_time_s": 0.0
+        }
+      }
+    },
+    "cuda-full-frame": {
+      "elapsed_with_verify_resume_s": 2.5699026490037795,
+      "status": {
+        "schema_id": "et_mainsim.legacy_expectation_status.v1",
+        "status": "completed",
+        "run_dir": "/home/cxgao/ET/outputs/m6-legacy-expectation-20261109/runs/cuda-full-frame",
+        "identity_sha256": "969a146212fca96d7c6aa45d3503cc1f2e55293d1352258f7716db4b19896cf8",
+        "groups": [
+          {
+            "group_index": 0,
+            "manifest_sha256": "2ad6da96060847a1c352063c376ca9e5d5f93b7dd7c093bd67cf60bb6e53e228",
+            "elapsed_s": 0.7900183450256009
+          },
+          {
+            "group_index": 1,
+            "manifest_sha256": "7317f0cff9708f52fdb8edbf6c34a353d3e2da1489e04b9733adeb054d46c858",
+            "elapsed_s": 0.3113975310116075
+          },
+          {
+            "group_index": 2,
+            "manifest_sha256": "2b9b475e1e50f0988bc3c3f20a850bd5904e1dd5e831dd3dd0e2d52add98ad61",
+            "elapsed_s": 0.3101832229876891
+          },
+          {
+            "group_index": 3,
+            "manifest_sha256": "f0c85703ad03e88129f707b8c176ddfac816733b57c37f5a46395a4ea9b00a22",
+            "elapsed_s": 0.30867683299584314
+          }
+        ],
+        "missing_groups": []
+      },
+      "host_peak_rss_kib": 2217008,
+      "cuda_peak_allocated_bytes": 63146496,
+      "pixel_vs_light_sharded": {
+        "arrays_compared": 340,
+        "bitwise_required": true,
+        "maximum_absolute_difference": 0.0,
+        "maximum_absolute_difference_by_field": {
+          "frame_start_s": 0.0,
+          "frame_stop_s": 0.0,
+          "mid_time_s": 0.0,
+          "integration_s": 0.0,
+          "flux_electrons": 0.0,
+          "electron_rate": 0.0,
+          "effective_aperture_area_pix": 0.0,
+          "centroid_xy_pix": 0.0,
+          "quality": 0.0,
+          "input_quality": 0.0,
+          "effective_integration_s": 0.0,
+          "weighted_mean_electron_rate": 0.0,
+          "contributing_scope_count": 0.0,
+          "scope_weights": 0.0,
+          "applied_scope_weights": 0.0,
+          "scope_present": 0.0,
+          "scope_used": 0.0,
+          "scope_quality": 0.0,
+          "scope_flux_electrons": 0.0,
+          "scope_electron_rate": 0.0,
+          "scope_integration_s": 0.0,
+          "scope_mid_time_s": 0.0
+        }
+      }
+    },
+    "cuda-table-stamp": {
+      "elapsed_with_verify_resume_s": 7.694930511992425,
+      "status": {
+        "schema_id": "et_mainsim.legacy_expectation_status.v1",
+        "status": "completed",
+        "run_dir": "/home/cxgao/ET/outputs/m6-legacy-expectation-20261109/runs/cuda-table-stamp",
+        "identity_sha256": "6738d83a6e54b5ea1e3ab6a6c4680df3e8a61b696c5d86370b09d52ec9ed12da",
+        "groups": [
+          {
+            "group_index": 0,
+            "manifest_sha256": "46dd42909892da4dd1fc66a9dd62db7627649c94a6e0c327790ee5a7f54b631c",
+            "elapsed_s": 1.282403327000793
+          },
+          {
+            "group_index": 1,
+            "manifest_sha256": "40fe611de756a5436cf18751a7d7c60977955e985c36afd36cb554badf5b71a5",
+            "elapsed_s": 1.283672050019959
+          },
+          {
+            "group_index": 2,
+            "manifest_sha256": "10948099d601cdd73f02c5e1993eba4c855f4e82feaf0b51313354e29dbdc841",
+            "elapsed_s": 1.5725031369947828
+          },
+          {
+            "group_index": 3,
+            "manifest_sha256": "8257723dd7f3ef5d1d21c17a3d2e0ef8491c1cf53bd915897e97dbf20f21d1b9",
+            "elapsed_s": 1.508018683991395
+          }
+        ],
+        "missing_groups": []
+      },
+      "host_peak_rss_kib": 2221544,
+      "cuda_peak_allocated_bytes": 64273920,
+      "pixel_vs_light_sharded": {
+        "arrays_compared": 680,
+        "bitwise_required": true,
+        "maximum_absolute_difference": 0.0,
+        "maximum_absolute_difference_by_field": {
+          "frame_start_s": 0.0,
+          "frame_stop_s": 0.0,
+          "mid_time_s": 0.0,
+          "integration_s": 0.0,
+          "flux_electrons": 0.0,
+          "electron_rate": 0.0,
+          "effective_aperture_area_pix": 0.0,
+          "centroid_xy_pix": 0.0,
+          "quality": 0.0,
+          "input_quality": 0.0,
+          "effective_integration_s": 0.0,
+          "weighted_mean_electron_rate": 0.0,
+          "contributing_scope_count": 0.0,
+          "scope_weights": 0.0,
+          "applied_scope_weights": 0.0,
+          "scope_present": 0.0,
+          "scope_used": 0.0,
+          "scope_quality": 0.0,
+          "scope_flux_electrons": 0.0,
+          "scope_electron_rate": 0.0,
+          "scope_integration_s": 0.0,
+          "scope_mid_time_s": 0.0
+        }
+      }
+    }
+  },
+  "cpu_cuda_diagnostics": {
+    "catalog-stamp": {
+      "arrays_compared": 340,
+      "bitwise_required": false,
+      "maximum_absolute_difference": 600.0,
+      "maximum_absolute_difference_by_field": {
+        "frame_start_s": 0.0,
+        "frame_stop_s": 0.0,
+        "mid_time_s": 0.0,
+        "integration_s": 0.0,
+        "flux_electrons": 600.0,
+        "electron_rate": 10.000000000000455,
+        "effective_aperture_area_pix": 0.0,
+        "centroid_xy_pix": 0.046323355037408476,
+        "quality": 0.0,
+        "input_quality": 0.0,
+        "effective_integration_s": 0.0,
+        "weighted_mean_electron_rate": 1.6666666666667425,
+        "contributing_scope_count": 0.0,
+        "scope_weights": 0.0,
+        "applied_scope_weights": 0.0,
+        "scope_present": 0.0,
+        "scope_used": 0.0,
+        "scope_quality": 0.0,
+        "scope_flux_electrons": 596.0,
+        "scope_electron_rate": 9.933333333333337,
+        "scope_integration_s": 0.0,
+        "scope_mid_time_s": 0.0
+      }
+    },
+    "full-frame": {
+      "arrays_compared": 340,
+      "bitwise_required": false,
+      "maximum_absolute_difference": 600.0,
+      "maximum_absolute_difference_by_field": {
+        "frame_start_s": 0.0,
+        "frame_stop_s": 0.0,
+        "mid_time_s": 0.0,
+        "integration_s": 0.0,
+        "flux_electrons": 600.0,
+        "electron_rate": 10.00000000000091,
+        "effective_aperture_area_pix": 0.0,
+        "centroid_xy_pix": 0.046323355037408476,
+        "quality": 0.0,
+        "input_quality": 0.0,
+        "effective_integration_s": 0.0,
+        "weighted_mean_electron_rate": 1.6666666666667993,
+        "contributing_scope_count": 0.0,
+        "scope_weights": 0.0,
+        "applied_scope_weights": 0.0,
+        "scope_present": 0.0,
+        "scope_used": 0.0,
+        "scope_quality": 0.0,
+        "scope_flux_electrons": 596.0,
+        "scope_electron_rate": 9.933333333333337,
+        "scope_integration_s": 0.0,
+        "scope_mid_time_s": 0.0
+      }
+    },
+    "table-stamp": {
+      "arrays_compared": 680,
+      "bitwise_required": false,
+      "maximum_absolute_difference": 1390.0,
+      "maximum_absolute_difference_by_field": {
+        "frame_start_s": 0.0,
+        "frame_stop_s": 0.0,
+        "mid_time_s": 0.0,
+        "integration_s": 0.0,
+        "flux_electrons": 1390.0,
+        "electron_rate": 23.166666666666515,
+        "effective_aperture_area_pix": 0.0,
+        "centroid_xy_pix": 0.39744387577805895,
+        "quality": 0.0,
+        "input_quality": 0.0,
+        "effective_integration_s": 0.0,
+        "weighted_mean_electron_rate": 3.861111111111086,
+        "contributing_scope_count": 0.0,
+        "scope_weights": 0.0,
+        "applied_scope_weights": 0.0,
+        "scope_present": 0.0,
+        "scope_used": 0.0,
+        "scope_quality": 0.0,
+        "scope_flux_electrons": 892.0,
+        "scope_electron_rate": 14.866666666666674,
+        "scope_integration_s": 0.0,
+        "scope_mid_time_s": 0.0
+      }
+    }
+  },
+  "science_acceptance": "engineering invariants only; no new science residual tolerance",
+  "full_stamp_pixel_parity": {
+    "cpu": {
+      "arrays_bitwise_equal": 288
+    },
+    "cuda": {
+      "arrays_bitwise_equal": 288
+    }
+  },
+  "cpu_cuda_policy": "Torch Poisson draws are backend-specific; cross-device noisy flux residuals are descriptive, not a bitwise gate",
+  "validation_script_sha256": "69c35d27913e0fdf4397deb918799481e62836bd1b9afc321b5107438c3fa121",
+  "archive": {
+    "filename": "m6-legacy-expectation-20261109.tar.gz",
+    "size_bytes": 48062383,
+    "sha256": "796ac5fc97decb10041cd27e77c71d00dc8487c2245ce90b5fedfb5fe2b6d061",
+    "payload_files": 1034
+  },
+  "validation": {
+    "local_full_suite": {
+      "passed": 1144,
+      "skipped": 2,
+      "seconds": 165.54
+    },
+    "focused_packaging_ci": {
+      "passed": 107
+    },
+    "application_commit": "94a2dacef2d6fb170a6e6d84fcb1dd1f8599985e",
+    "photsim7_commit": "429b7687895ea97eca2f23d5c09b9f823bed3bee"
+  }
+}
